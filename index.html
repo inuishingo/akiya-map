@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>空家マップ｜現地調査</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+
+  <!-- Firebase SDK -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+    import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, deleteDoc, doc, serverTimestamp }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyDloqlUX051jReuAW4_TyncQgGlk03CfO0",
+      authDomain: "housemarket-map.firebaseapp.com",
+      projectId: "housemarket-map",
+      storageBucket: "housemarket-map.firebasestorage.app",
+      messagingSenderId: "182625011825",
+      appId: "1:182625011825:web:a5f7c989e94a426d5373d0"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    const GMAPS_KEY = "AIzaSyDbZVrgxEDAke-HG5sgYT0AEOChsBSNtck";
+
+    // ===== STATE =====
+    let map = null;
+    let currentUser = null;
+    let markers = [];
+    let pendingLatLng = null;
+    let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue") || "[]");
+    let editingPinId = null;
+
+    const STATUS = {
+      tochi:    { label: "土地",   color: "#10B981", text: "#fff" },
+      tatemono: { label: "建物",   color: "#EF4444", text: "#fff" },
+      rentou:   { label: "連棟",   color: "#F97316", text: "#fff" },
+      shintiku: { label: "新築",   color: "#9CA3AF", text: "#fff" },
+      souko:    { label: "倉庫",   color: "#EAB308", text: "#fff" },
+      shueki:   { label: "収益",   color: "#8B5CF6", text: "#fff" },
+      hansha:   { label: "反社",   color: "#1f2937", text: "#fff" },
+    };
+
+    // ===== OFFLINE SYNC =====
+    async function syncOfflineQueue() {
+      if (!navigator.onLine || offlineQueue.length === 0) return;
+      const remaining = [];
+      for (const item of offlineQueue) {
+        try {
+          await addDoc(collection(db, "pins"), item);
+        } catch(e) {
+          remaining.push(item);
+        }
+      }
+      offlineQueue = remaining;
+      localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
+      if (remaining.length === 0) showToast("オフライン中のデータを同期しました");
+    }
+    window.addEventListener("online", syncOfflineQueue);
+
+    // ===== AUTH =====
+    onAuthStateChanged(auth, user => {
+      currentUser = user;
+      if (user) {
+        document.getElementById("loginScreen").style.display = "none";
+        document.getElementById("mapScreen").style.display = "flex";
+        document.getElementById("userLabel").textContent = user.email;
+        initMap();
+        syncOfflineQueue();
+      } else {
+        document.getElementById("loginScreen").style.display = "flex";
+        document.getElementById("mapScreen").style.display = "none";
+      }
+    });
+
+    window.doLogin = async () => {
+      const email = document.getElementById("email").value.trim();
+      const pass  = document.getElementById("pass").value;
+      const btn   = document.getElementById("loginBtn");
+      btn.disabled = true;
+      btn.textContent = "ログイン中…";
+      try {
+        await signInWithEmailAndPassword(auth, email, pass);
+      } catch(e) {
+        showToast("メールアドレスまたはパスワードが違います", "error");
+        btn.disabled = false;
+        btn.textContent = "ログイン";
+      }
+    };
+
+    window.doLogout = async () => {
+      await signOut(auth);
+    };
+
+    // ===== MAP INIT =====
+    function initMap() {
+      if (map) return;
+      map = new google.maps.Map(document.getElementById("map"), {
+        center: { lat: 35.1709, lng: 136.8815 }, // 名古屋
+        zoom: 15,
+        mapTypeId: "roadmap",
+        disableDefaultUI: true,
+        zoomControl: true,
+        gestureHandling: "greedy",
+      });
+
+      // 現在地
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(pos => {
+          map.setCenter({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        });
+      }
+
+      map.addListener("click", e => {
+        pendingLatLng = { lat: e.latLng.lat(), lng: e.latLng.lng() };
+        openPinModal();
+      });
+
+      loadMyPins();
+    }
+    window.initMap = initMap;
+
+    // ===== LOAD PINS =====
+    async function loadMyPins() {
+      if (!currentUser) return;
+      markers.forEach(m => m.setMap(null));
+      markers = [];
+      try {
+        const q = query(collection(db, "pins"), where("uid", "==", currentUser.uid));
+        const snap = await getDocs(q);
+        snap.forEach(d => renderMarker(d.id, d.data()));
+      } catch(e) {
+        // オフライン時は無視
+      }
+    }
+
+    function renderMarker(id, data) {
+      const s = STATUS[data.status] || STATUS.akiya;
+      const marker = new google.maps.Marker({
+        position: { lat: data.lat, lng: data.lng },
+        map,
+        title: s.label,
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          scale: 14,
+          fillColor: s.color,
+          fillOpacity: 1,
+          strokeColor: "#fff",
+          strokeWeight: 2,
+        },
+        label: { text: s.label[0], color: "#fff", fontSize: "11px", fontWeight: "bold" }
+      });
+      marker.pinId = id;
+      marker.pinData = data;
+      marker.addListener("click", () => openEditModal(id, data, marker));
+      markers.push(marker);
+    }
+
+    // ===== PIN MODAL（新規）=====
+    function openPinModal() {
+      editingPinId = null;
+      document.getElementById("modalTitle").textContent = "ピンを追加";
+      document.getElementById("statusSelect").value = "akiya";
+      document.getElementById("memo").value = "";
+      document.getElementById("deleteBtn").style.display = "none";
+      document.getElementById("pinModal").style.display = "flex";
+      reverseGeocode(pendingLatLng);
+    }
+
+    // ===== PIN MODAL（編集）=====
+    function openEditModal(id, data, marker) {
+      editingPinId = id;
+      pendingLatLng = { lat: data.lat, lng: data.lng };
+      document.getElementById("modalTitle").textContent = "ピンを編集";
+      document.getElementById("statusSelect").value = data.status;
+      document.getElementById("memo").value = data.memo || "";
+      document.getElementById("addressLabel").textContent = data.address || "取得中…";
+      document.getElementById("deleteBtn").style.display = "block";
+      document.getElementById("pinModal").style.display = "flex";
+    }
+
+    window.closeModal = () => {
+      document.getElementById("pinModal").style.display = "none";
+      pendingLatLng = null;
+      editingPinId = null;
+    };
+
+    // ===== GEOCODE =====
+    async function reverseGeocode(latlng) {
+      document.getElementById("addressLabel").textContent = "住所取得中…";
+      try {
+        const res = await fetch(
+          `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latlng.lat},${latlng.lng}&language=ja&key=${GMAPS_KEY}`
+        );
+        const json = await res.json();
+        const addr = json.results[0]?.formatted_address?.replace("日本、", "") || "住所不明";
+        document.getElementById("addressLabel").textContent = addr;
+      } catch {
+        document.getElementById("addressLabel").textContent = "（オフライン）";
+      }
+    }
+
+    // ===== SAVE PIN =====
+    window.savePin = async () => {
+      if (!pendingLatLng && !editingPinId) return;
+      const status = document.getElementById("statusSelect").value;
+      const memo   = document.getElementById("memo").value.trim();
+      const address = document.getElementById("addressLabel").textContent;
+      const btn = document.getElementById("saveBtn");
+      btn.disabled = true;
+      btn.textContent = "保存中…";
+
+      if (editingPinId) {
+        // 編集
+        try {
+          await updateDoc(doc(db, "pins", editingPinId), { status, memo, address });
+          showToast("更新しました");
+          closeModal();
+          loadMyPins();
+        } catch(e) {
+          showToast("更新に失敗しました", "error");
+        }
+      } else {
+        // 新規
+        const pinData = {
+          uid: currentUser.uid,
+          email: currentUser.email,
+          lat: pendingLatLng.lat,
+          lng: pendingLatLng.lng,
+          address,
+          status,
+          memo,
+          branch: "名古屋",
+          createdAt: new Date().toISOString(),
+        };
+        if (navigator.onLine) {
+          try {
+            const ref = await addDoc(collection(db, "pins"), pinData);
+            renderMarker(ref.id, pinData);
+            showToast("保存しました");
+          } catch(e) {
+            offlineQueue.push(pinData);
+            localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
+            showToast("オフライン保存（後で自動送信）", "warn");
+          }
+        } else {
+          offlineQueue.push(pinData);
+          localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
+          showToast("オフライン保存（後で自動送信）", "warn");
+        }
+        closeModal();
+      }
+      btn.disabled = false;
+      btn.textContent = "保存";
+    };
+
+    // ===== DELETE PIN =====
+    window.deletePin = async () => {
+      if (!editingPinId) return;
+      if (!confirm("このピンを削除しますか？")) return;
+      try {
+        await deleteDoc(doc(db, "pins", editingPinId));
+        showToast("削除しました");
+        closeModal();
+        loadMyPins();
+      } catch(e) {
+        showToast("削除に失敗しました", "error");
+      }
+    };
+
+    // ===== TOAST =====
+    function showToast(msg, type = "ok") {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.className = "toast " + type;
+      t.style.opacity = "1";
+      setTimeout(() => { t.style.opacity = "0"; }, 2800);
+    }
+
+    // ===== LOCATE =====
+    window.locateMe = () => {
+      if (!navigator.geolocation) return;
+      navigator.geolocation.getCurrentPosition(pos => {
+        map.panTo({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        map.setZoom(17);
+      });
+    };
+
+    // ===== ENTER KEY LOGIN =====
+    window.addEventListener("keydown", e => {
+      if (e.key === "Enter" && document.getElementById("loginScreen").style.display !== "none") {
+        doLogin();
+      }
+    });
+  </script>
+
+  <!-- Google Maps -->
+  <script async
+    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDbZVrgxEDAke-HG5sgYT0AEOChsBSNtck&callback=initMap&language=ja">
+  </script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Noto Sans JP', sans-serif; background: #0f1117; color: #f0f0f0; height: 100dvh; overflow: hidden; }
+
+    /* ===== LOGIN ===== */
+    #loginScreen {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: 100dvh; background: #0f1117; gap: 16px; padding: 24px;
+    }
+    .login-logo {
+      font-size: 13px; font-weight: 700; letter-spacing: 0.15em; color: #6b7280;
+      text-transform: uppercase; margin-bottom: 4px;
+    }
+    .login-title { font-size: 22px; font-weight: 700; color: #f9fafb; margin-bottom: 16px; }
+    .login-box { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 12px; }
+    .login-box input {
+      width: 100%; padding: 14px 16px; border-radius: 10px; border: 1px solid #374151;
+      background: #1f2937; color: #f9fafb; font-size: 15px; font-family: inherit;
+      outline: none; transition: border 0.2s;
+    }
+    .login-box input:focus { border-color: #3b82f6; }
+    #loginBtn {
+      padding: 14px; border-radius: 10px; background: #3b82f6; color: #fff;
+      font-size: 15px; font-weight: 700; border: none; cursor: pointer; transition: background 0.2s;
+    }
+    #loginBtn:hover { background: #2563eb; }
+    #loginBtn:disabled { background: #374151; cursor: not-allowed; }
+
+    /* ===== MAP SCREEN ===== */
+    #mapScreen { display: none; flex-direction: column; height: 100dvh; }
+
+    /* header */
+    .header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 14px; background: #111827; border-bottom: 1px solid #1f2937;
+      flex-shrink: 0; z-index: 10;
+    }
+    .header-title { font-size: 14px; font-weight: 700; color: #f9fafb; }
+    #userLabel { font-size: 11px; color: #6b7280; margin-top: 1px; }
+    .logout-btn {
+      padding: 6px 12px; border-radius: 6px; background: transparent;
+      border: 1px solid #374151; color: #9ca3af; font-size: 12px; cursor: pointer;
+    }
+
+    /* map */
+    #map { flex: 1; width: 100%; }
+
+    /* locate btn */
+    .locate-btn {
+      position: fixed; bottom: 24px; right: 16px; z-index: 100;
+      width: 48px; height: 48px; border-radius: 50%; background: #1f2937;
+      border: 1px solid #374151; color: #60a5fa; font-size: 20px;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+
+    /* offline badge */
+    .offline-badge {
+      position: fixed; top: 60px; left: 50%; transform: translateX(-50%);
+      background: #f97316; color: #fff; font-size: 12px; font-weight: 700;
+      padding: 4px 14px; border-radius: 20px; z-index: 200;
+      display: none;
+    }
+
+    /* ===== MODAL ===== */
+    #pinModal {
+      display: none; position: fixed; inset: 0; z-index: 300;
+      align-items: flex-end; justify-content: center;
+      background: rgba(0,0,0,0.5);
+    }
+    .modal-sheet {
+      background: #1f2937; border-radius: 20px 20px 0 0;
+      padding: 24px 20px 32px; width: 100%; max-width: 520px;
+    }
+    .modal-handle {
+      width: 36px; height: 4px; background: #374151; border-radius: 2px;
+      margin: 0 auto 16px;
+    }
+    .modal-title { font-size: 17px; font-weight: 700; color: #f9fafb; margin-bottom: 16px; }
+    .address-box {
+      background: #111827; border-radius: 8px; padding: 10px 12px;
+      font-size: 13px; color: #9ca3af; margin-bottom: 16px; line-height: 1.5;
+    }
+    .field-label { font-size: 12px; color: #6b7280; font-weight: 500; margin-bottom: 6px; }
+    .status-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px;
+    }
+    .status-option { display: none; }
+    .status-label {
+      display: flex; align-items: center; justify-content: center;
+      padding: 10px 8px; border-radius: 8px; border: 2px solid #374151;
+      font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.15s;
+      color: #9ca3af;
+    }
+    .status-option:checked + .status-label { border-color: transparent; color: #fff; }
+    #s-tochi:checked    + .status-label { background: #10B981; }
+    #s-tatemono:checked + .status-label { background: #EF4444; }
+    #s-rentou:checked   + .status-label { background: #F97316; }
+    #s-shintiku:checked + .status-label { background: #9CA3AF; }
+    #s-souko:checked    + .status-label { background: #EAB308; color: #111; }
+    #s-shueki:checked   + .status-label { background: #8B5CF6; }
+    #s-hansha:checked   + .status-label { background: #1f2937; }
+
+    textarea#memo {
+      width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #374151;
+      background: #111827; color: #f9fafb; font-size: 14px; font-family: inherit;
+      resize: none; height: 72px; outline: none; margin-bottom: 16px;
+    }
+    textarea#memo:focus { border-color: #3b82f6; }
+
+    .modal-actions { display: flex; gap: 8px; }
+    #saveBtn {
+      flex: 1; padding: 14px; border-radius: 10px; background: #3b82f6;
+      color: #fff; font-size: 15px; font-weight: 700; border: none; cursor: pointer;
+    }
+    #saveBtn:disabled { background: #374151; }
+    .cancel-btn {
+      padding: 14px 18px; border-radius: 10px; background: #374151;
+      color: #9ca3af; font-size: 15px; border: none; cursor: pointer;
+    }
+    #deleteBtn {
+      padding: 14px 16px; border-radius: 10px; background: transparent;
+      border: 1px solid #ef4444; color: #ef4444; font-size: 14px; cursor: pointer;
+    }
+
+    /* ===== TOAST ===== */
+    .toast {
+      position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+      padding: 10px 20px; border-radius: 20px; font-size: 13px; font-weight: 500;
+      z-index: 999; opacity: 0; transition: opacity 0.3s; pointer-events: none;
+      white-space: nowrap;
+    }
+    .toast.ok   { background: #065f46; color: #6ee7b7; }
+    .toast.error{ background: #7f1d1d; color: #fca5a5; }
+    .toast.warn { background: #78350f; color: #fcd34d; }
+  </style>
+</head>
+<body>
+
+<!-- ===== LOGIN ===== -->
+<div id="loginScreen">
+  <div class="login-logo">HOUSE MARKET</div>
+  <div class="login-title">空家マップ｜現地調査</div>
+  <div class="login-box">
+    <input id="email" type="email" placeholder="メールアドレス" autocomplete="email">
+    <input id="pass"  type="password" placeholder="パスワード" autocomplete="current-password">
+    <button id="loginBtn" onclick="doLogin()">ログイン</button>
+  </div>
+</div>
+
+<!-- ===== MAP SCREEN ===== -->
+<div id="mapScreen">
+  <div class="header">
+    <div>
+      <div class="header-title">🏚 空家マップ</div>
+      <div id="userLabel"></div>
+    </div>
+    <button class="logout-btn" onclick="doLogout()">ログアウト</button>
+  </div>
+  <div id="map"></div>
+  <div class="offline-badge" id="offlineBadge">📡 オフライン</div>
+  <button class="locate-btn" onclick="locateMe()" title="現在地">📍</button>
+</div>
+
+<!-- ===== PIN MODAL ===== -->
+<div id="pinModal" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <div class="modal-handle"></div>
+    <div class="modal-title" id="modalTitle">ピンを追加</div>
+    <div class="address-box" id="addressLabel">住所取得中…</div>
+
+    <div class="field-label">ステータス</div>
+    <div class="status-grid">
+      <div>
+        <input class="status-option" type="radio" name="status" id="s-tochi" value="tochi" checked>
+        <label class="status-label" for="s-tochi">🌿 土地</label>
+      </div>
+      <div>
+        <input class="status-option" type="radio" name="status" id="s-tatemono" value="tatemono">
+        <label class="status-label" for="s-tatemono">🏚 建物</label>
+      </div>
+      <div>
+        <input class="status-option" type="radio" name="status" id="s-rentou" value="rentou">
+        <label class="status-label" for="s-rentou">🏘 連棟</label>
+      </div>
+      <div>
+        <input class="status-option" type="radio" name="status" id="s-shintiku" value="shintiku">
+        <label class="status-label" for="s-shintiku">🏠 新築</label>
+      </div>
+      <div>
+        <input class="status-option" type="radio" name="status" id="s-souko" value="souko">
+        <label class="status-label" for="s-souko">🏗 倉庫</label>
+      </div>
+      <div>
+        <input class="status-option" type="radio" name="status" id="s-shueki" value="shueki">
+        <label class="status-label" for="s-shueki">🏢 収益</label>
+      </div>
+      <div>
+        <input class="status-option" type="radio" name="status" id="s-hansha" value="hansha">
+        <label class="status-label" for="s-hansha">⚫ 反社</label>
+      </div>
+    </div>
+
+    <!-- hidden select for JS read -->
+    <select id="statusSelect" style="display:none">
+      <option value="tochi">土地</option>
+      <option value="tatemono">建物</option>
+      <option value="rentou">連棟</option>
+      <option value="shintiku">新築</option>
+      <option value="souko">倉庫</option>
+      <option value="shueki">収益</option>
+      <option value="hansha">反社</option>
+    </select>
+
+    <div class="field-label">メモ</div>
+    <textarea id="memo" placeholder="気づいたことを入力（任意）"></textarea>
+
+    <div class="modal-actions">
+      <button class="cancel-btn" onclick="closeModal()">キャンセル</button>
+      <button id="saveBtn" onclick="savePin()">保存</button>
+      <button id="deleteBtn" onclick="deletePin()" style="display:none">削除</button>
+    </div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<script>
+  // ラジオ→hiddenSelectの同期
+  document.querySelectorAll('.status-option').forEach(r => {
+    r.addEventListener('change', () => {
+      document.getElementById('statusSelect').value = r.value;
+    });
+  });
+  // hiddenSelect→ラジオの同期（編集時）
+  const origStatusSet = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+  // offline badge
+  function updateOnlineStatus() {
+    document.getElementById('offlineBadge').style.display = navigator.onLine ? 'none' : 'block';
+  }
+  window.addEventListener('online', updateOnlineStatus);
+  window.addEventListener('offline', updateOnlineStatus);
+  updateOnlineStatus();
+</script>
+
+</body>
+</html>
