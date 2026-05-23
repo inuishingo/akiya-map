@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZENRIN API テスト</title>
+  <style>
+    body { font-family: sans-serif; padding: 24px; background: #0f172a; color: #f0f0f0; }
+    h2 { margin-bottom: 16px; color: #60a5fa; }
+    .card { background: #1e293b; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    label { font-size: 13px; color: #94a3b8; }
+    input { width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid #334155;
+      background: #0f172a; color: #f0f0f0; font-size: 14px; margin: 4px 0 12px; box-sizing: border-box; }
+    button {
+      padding: 10px 20px; border-radius: 6px; background: #3b82f6; color: #fff;
+      border: none; cursor: pointer; font-size: 14px; font-weight: 700; margin-right: 8px;
+    }
+    button:hover { background: #2563eb; }
+    pre {
+      background: #0f172a; border-radius: 6px; padding: 12px;
+      font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+      color: #86efac; margin-top: 12px; min-height: 40px;
+    }
+    .status { font-size: 12px; margin-top: 8px; }
+    .ok { color: #4ade80; }
+    .err { color: #f87171; }
+    .section-title { font-size: 14px; font-weight: 700; color: #fbbf24; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+
+<h2>🔍 ZENRIN Maps API 動作テスト</h2>
+
+<div class="card">
+  <div class="section-title">① 住所逆引き（緯度経度 → 住所）</div>
+  <label>緯度</label>
+  <input id="lat1" value="35.170915" />
+  <label>経度</label>
+  <input id="lng1" value="136.881537" />
+  <button onclick="testReverse()">テスト実行</button>
+  <div class="status" id="status1"></div>
+  <pre id="result1">ここに結果が表示されます</pre>
+</div>
+
+<div class="card">
+  <div class="section-title">② 住所地番変換（住所 → 地番）</div>
+  <label>住所</label>
+  <input id="addr2" value="愛知県名古屋市中村区椿町17-16" />
+  <button onclick="testChiban()">テスト実行</button>
+  <div class="status" id="status2"></div>
+  <pre id="result2">ここに結果が表示されます</pre>
+</div>
+
+<div class="card">
+  <div class="section-title">③ 建物ターゲティング（座標 → 建物情報）</div>
+  <label>緯度</label>
+  <input id="lat3" value="35.170915" />
+  <label>経度</label>
+  <input id="lng3" value="136.881537" />
+  <button onclick="testBuilding()">テスト実行</button>
+  <div class="status" id="status3"></div>
+  <pre id="result3">ここに結果が表示されます</pre>
+</div>
+
+<script>
+  const API_KEY = "2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW";
+  const BASE = "https://test-web.zmaps-api.com";
+
+  async function callZenrin(url, statusEl, resultEl) {
+    statusEl.textContent = "通信中…";
+    statusEl.className = "status";
+    resultEl.textContent = "取得中…";
+    try {
+      const res = await fetch(url, {
+        headers: { "x-api-key": API_KEY }
+      });
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); } catch { json = text; }
+      if (res.ok) {
+        statusEl.textContent = `✅ HTTP ${res.status} OK`;
+        statusEl.className = "status ok";
+        resultEl.textContent = typeof json === "object" ? JSON.stringify(json, null, 2) : text;
+      } else {
+        statusEl.textContent = `❌ HTTP ${res.status} エラー`;
+        statusEl.className = "status err";
+        resultEl.textContent = typeof json === "object" ? JSON.stringify(json, null, 2) : text;
+      }
+    } catch(e) {
+      statusEl.textContent = `❌ 通信エラー: ${e.message}`;
+      statusEl.className = "status err";
+      resultEl.textContent = e.toString();
+    }
+  }
+
+  // ① 住所逆引き
+  async function testReverse() {
+    const lat = document.getElementById("lat1").value;
+    const lng = document.getElementById("lng1").value;
+    const url = `${BASE}/address/reverse?lat=${lat}&lon=${lng}&datum=world&unit=degree`;
+    await callZenrin(url, document.getElementById("status1"), document.getElementById("result1"));
+  }
+
+  // ② 住所地番変換
+  async function testChiban() {
+    const addr = encodeURIComponent(document.getElementById("addr2").value);
+    const url = `${BASE}/address/chiban?address=${addr}`;
+    await callZenrin(url, document.getElementById("status2"), document.getElementById("result2"));
+  }
+
+  // ③ 建物ターゲティング
+  async function testBuilding() {
+    const lat = document.getElementById("lat3").value;
+    const lng = document.getElementById("lng3").value;
+    const url = `${BASE}/search/targeting?lat=${lat}&lon=${lng}&datum=world`;
+    await callZenrin(url, document.getElementById("status3"), document.getElementById("result3"));
+  }
+</script>
+
+</body>
+</html>
