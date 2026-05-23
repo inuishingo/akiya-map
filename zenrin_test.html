@@ -97,14 +97,14 @@
   async function testReverse() {
     const lat = document.getElementById("lat1").value;
     const lng = document.getElementById("lng1").value;
-    const url = `${BASE}/address/reverse?lat=${lat}&lon=${lng}&datum=world&unit=degree`;
+    const url = `${BASE}/search/address?lat=${lat}&lon=${lng}&datum=world&unit=degree`;
     await callZenrin(url, document.getElementById("status1"), document.getElementById("result1"));
   }
 
   // ② 住所地番変換
   async function testChiban() {
     const addr = encodeURIComponent(document.getElementById("addr2").value);
-    const url = `${BASE}/address/chiban?address=${addr}`;
+    const url = `${BASE}/coding/address_to_bluemap?address=${addr}`;
     await callZenrin(url, document.getElementById("status2"), document.getElementById("result2"));
   }
 
@@ -112,7 +112,7 @@
   async function testBuilding() {
     const lat = document.getElementById("lat3").value;
     const lng = document.getElementById("lng3").value;
-    const url = `${BASE}/search/targeting?lat=${lat}&lon=${lng}&datum=world`;
+    const url = `${BASE}/coding/targeting?lat=${lat}&lon=${lng}&datum=world`;
     await callZenrin(url, document.getElementById("status3"), document.getElementById("result3"));
   }
 </script>
