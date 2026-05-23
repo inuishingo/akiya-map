@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZENRIN JS API テスト</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #0f172a; color: #f0f0f0; }
+    .header { padding: 12px 16px; background: #1e293b; font-size: 15px; font-weight: 700; color: #60a5fa; }
+    #ZMap { position: absolute; top: 48px; bottom: 120px; width: 100%; }
+    .panel {
+      position: absolute; bottom: 0; left: 0; right: 0; height: 120px;
+      background: #1e293b; padding: 12px 16px; border-top: 1px solid #334155;
+    }
+    .result-label { font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+    .result-box {
+      background: #0f172a; border-radius: 6px; padding: 8px 12px;
+      font-size: 12px; color: #86efac; height: 72px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .toast {
+      position: fixed; top: 60px; left: 50%; transform: translateX(-50%);
+      background: #065f46; color: #6ee7b7; padding: 8px 20px; border-radius: 20px;
+      font-size: 13px; font-weight: 700; z-index: 9999;
+      opacity: 0; transition: opacity 0.3s; pointer-events: none;
+    }
+  </style>
+  <!-- ZENRIN JavaScript API ローダー（検証環境） -->
+  <script src="https://test-js.zmaps-api.com/zma_loader.js?key=2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW&auth=referer"></script>
+</head>
+<body>
+
+<div class="header">🔍 ZENRIN Maps API テスト｜地図タップで住所取得</div>
+<div id="ZMap"></div>
+<div class="panel">
+  <div class="result-label">タップした場所の情報</div>
+  <div class="result-box" id="resultBox">地図をタップしてください…</div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+  ZMALoader.setOnLoad(function(mapOptions, error) {
+    if (error) {
+      document.getElementById("resultBox").textContent = "❌ ZENRINロードエラー: " + JSON.stringify(error);
+      return;
+    }
+
+    // 名古屋駅を中心に表示
+    mapOptions.center = new ZDC.LatLng(35.170915, 136.881537);
+    mapOptions.zoom = 15;
+
+    const mapElement = document.getElementById("ZMap");
+    const map = new ZDC.Map(
+      mapElement,
+      mapOptions,
+      function() {
+        // コントロール追加
+        map.addControl(new ZDC.ZoomButton("top-left"));
+        map.addControl(new ZDC.ScaleBar("bottom-left"));
+
+        showToast("✅ ZENRINマップ 読み込み成功！");
+        document.getElementById("resultBox").textContent = "✅ 地図の読み込み成功！\nタップした場所の緯度経度と住所が表示されます。";
+
+        // タップイベント
+        map.addEventListener("click", async function(e) {
+          const lat = e.latlng.lat;
+          const lng = e.latlng.lng;
+
+          document.getElementById("resultBox").textContent = `緯度: ${lat}\n経度: ${lng}\n住所: 取得中…`;
+
+          // Web API 住所逆引き（URLパラメータにAPIキー）
+          try {
+            const url = `https://test-web.zmaps-api.com/search/address?lat=${lat}&lon=${lng}&datum=world&unit=degree&key=2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW`;
+            const res = await fetch(url);
+            const json = await res.json();
+            document.getElementById("resultBox").textContent =
+              `緯度: ${lat}\n経度: ${lng}\n\nAPIレスポンス:\n${JSON.stringify(json, null, 2)}`;
+            if (res.ok) showToast("取得成功！");
+          } catch(err) {
+            document.getElementById("resultBox").textContent =
+              `緯度: ${lat}\n経度: ${lng}\n\nエラー: ${err.message}`;
+          }
+        });
+      },
+      function(err) {
+        document.getElementById("resultBox").textContent = "❌ マップ初期化エラー: " + JSON.stringify(err);
+      }
+    );
+  });
+
+  function showToast(msg) {
+    const t = document.getElementById("toast");
+    t.textContent = msg;
+    t.style.opacity = "1";
+    setTimeout(() => { t.style.opacity = "0"; }, 2500);
+  }
+</script>
+
+</body>
+</html>
