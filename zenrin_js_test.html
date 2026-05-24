@@ -62,12 +62,23 @@
         showToast("✅ ZENRINマップ 読み込み成功！");
         document.getElementById("resultBox").textContent = "✅ 地図の読み込み成功！\nタップした場所の緯度経度と住所が表示されます。";
 
-        // タップイベント
+// タップイベント
         map.addEventListener("click", async function(e) {
           const lat = e.latlng.lat;
           const lng = e.latlng.lng;
-
           document.getElementById("resultBox").textContent = `緯度: ${lat}\n経度: ${lng}\n住所: 取得中…`;
+          try {
+            const url = `https://zenrin-ptddjpvgeq-an.a.run.app/zenrin?type=reverse&lat=${lat}&lon=${lng}`;
+            const res = await fetch(url);
+            const json = await res.json();
+            document.getElementById("resultBox").textContent =
+              `緯度: ${lat}\n経度: ${lng}\n\nAPIレスポンス:\n${JSON.stringify(json, null, 2)}`;
+            if (res.ok) showToast("取得成功！");
+          } catch(err) {
+            document.getElementById("resultBox").textContent =
+              `緯度: ${lat}\n経度: ${lng}\n\nエラー: ${err.message}`;
+          }
+        });
 
           // Web API 住所逆引き（URLパラメータにAPIキー）
           try {
