@@ -199,10 +199,10 @@
       document.getElementById("addressLabel").textContent = "住所取得中…";
       try {
         const res = await fetch(
-          `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latlng.lat},${latlng.lng}&language=ja&key=${GMAPS_KEY}`
+          `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`
         );
         const json = await res.json();
-        const addr = json.results[0]?.formatted_address?.replace("日本、", "") || "住所不明";
+        const addr = json.result?.item?.[0]?.address || "住所不明";
         document.getElementById("addressLabel").textContent = addr;
       } catch {
         document.getElementById("addressLabel").textContent = "（オフライン）";
