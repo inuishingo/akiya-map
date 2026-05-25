@@ -9,6 +9,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
 
+  <!-- ZENRIN Maps JavaScript API -->
+  <script src="https://test-js.zmaps-api.com/zma_loader.js?key=2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW&auth=referer"></script>
+
   <!-- Firebase SDK -->
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
@@ -29,8 +32,6 @@
     const app = initializeApp(firebaseConfig);
     const auth = getAuth(app);
     const db = getFirestore(app);
-
-    const GMAPS_KEY = "AIzaSyDbZVrgxEDAke-HG5sgYT0AEOChsBSNtck";
 
     // ===== STATE =====
     let map = null;
@@ -104,35 +105,54 @@
     // ===== MAP INIT =====
     function initMap() {
       if (map) return;
-      map = new google.maps.Map(document.getElementById("map"), {
-        center: { lat: 35.1709, lng: 136.8815 }, // 名古屋
-        zoom: 15,
-        mapTypeId: "roadmap",
-        disableDefaultUI: true,
-        zoomControl: true,
-        gestureHandling: "greedy",
+      ZMALoader.setOnLoad(function(mapOptions, error) {
+        if (error) {
+          showToast("地図の読み込みに失敗しました", "error");
+          return;
+        }
+
+        // 名古屋駅付近を初期表示
+        mapOptions.center = new ZDC.LatLng(35.1709, 136.8815);
+        mapOptions.zoom = 15;
+        mapOptions.movable = true;
+        mapOptions.zoomable = true;
+        mapOptions.touchOperation = true;
+        mapOptions.mouseOperation = true;
+
+        map = new ZDC.Map(
+          document.getElementById("map"),
+          mapOptions,
+          function() {
+            // コントロール追加
+            map.addControl(new ZDC.ZoomButton('top-left'));
+            map.addControl(new ZDC.ScaleBar('bottom-left'));
+
+            // 現在地に移動
+            if (navigator.geolocation) {
+              navigator.geolocation.getCurrentPosition(pos => {
+                map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
+              });
+            }
+
+            // クリックでピン追加
+            map.addEventListener("click", function(e) {
+              pendingLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
+              openPinModal();
+            });
+
+            loadMyPins();
+          },
+          function() {
+            showToast("地図の初期化に失敗しました", "error");
+          }
+        );
       });
-
-      // 現在地
-      if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition(pos => {
-          map.setCenter({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-        });
-      }
-
-      map.addListener("click", e => {
-        pendingLatLng = { lat: e.latLng.lat(), lng: e.latLng.lng() };
-        openPinModal();
-      });
-
-      loadMyPins();
     }
-    window.initMap = initMap;
 
     // ===== LOAD PINS =====
     async function loadMyPins() {
       if (!currentUser) return;
-      markers.forEach(m => m.setMap(null));
+      markers.forEach(m => map.removeWidget(m));
       markers = [];
       try {
         const q = query(collection(db, "pins"), where("uid", "==", currentUser.uid));
@@ -144,24 +164,20 @@
     }
 
     function renderMarker(id, data) {
-      const s = STATUS[data.status] || STATUS.akiya;
-      const marker = new google.maps.Marker({
-        position: { lat: data.lat, lng: data.lng },
-        map,
-        title: s.label,
-        icon: {
-          path: google.maps.SymbolPath.CIRCLE,
-          scale: 14,
-          fillColor: s.color,
-          fillOpacity: 1,
-          strokeColor: "#fff",
-          strokeWeight: 2,
-        },
-        label: { text: s.label[0], color: "#fff", fontSize: "11px", fontWeight: "bold" }
-      });
+      const s = STATUS[data.status] || STATUS.tochi;
+      const marker = new ZDC.Marker(
+        new ZDC.LatLng(data.lat, data.lng),
+        {
+          color: s.color,
+          text: s.label[0],
+        }
+      );
       marker.pinId = id;
       marker.pinData = data;
-      marker.addListener("click", () => openEditModal(id, data, marker));
+      marker.addEventListener("click", function() {
+        openEditModal(id, data, marker);
+      });
+      map.addWidget(marker);
       markers.push(marker);
     }
 
@@ -169,7 +185,7 @@
     function openPinModal() {
       editingPinId = null;
       document.getElementById("modalTitle").textContent = "ピンを追加";
-      document.getElementById("statusSelect").value = "akiya";
+      document.getElementById("statusSelect").value = "tochi";
       document.getElementById("memo").value = "";
       document.getElementById("deleteBtn").style.display = "none";
       document.getElementById("pinModal").style.display = "flex";
@@ -194,7 +210,7 @@
       editingPinId = null;
     };
 
-    // ===== GEOCODE =====
+    // ===== GEOCODE（ZENRIN）=====
     async function reverseGeocode(latlng) {
       document.getElementById("addressLabel").textContent = "住所取得中…";
       try {
@@ -220,7 +236,6 @@
       btn.textContent = "保存中…";
 
       if (editingPinId) {
-        // 編集
         try {
           await updateDoc(doc(db, "pins", editingPinId), { status, memo, address });
           showToast("更新しました");
@@ -230,7 +245,6 @@
           showToast("更新に失敗しました", "error");
         }
       } else {
-        // 新規
         const pinData = {
           uid: currentUser.uid,
           email: currentUser.email,
@@ -288,9 +302,9 @@
 
     // ===== LOCATE =====
     window.locateMe = () => {
-      if (!navigator.geolocation) return;
+      if (!navigator.geolocation || !map) return;
       navigator.geolocation.getCurrentPosition(pos => {
-        map.panTo({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
         map.setZoom(17);
       });
     };
@@ -303,30 +317,20 @@
     });
   </script>
 
-  <!-- Google Maps -->
-  <script async
-    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDbZVrgxEDAke-HG5sgYT0AEOChsBSNtck&callback=initMap&language=ja">
-  </script>
-
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Noto Sans JP', sans-serif; background: #0f1117; color: #f0f0f0; height: 100dvh; overflow: hidden; }
 
-    /* ===== LOGIN ===== */
     #loginScreen {
       display: flex; flex-direction: column; align-items: center; justify-content: center;
       height: 100dvh; background: #0f1117; gap: 16px; padding: 24px;
     }
-    .login-logo {
-      font-size: 13px; font-weight: 700; letter-spacing: 0.15em; color: #6b7280;
-      text-transform: uppercase; margin-bottom: 4px;
-    }
+    .login-logo { font-size: 13px; font-weight: 700; letter-spacing: 0.15em; color: #6b7280; text-transform: uppercase; margin-bottom: 4px; }
     .login-title { font-size: 22px; font-weight: 700; color: #f9fafb; margin-bottom: 16px; }
     .login-box { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 12px; }
     .login-box input {
       width: 100%; padding: 14px 16px; border-radius: 10px; border: 1px solid #374151;
-      background: #1f2937; color: #f9fafb; font-size: 15px; font-family: inherit;
-      outline: none; transition: border 0.2s;
+      background: #1f2937; color: #f9fafb; font-size: 15px; font-family: inherit; outline: none; transition: border 0.2s;
     }
     .login-box input:focus { border-color: #3b82f6; }
     #loginBtn {
@@ -336,10 +340,7 @@
     #loginBtn:hover { background: #2563eb; }
     #loginBtn:disabled { background: #374151; cursor: not-allowed; }
 
-    /* ===== MAP SCREEN ===== */
     #mapScreen { display: none; flex-direction: column; height: 100dvh; }
-
-    /* header */
     .header {
       display: flex; align-items: center; justify-content: space-between;
       padding: 10px 14px; background: #111827; border-bottom: 1px solid #1f2937;
@@ -351,11 +352,7 @@
       padding: 6px 12px; border-radius: 6px; background: transparent;
       border: 1px solid #374151; color: #9ca3af; font-size: 12px; cursor: pointer;
     }
-
-    /* map */
     #map { flex: 1; width: 100%; }
-
-    /* locate btn */
     .locate-btn {
       position: fixed; bottom: 24px; right: 16px; z-index: 100;
       width: 48px; height: 48px; border-radius: 50%; background: #1f2937;
@@ -363,16 +360,12 @@
       display: flex; align-items: center; justify-content: center;
       cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
     }
-
-    /* offline badge */
     .offline-badge {
       position: fixed; top: 60px; left: 50%; transform: translateX(-50%);
       background: #f97316; color: #fff; font-size: 12px; font-weight: 700;
-      padding: 4px 14px; border-radius: 20px; z-index: 200;
-      display: none;
+      padding: 4px 14px; border-radius: 20px; z-index: 200; display: none;
     }
 
-    /* ===== MODAL ===== */
     #pinModal {
       display: none; position: fixed; inset: 0; z-index: 300;
       align-items: flex-end; justify-content: center;
@@ -382,25 +375,19 @@
       background: #1f2937; border-radius: 20px 20px 0 0;
       padding: 24px 20px 32px; width: 100%; max-width: 520px;
     }
-    .modal-handle {
-      width: 36px; height: 4px; background: #374151; border-radius: 2px;
-      margin: 0 auto 16px;
-    }
+    .modal-handle { width: 36px; height: 4px; background: #374151; border-radius: 2px; margin: 0 auto 16px; }
     .modal-title { font-size: 17px; font-weight: 700; color: #f9fafb; margin-bottom: 16px; }
     .address-box {
       background: #111827; border-radius: 8px; padding: 10px 12px;
       font-size: 13px; color: #9ca3af; margin-bottom: 16px; line-height: 1.5;
     }
     .field-label { font-size: 12px; color: #6b7280; font-weight: 500; margin-bottom: 6px; }
-    .status-grid {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px;
-    }
+    .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
     .status-option { display: none; }
     .status-label {
       display: flex; align-items: center; justify-content: center;
       padding: 10px 8px; border-radius: 8px; border: 2px solid #374151;
-      font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.15s;
-      color: #9ca3af;
+      font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.15s; color: #9ca3af;
     }
     .status-option:checked + .status-label { border-color: transparent; color: #fff; }
     #s-tochi:checked    + .status-label { background: #10B981; }
@@ -417,37 +404,27 @@
       resize: none; height: 72px; outline: none; margin-bottom: 16px;
     }
     textarea#memo:focus { border-color: #3b82f6; }
-
     .modal-actions { display: flex; gap: 8px; }
     #saveBtn {
       flex: 1; padding: 14px; border-radius: 10px; background: #3b82f6;
       color: #fff; font-size: 15px; font-weight: 700; border: none; cursor: pointer;
     }
     #saveBtn:disabled { background: #374151; }
-    .cancel-btn {
-      padding: 14px 18px; border-radius: 10px; background: #374151;
-      color: #9ca3af; font-size: 15px; border: none; cursor: pointer;
-    }
-    #deleteBtn {
-      padding: 14px 16px; border-radius: 10px; background: transparent;
-      border: 1px solid #ef4444; color: #ef4444; font-size: 14px; cursor: pointer;
-    }
+    .cancel-btn { padding: 14px 18px; border-radius: 10px; background: #374151; color: #9ca3af; font-size: 15px; border: none; cursor: pointer; }
+    #deleteBtn { padding: 14px 16px; border-radius: 10px; background: transparent; border: 1px solid #ef4444; color: #ef4444; font-size: 14px; cursor: pointer; }
 
-    /* ===== TOAST ===== */
     .toast {
       position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
       padding: 10px 20px; border-radius: 20px; font-size: 13px; font-weight: 500;
-      z-index: 999; opacity: 0; transition: opacity 0.3s; pointer-events: none;
-      white-space: nowrap;
+      z-index: 999; opacity: 0; transition: opacity 0.3s; pointer-events: none; white-space: nowrap;
     }
-    .toast.ok   { background: #065f46; color: #6ee7b7; }
-    .toast.error{ background: #7f1d1d; color: #fca5a5; }
-    .toast.warn { background: #78350f; color: #fcd34d; }
+    .toast.ok    { background: #065f46; color: #6ee7b7; }
+    .toast.error { background: #7f1d1d; color: #fca5a5; }
+    .toast.warn  { background: #78350f; color: #fcd34d; }
   </style>
 </head>
 <body>
 
-<!-- ===== LOGIN ===== -->
 <div id="loginScreen">
   <div class="login-logo">HOUSE MARKET</div>
   <div class="login-title">空家マップ｜現地調査</div>
@@ -458,7 +435,6 @@
   </div>
 </div>
 
-<!-- ===== MAP SCREEN ===== -->
 <div id="mapScreen">
   <div class="header">
     <div>
@@ -472,46 +448,21 @@
   <button class="locate-btn" onclick="locateMe()" title="現在地">📍</button>
 </div>
 
-<!-- ===== PIN MODAL ===== -->
 <div id="pinModal" onclick="if(event.target===this)closeModal()">
   <div class="modal-sheet">
     <div class="modal-handle"></div>
     <div class="modal-title" id="modalTitle">ピンを追加</div>
     <div class="address-box" id="addressLabel">住所取得中…</div>
-
     <div class="field-label">ステータス</div>
     <div class="status-grid">
-      <div>
-        <input class="status-option" type="radio" name="status" id="s-tochi" value="tochi" checked>
-        <label class="status-label" for="s-tochi">🌿 土地</label>
-      </div>
-      <div>
-        <input class="status-option" type="radio" name="status" id="s-tatemono" value="tatemono">
-        <label class="status-label" for="s-tatemono">🏚 建物</label>
-      </div>
-      <div>
-        <input class="status-option" type="radio" name="status" id="s-rentou" value="rentou">
-        <label class="status-label" for="s-rentou">🏘 連棟</label>
-      </div>
-      <div>
-        <input class="status-option" type="radio" name="status" id="s-shintiku" value="shintiku">
-        <label class="status-label" for="s-shintiku">🏠 新築</label>
-      </div>
-      <div>
-        <input class="status-option" type="radio" name="status" id="s-souko" value="souko">
-        <label class="status-label" for="s-souko">🏗 倉庫</label>
-      </div>
-      <div>
-        <input class="status-option" type="radio" name="status" id="s-shueki" value="shueki">
-        <label class="status-label" for="s-shueki">🏢 収益</label>
-      </div>
-      <div>
-        <input class="status-option" type="radio" name="status" id="s-hansha" value="hansha">
-        <label class="status-label" for="s-hansha">⚫ 反社</label>
-      </div>
+      <div><input class="status-option" type="radio" name="status" id="s-tochi" value="tochi" checked><label class="status-label" for="s-tochi">🌿 土地</label></div>
+      <div><input class="status-option" type="radio" name="status" id="s-tatemono" value="tatemono"><label class="status-label" for="s-tatemono">🏚 建物</label></div>
+      <div><input class="status-option" type="radio" name="status" id="s-rentou" value="rentou"><label class="status-label" for="s-rentou">🏘 連棟</label></div>
+      <div><input class="status-option" type="radio" name="status" id="s-shintiku" value="shintiku"><label class="status-label" for="s-shintiku">🏠 新築</label></div>
+      <div><input class="status-option" type="radio" name="status" id="s-souko" value="souko"><label class="status-label" for="s-souko">🏗 倉庫</label></div>
+      <div><input class="status-option" type="radio" name="status" id="s-shueki" value="shueki"><label class="status-label" for="s-shueki">🏢 収益</label></div>
+      <div><input class="status-option" type="radio" name="status" id="s-hansha" value="hansha"><label class="status-label" for="s-hansha">⚫ 反社</label></div>
     </div>
-
-    <!-- hidden select for JS read -->
     <select id="statusSelect" style="display:none">
       <option value="tochi">土地</option>
       <option value="tatemono">建物</option>
@@ -521,10 +472,8 @@
       <option value="shueki">収益</option>
       <option value="hansha">反社</option>
     </select>
-
     <div class="field-label">メモ</div>
     <textarea id="memo" placeholder="気づいたことを入力（任意）"></textarea>
-
     <div class="modal-actions">
       <button class="cancel-btn" onclick="closeModal()">キャンセル</button>
       <button id="saveBtn" onclick="savePin()">保存</button>
@@ -533,19 +482,14 @@
   </div>
 </div>
 
-<!-- TOAST -->
 <div class="toast" id="toast"></div>
 
 <script>
-  // ラジオ→hiddenSelectの同期
   document.querySelectorAll('.status-option').forEach(r => {
     r.addEventListener('change', () => {
       document.getElementById('statusSelect').value = r.value;
     });
   });
-  // hiddenSelect→ラジオの同期（編集時）
-  const origStatusSet = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-  // offline badge
   function updateOnlineStatus() {
     document.getElementById('offlineBadge').style.display = navigator.onLine ? 'none' : 'block';
   }
