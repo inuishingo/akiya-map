@@ -253,7 +253,7 @@
       } catch(e) { showToast("削除に失敗しました", "error"); }
     };
 
-   // ===== MAP MARKERS =====
+  // ===== MAP MARKERS =====
     function renderMapMarkers() {
       if (!map) return;
       markers.forEach(m => map.removeWidget(m));
@@ -261,11 +261,24 @@
       filtered().forEach(p => {
         const s = STATUS[p.status] || STATUS.tatemono;
         const isSelected = selectedPinId === p.id;
+
+        const color = isSelected ? "#facc15" : s.color;
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="40" viewBox="0 0 32 40">
+          <ellipse cx="16" cy="38" rx="6" ry="2" fill="rgba(0,0,0,0.2)"/>
+          <path d="M16 0 C7.16 0 0 7.16 0 16 C0 28 16 40 16 40 C16 40 32 28 32 16 C32 7.16 24.84 0 16 0Z" fill="${color}"/>
+          <text x="16" y="20" text-anchor="middle" dominant-baseline="middle" fill="white" font-size="13" font-weight="bold" font-family="sans-serif">${isSelected ? "★" : s.label[0]}</text>
+        </svg>`;
+        const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
-          isSelected
-            ? { color: "#facc15", text: "★" }
-            : { color: s.color, text: s.label[0] }
+          {
+            icon: new ZDC.Icon({
+              url: url,
+              size: new ZDC.Size(32, 40),
+              anchor: new ZDC.Point(16, 40)
+            })
+          }
         );
         marker.pinId = p.id;
         marker.addEventListener("click", function() { selectPin(p.id); });
