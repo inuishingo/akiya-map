@@ -285,8 +285,24 @@
         card.scrollIntoView({ behavior: "smooth", block: "nearest" });
       }
 
-      // ピンの色を切り替え（再描画）
-      renderMapMarkers();
+      // ピンを再描画（選択ピンだけ黄色・大きく）
+      if (!map) return;
+      markers.forEach(m => map.removeWidget(m));
+      markers = [];
+      filtered().forEach(p => {
+        const s = STATUS[p.status] || STATUS.tatemono;
+        const isSelected = p.id === id;
+        const marker = new ZDC.Marker(
+          new ZDC.LatLng(p.lat, p.lng),
+          isSelected
+            ? { color: "#facc15", text: "★", width: 40, height: 40 }
+            : { color: s.color, text: s.label[0] }
+        );
+        marker.pinId = p.id;
+        marker.addEventListener("click", function() { selectPin(p.id); });
+        map.addWidget(marker);
+        markers.push(marker);
+      });
 
       // 地図移動
       const pin = allPins.find(p => p.id === id);
