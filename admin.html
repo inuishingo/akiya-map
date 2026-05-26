@@ -7,7 +7,6 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
 
-  <!-- ZENRIN Maps JavaScript API -->
   <script src="https://test-js.zmaps-api.com/zma_loader.js?key=2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW&auth=referer"></script>
 
   <script type="module">
@@ -48,6 +47,14 @@
       shueki:   { label: "収益",   color: "#8B5CF6", bg: "#f5f3ff", fg: "#5b21b6" },
       hansha:   { label: "反社",   color: "#1f2937", bg: "#111827", fg: "#d1d5db" },
     };
+
+    function makeSvgUrl(color, text) {
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="40" viewBox="0 0 32 40">
+        <path d="M16 0 C7.16 0 0 7.16 0 16 C0 28 16 40 16 40 C16 40 32 28 32 16 C32 7.16 24.84 0 16 0Z" fill="${color}"/>
+        <text x="16" y="21" text-anchor="middle" dominant-baseline="middle" fill="white" font-size="13" font-weight="bold" font-family="sans-serif">${text}</text>
+      </svg>`;
+      return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+    }
 
     // ===== AUTH =====
     onAuthStateChanged(auth, user => {
@@ -253,7 +260,7 @@
       } catch(e) { showToast("削除に失敗しました", "error"); }
     };
 
- // ===== MAP MARKERS =====
+    // ===== MAP MARKERS =====
     function renderMapMarkers() {
       if (!map) return;
       markers.forEach(m => map.removeWidget(m));
@@ -263,8 +270,7 @@
         const isSelected = selectedPinId === p.id;
         const color = isSelected ? "#facc15" : s.color;
         const text = isSelected ? "★" : s.label[0];
-        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="40" viewBox="0 0 32 40"><path d="M16 0 C7.16 0 0 7.16 0 16 C0 28 16 40 16 40 C16 40 32 28 32 16 C32 7.16 24.84 0 16 0Z" fill="${color}"/><text x="16" y="21" text-anchor="middle" dominant-baseline="middle" fill="white" font-size="13" font-weight="bold" font-family="sans-serif">${text}</text></svg>`;
-        const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+        const url = makeSvgUrl(color, text);
 
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
@@ -272,8 +278,8 @@
             custom: {
               base: {
                 imgSrc: url,
-                imgSize: [32, 40],
-                imgPos: [0, 0]
+                imgSize: { width: 32, height: 40 },
+                imgPos: { x: 16, y: 40 }
               }
             }
           }
@@ -284,12 +290,11 @@
         markers.push(marker);
       });
     }
-    
+
     // ===== SELECT PIN =====
     window.selectPin = (id) => {
       selectedPinId = id;
 
-      // リストのハイライト
       document.querySelectorAll(".pin-card").forEach(c => c.classList.remove("selected"));
       const card = document.getElementById(`card-${id}`);
       if (card) {
@@ -297,10 +302,8 @@
         card.scrollIntoView({ behavior: "smooth", block: "nearest" });
       }
 
-      // ピンを再描画
       renderMapMarkers();
 
-      // 地図移動
       const pin = allPins.find(p => p.id === id);
       if (pin && map) {
         map.setCenter(new ZDC.LatLng(pin.lat, pin.lng));
