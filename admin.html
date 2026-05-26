@@ -37,6 +37,7 @@
     let activeStaffFilter = "all";
     let activeDateFilter = "all";
     let checkedIds = new Set();
+    let selectedPinId = null;
 
     const STATUS = {
       tochi:    { label: "土地",   color: "#10B981", bg: "#ecfdf5", fg: "#065f46" },
@@ -191,9 +192,10 @@
         const s = STATUS[p.status] || STATUS.tatemono;
         const date = p.createdAt ? p.createdAt.slice(0, 10) : "–";
         const isChecked = checkedIds.has(p.id);
+        const isSelected = selectedPinId === p.id;
         const svUrl = `https://maps.google.com/maps?q=&layer=c&cbll=${p.lat},${p.lng}`;
         return `
-        <div class="pin-card ${isChecked ? "checked" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
+        <div class="pin-card ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
           <div class="pin-card-top">
             <input type="checkbox" class="pin-check" ${isChecked ? "checked" : ""}
               onclick="toggleCheck('${p.id}',event)">
@@ -258,10 +260,13 @@
       markers = [];
       filtered().forEach(p => {
         const s = STATUS[p.status] || STATUS.tatemono;
+        const isSelected = selectedPinId === p.id;
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
-          { color: s.color, text: s.label[0] }
+          { color: isSelected ? "#facc15" : s.color, text: s.label[0] }
         );
+        marker.pinId = p.id;
+        marker.pinColor = s.color;
         marker.addEventListener("click", function() { selectPin(p.id); });
         map.addWidget(marker);
         markers.push(marker);
@@ -270,9 +275,20 @@
 
     // ===== SELECT PIN =====
     window.selectPin = (id) => {
+      selectedPinId = id;
+
+      // リストのハイライト
       document.querySelectorAll(".pin-card").forEach(c => c.classList.remove("selected"));
       const card = document.getElementById(`card-${id}`);
-      if (card) { card.classList.add("selected"); card.scrollIntoView({ behavior: "smooth", block: "nearest" }); }
+      if (card) {
+        card.classList.add("selected");
+        card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+
+      // ピンの色を切り替え（再描画）
+      renderMapMarkers();
+
+      // 地図移動
       const pin = allPins.find(p => p.id === id);
       if (pin && map) {
         map.setCenter(new ZDC.LatLng(pin.lat, pin.lng));
@@ -431,8 +447,9 @@
       margin-bottom: 8px; cursor: pointer; transition: all 0.15s; background: #fff;
     }
     .pin-card:hover { border-color: #94a3b8; }
-    .pin-card.selected { border-color: #3b82f6; box-shadow: 0 0 0 2px #bfdbfe; }
+    .pin-card.selected { border-color: #3b82f6; box-shadow: 0 0 0 2px #bfdbfe; background: #eff6ff; }
     .pin-card.checked { background: #fef9c3; border-color: #eab308; }
+    .pin-card.checked.selected { background: #fef9c3; border-color: #3b82f6; }
 
     .pin-card-top { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
     .pin-check { width: 16px; height: 16px; cursor: pointer; flex-shrink: 0; }
