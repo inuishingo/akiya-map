@@ -40,13 +40,13 @@
     let selectedPinId = null;
 
     const STATUS = {
-      tochi:    { label: "土地",   color: "#10B981", bg: "#ecfdf5", fg: "#065f46" },
-      tatemono: { label: "建物",   color: "#EF4444", bg: "#fef2f2", fg: "#991b1b" },
-      rentou:   { label: "連棟",   color: "#F97316", bg: "#fff7ed", fg: "#9a3412" },
-      shintiku: { label: "新築",   color: "#9CA3AF", bg: "#f9fafb", fg: "#4b5563" },
-      souko:    { label: "倉庫",   color: "#EAB308", bg: "#fefce8", fg: "#854d0e" },
-      shueki:   { label: "収益",   color: "#8B5CF6", bg: "#f5f3ff", fg: "#5b21b6" },
-      hansha:   { label: "反社",   color: "#1f2937", bg: "#111827", fg: "#d1d5db" },
+      tochi:    { label: "土地",   styleId: "MARKER COLOR ID GREEN S",  bg: "#ecfdf5", fg: "#065f46" },
+      tatemono: { label: "建物",   styleId: "MARKER COLOR ID RED S",    bg: "#fef2f2", fg: "#991b1b" },
+      rentou:   { label: "連棟",   styleId: "MARKER COLOR ID RED S",    bg: "#fff7ed", fg: "#9a3412" },
+      shintiku: { label: "新築",   styleId: "MARKER COLOR ID GRAY S",   bg: "#f9fafb", fg: "#4b5563" },
+      souko:    { label: "倉庫",   styleId: "MARKER COLOR ID YELLOW S", bg: "#fefce8", fg: "#854d0e" },
+      shueki:   { label: "収益",   styleId: "MARKER COLOR ID BLUE S",   bg: "#f5f3ff", fg: "#5b21b6" },
+      hansha:   { label: "反社",   styleId: "MARKER COLOR ID BLACK S",  bg: "#111827", fg: "#d1d5db" },
     };
 
     // ===== AUTH =====
@@ -263,10 +263,9 @@
         const isSelected = selectedPinId === p.id;
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
-          { color: isSelected ? "#facc15" : s.color, text: s.label[0] }
+          { styleId: isSelected ? ZDC['MARKER COLOR ID YELLOW S'] : ZDC[s.styleId] }
         );
         marker.pinId = p.id;
-        marker.pinColor = s.color;
         marker.addEventListener("click", function() { selectPin(p.id); });
         map.addWidget(marker);
         markers.push(marker);
@@ -285,24 +284,8 @@
         card.scrollIntoView({ behavior: "smooth", block: "nearest" });
       }
 
-      // ピンを再描画（選択ピンだけ黄色・大きく）
-      if (!map) return;
-      markers.forEach(m => map.removeWidget(m));
-      markers = [];
-      filtered().forEach(p => {
-        const s = STATUS[p.status] || STATUS.tatemono;
-        const isSelected = p.id === id;
-        const marker = new ZDC.Marker(
-          new ZDC.LatLng(p.lat, p.lng),
-          isSelected
-            ? { color: "#facc15", text: "★", width: 40, height: 40 }
-            : { color: s.color, text: s.label[0] }
-        );
-        marker.pinId = p.id;
-        marker.addEventListener("click", function() { selectPin(p.id); });
-        map.addWidget(marker);
-        markers.push(marker);
-      });
+      // ピンを再描画
+      renderMapMarkers();
 
       // 地図移動
       const pin = allPins.find(p => p.id === id);
