@@ -267,29 +267,17 @@
       markers = [];
       filtered().forEach(p => {
         const s = STATUS[p.status] || STATUS.tatemono;
-        const isSelected = selectedPinId === p.id;
-        const color = isSelected ? "#facc15" : s.color;
-        const text = isSelected ? "★" : s.label[0];
-
-        const div = document.createElement("div");
-        div.style.cssText = `
-          width:32px;height:40px;cursor:pointer;
-          background:${color};border-radius:50% 50% 50% 0;
-          transform:rotate(-45deg);border:2px solid rgba(0,0,0,0.2);
-          display:flex;align-items:center;justify-content:center;
-        `;
-        const span = document.createElement("span");
-        span.textContent = text;
-        span.style.cssText = "transform:rotate(45deg);color:white;font-size:12px;font-weight:bold;";
-        div.appendChild(span);
-
-        const widget = new ZDC.UserWidget(new ZDC.LatLng(p.lat, p.lng), { content: div });
-        widget.pinId = p.id;
-        div.addEventListener("click", function() { selectPin(p.id); });
-        map.addWidget(widget);
-        markers.push(widget);
+        const marker = new ZDC.Marker(
+          new ZDC.LatLng(p.lat, p.lng),
+          { color: s.color, text: s.label[0] }
+        );
+        marker.pinId = p.id;
+        marker.addEventListener("click", function() { selectPin(p.id); });
+        map.addWidget(marker);
+        markers.push(marker);
       });
     }
+    
     // ===== SELECT PIN =====
     window.selectPin = (id) => {
       selectedPinId = id;
