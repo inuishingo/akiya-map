@@ -7,6 +7,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
 
+  <!-- ZENRIN Maps JavaScript API -->
+  <script src="https://test-js.zmaps-api.com/zma_loader.js?key=2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW&auth=referer"></script>
+
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
@@ -34,7 +37,6 @@
     let activeStaffFilter = "all";
     let activeDateFilter = "all";
     let checkedIds = new Set();
-    let streetPanorama = null;
 
     const STATUS = {
       tochi:    { label: "土地",   color: "#10B981", bg: "#ecfdf5", fg: "#065f46" },
@@ -77,19 +79,27 @@
     // ===== MAP =====
     function initMap() {
       if (map) return;
-      map = new google.maps.Map(document.getElementById("map"), {
-        center: { lat: 35.1709, lng: 136.8815 },
-        zoom: 13,
-        mapTypeId: "roadmap",
-        zoomControl: true,
+      ZMALoader.setOnLoad(function(mapOptions, error) {
+        if (error) { console.error(error); return; }
+        mapOptions.center = new ZDC.LatLng(35.1709, 136.8815);
+        mapOptions.zoom = 13;
+        mapOptions.movable = true;
+        mapOptions.zoomable = true;
+        mapOptions.mouseOperation = true;
+        mapOptions.touchOperation = true;
+
+        map = new ZDC.Map(
+          document.getElementById("map"),
+          mapOptions,
+          function() {
+            map.addControl(new ZDC.ZoomButton('top-left'));
+            map.addControl(new ZDC.ScaleBar('bottom-left'));
+            renderMapMarkers();
+          },
+          function() { console.error("地図初期化失敗"); }
+        );
       });
-      streetPanorama = new google.maps.StreetViewPanorama(
-        document.getElementById("streetview"),
-        { visible: false, addressControl: true, enableCloseButton: true }
-      );
-      map.setStreetView(streetPanorama);
     }
-    window.initMap = initMap;
 
     // ===== REALTIME LISTEN =====
     function listenPins() {
@@ -181,6 +191,7 @@
         const s = STATUS[p.status] || STATUS.tatemono;
         const date = p.createdAt ? p.createdAt.slice(0, 10) : "–";
         const isChecked = checkedIds.has(p.id);
+        const svUrl = `https://maps.google.com/maps?q=&layer=c&cbll=${p.lat},${p.lng}`;
         return `
         <div class="pin-card ${isChecked ? "checked" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
           <div class="pin-card-top">
@@ -199,7 +210,7 @@
               onchange="saveField('${p.id}','chiban',this.value)" onclick="event.stopPropagation()">
           </div>
           <div class="pin-actions">
-            <button class="sv-btn" onclick="openStreetView(${p.lat},${p.lng},event)">📷 ストリートビュー</button>
+            <a class="sv-btn" href="${svUrl}" target="_blank" onclick="event.stopPropagation()">📷 ストリートビュー</a>
             <select class="status-sel" onchange="updateStatus('${p.id}',this.value)" onclick="event.stopPropagation()">
               ${Object.entries(STATUS).map(([k,v]) =>
                 `<option value="${k}" ${p.status===k?"selected":""}>${v.label}</option>`
@@ -242,25 +253,17 @@
 
     // ===== MAP MARKERS =====
     function renderMapMarkers() {
-      markers.forEach(m => m.setMap(null));
+      if (!map) return;
+      markers.forEach(m => map.removeWidget(m));
       markers = [];
       filtered().forEach(p => {
         const s = STATUS[p.status] || STATUS.tatemono;
-        const marker = new google.maps.Marker({
-          position: { lat: p.lat, lng: p.lng },
-          map,
-          title: p.address,
-          icon: {
-            path: google.maps.SymbolPath.CIRCLE,
-            scale: 12,
-            fillColor: s.color,
-            fillOpacity: 1,
-            strokeColor: "#fff",
-            strokeWeight: 2,
-          },
-          label: { text: s.label[0], color: "#fff", fontSize: "10px", fontWeight: "bold" }
-        });
-        marker.addListener("click", () => selectPin(p.id));
+        const marker = new ZDC.Marker(
+          new ZDC.LatLng(p.lat, p.lng),
+          { color: s.color, text: s.label[0] }
+        );
+        marker.addEventListener("click", function() { selectPin(p.id); });
+        map.addWidget(marker);
         markers.push(marker);
       });
     }
@@ -271,15 +274,10 @@
       const card = document.getElementById(`card-${id}`);
       if (card) { card.classList.add("selected"); card.scrollIntoView({ behavior: "smooth", block: "nearest" }); }
       const pin = allPins.find(p => p.id === id);
-      if (pin && map) { map.panTo({ lat: pin.lat, lng: pin.lng }); map.setZoom(17); }
-    };
-
-    // ===== STREET VIEW =====
-    window.openStreetView = (lat, lng, e) => {
-      if (e) e.stopPropagation();
-      document.getElementById("streetview").style.display = "block";
-      streetPanorama.setPosition({ lat, lng });
-      streetPanorama.setVisible(true);
+      if (pin && map) {
+        map.setCenter(new ZDC.LatLng(pin.lat, pin.lng));
+        map.setZoom(17);
+      }
     };
 
     // ===== SAVE FIELD =====
@@ -310,272 +308,3 @@
         STATUS[p.status]?.label || p.status,
         p.memo || "",
         p.lat || "",
-        p.lng || "",
-        p.branch || "",
-      ].map(v => `"${String(v).replace(/"/g,'""')}"`));
-      const csv = [header, ...rows].map(r => r.join(",")).join("\n");
-      const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `空家マップ_${new Date().toISOString().slice(0,10)}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
-      showToast("CSVを出力しました");
-    };
-
-    // ===== TOAST =====
-    function showToast(msg, type = "ok") {
-      const t = document.getElementById("toast");
-      t.textContent = msg; t.className = "toast " + type;
-      t.style.opacity = "1";
-      setTimeout(() => { t.style.opacity = "0"; }, 2500);
-    }
-
-    window.addEventListener("keydown", e => {
-      if (e.key === "Enter" && document.getElementById("loginScreen").style.display !== "none") doLogin();
-    });
-  </script>
-
-  <script async src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDbZVrgxEDAke-HG5sgYT0AEOChsBSNtck&callback=initMap&language=ja"></script>
-
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Noto Sans JP', sans-serif; background: #f1f5f9; color: #1e293b; height: 100vh; overflow: hidden; }
-
-    #loginScreen {
-      display: flex; flex-direction: column; align-items: center; justify-content: center;
-      height: 100vh; background: #0f172a; gap: 16px; padding: 24px;
-    }
-    .login-logo { font-size: 12px; font-weight: 700; letter-spacing: 0.2em; color: #475569; text-transform: uppercase; }
-    .login-title { font-size: 22px; font-weight: 700; color: #f8fafc; margin-bottom: 8px; }
-    .login-box { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 12px; }
-    .login-box input {
-      padding: 13px 16px; border-radius: 8px; border: 1px solid #334155;
-      background: #1e293b; color: #f8fafc; font-size: 15px; font-family: inherit; outline: none;
-    }
-    .login-box input:focus { border-color: #3b82f6; }
-    #loginBtn {
-      padding: 13px; border-radius: 8px; background: #3b82f6; color: #fff;
-      font-size: 15px; font-weight: 700; border: none; cursor: pointer;
-    }
-    #loginBtn:disabled { background: #334155; cursor: not-allowed; }
-
-    #adminScreen {
-      display: none;
-      grid-template-rows: 52px 1fr;
-      grid-template-columns: 380px 1fr;
-      height: 100vh;
-    }
-
-    .header {
-      grid-column: 1 / -1;
-      display: flex; align-items: center; gap: 8px;
-      padding: 0 16px; background: #0f172a; border-bottom: 1px solid #1e293b;
-    }
-    .header-title { font-size: 15px; font-weight: 700; color: #f8fafc; margin-right: 4px; }
-    #userLabel { font-size: 12px; color: #64748b; }
-    .header-spacer { flex: 1; }
-    #staffFilter, #dateFilter {
-      padding: 6px 10px; border-radius: 6px; border: 1px solid #334155;
-      background: #1e293b; color: #94a3b8; font-size: 12px; font-family: inherit; outline: none; cursor: pointer;
-    }
-    .csv-btn {
-      padding: 7px 16px; border-radius: 6px; background: #10b981; color: #fff;
-      font-size: 13px; font-weight: 700; border: none; cursor: pointer;
-    }
-    .logout-btn {
-      padding: 7px 14px; border-radius: 6px; background: transparent;
-      border: 1px solid #334155; color: #94a3b8; font-size: 13px; cursor: pointer;
-    }
-
-    .left-panel {
-      display: flex; flex-direction: column;
-      background: #fff; border-right: 1px solid #e2e8f0; overflow: hidden;
-    }
-
-    .stats-bar {
-      display: grid; grid-template-columns: repeat(4, 1fr);
-      gap: 1px; background: #e2e8f0; border-bottom: 1px solid #e2e8f0; flex-shrink: 0;
-    }
-    .stat-item {
-      display: flex; flex-direction: column; align-items: center;
-      padding: 8px 4px; background: #fff; cursor: pointer;
-    }
-    .stat-num { font-size: 18px; font-weight: 700; color: #1e293b; line-height: 1; }
-    .stat-label { font-size: 10px; color: #94a3b8; margin-top: 2px; }
-
-    .filter-bar {
-      display: flex; gap: 6px; padding: 8px 10px; overflow-x: auto;
-      border-bottom: 1px solid #f1f5f9; flex-shrink: 0;
-    }
-    .filter-bar::-webkit-scrollbar { display: none; }
-    .filter-btn {
-      padding: 4px 10px; border-radius: 20px; border: 1px solid #e2e8f0;
-      font-size: 11px; font-weight: 500; cursor: pointer; white-space: nowrap;
-      background: #fff; color: #64748b; transition: all 0.15s;
-    }
-    .filter-btn.active { background: #1e293b; color: #fff; border-color: #1e293b; }
-
-    /* まとめて削除バー */
-    #bulkDeleteBtn {
-      display: none; align-items: center; justify-content: center;
-      gap: 6px; margin: 6px 8px; padding: 8px;
-      border-radius: 8px; background: #fef2f2; border: 1px solid #fca5a5;
-      color: #991b1b; font-size: 13px; font-weight: 700; cursor: pointer;
-    }
-    #bulkDeleteBtn:hover { background: #fee2e2; }
-
-    #pinList { flex: 1; overflow-y: auto; padding: 8px; }
-    #pinList::-webkit-scrollbar { width: 4px; }
-    #pinList::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 2px; }
-    .empty { padding: 40px; text-align: center; color: #94a3b8; font-size: 14px; }
-
-    .pin-card {
-      border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px;
-      margin-bottom: 8px; cursor: pointer; transition: all 0.15s; background: #fff;
-    }
-    .pin-card:hover { border-color: #94a3b8; }
-    .pin-card.selected { border-color: #3b82f6; box-shadow: 0 0 0 2px #bfdbfe; }
-    .pin-card.checked { background: #fef9c3; border-color: #eab308; }
-
-    .pin-card-top { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
-    .pin-check { width: 16px; height: 16px; cursor: pointer; flex-shrink: 0; }
-    .status-badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
-    .pin-date { font-size: 11px; color: #94a3b8; margin-left: auto; }
-    .pin-staff { font-size: 11px; color: #94a3b8; }
-    .del-btn {
-      padding: 2px 6px; border-radius: 4px; background: transparent;
-      border: 1px solid #fca5a5; color: #ef4444; font-size: 12px; cursor: pointer;
-    }
-    .del-btn:hover { background: #fef2f2; }
-
-    .pin-address { font-size: 13px; font-weight: 500; color: #1e293b; margin-bottom: 4px; line-height: 1.4; }
-    .pin-memo { font-size: 12px; color: #64748b; margin-bottom: 8px; }
-
-    .pin-detail-row {
-      display: grid; grid-template-columns: 32px 1fr; gap: 4px; align-items: center;
-      margin-bottom: 8px;
-    }
-    .detail-label { font-size: 11px; color: #94a3b8; font-weight: 500; }
-    .detail-input {
-      padding: 5px 8px; border-radius: 5px; border: 1px solid #e2e8f0;
-      font-size: 12px; font-family: inherit; outline: none; color: #1e293b; width: 100%;
-    }
-    .detail-input:focus { border-color: #3b82f6; }
-
-    .pin-actions { display: flex; gap: 6px; align-items: center; }
-    .sv-btn {
-      padding: 5px 10px; border-radius: 6px; background: #f1f5f9;
-      border: 1px solid #e2e8f0; font-size: 12px; cursor: pointer; white-space: nowrap;
-    }
-    .sv-btn:hover { background: #e2e8f0; }
-    .status-sel {
-      flex: 1; padding: 5px 8px; border-radius: 6px; border: 1px solid #e2e8f0;
-      font-size: 12px; font-family: inherit; outline: none; background: #fff; cursor: pointer;
-    }
-
-    .right-panel { display: flex; flex-direction: column; position: relative; }
-    #map { flex: 1; }
-    #streetview {
-      display: none; position: absolute; bottom: 0; left: 0; right: 0;
-      height: 45%; z-index: 10; border-top: 2px solid #3b82f6;
-    }
-
-    .toast {
-      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-      padding: 10px 20px; border-radius: 20px; font-size: 13px; font-weight: 500;
-      z-index: 9999; opacity: 0; transition: opacity 0.3s; pointer-events: none; white-space: nowrap;
-    }
-    .toast.ok    { background: #065f46; color: #6ee7b7; }
-    .toast.error { background: #7f1d1d; color: #fca5a5; }
-  </style>
-</head>
-<body>
-
-<div id="loginScreen">
-  <div class="login-logo">HOUSE MARKET</div>
-  <div class="login-title">空家マップ｜管理画面</div>
-  <div class="login-box">
-    <input id="email" type="email" placeholder="メールアドレス" autocomplete="email">
-    <input id="pass"  type="password" placeholder="パスワード">
-    <button id="loginBtn" onclick="doLogin()">ログイン</button>
-  </div>
-</div>
-
-<div id="adminScreen">
-  <div class="header">
-    <div class="header-title">🏚 空家マップ 管理画面</div>
-    <div id="userLabel"></div>
-    <div class="header-spacer"></div>
-    <select id="dateFilter" onchange="setDateFilter(this.value)">
-      <option value="all">日付：すべて</option>
-    </select>
-    <select id="staffFilter" onchange="setStaffFilter(this.value)">
-      <option value="all">担当者：すべて</option>
-    </select>
-    <button class="csv-btn" onclick="exportCSV()">📥 CSV出力</button>
-    <button class="logout-btn" onclick="doLogout()">ログアウト</button>
-  </div>
-
-  <div class="left-panel">
-    <div class="stats-bar">
-      <div class="stat-item" onclick="setFilter('all')">
-        <div class="stat-num" id="stat-total">0</div>
-        <div class="stat-label">総件数</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('tochi')">
-        <div class="stat-num" style="color:#10B981" id="stat-tochi">0</div>
-        <div class="stat-label">土地</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('tatemono')">
-        <div class="stat-num" style="color:#EF4444" id="stat-tatemono">0</div>
-        <div class="stat-label">建物</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('rentou')">
-        <div class="stat-num" style="color:#F97316" id="stat-rentou">0</div>
-        <div class="stat-label">連棟</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('shintiku')">
-        <div class="stat-num" style="color:#9CA3AF" id="stat-shintiku">0</div>
-        <div class="stat-label">新築</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('souko')">
-        <div class="stat-num" style="color:#EAB308" id="stat-souko">0</div>
-        <div class="stat-label">倉庫</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('shueki')">
-        <div class="stat-num" style="color:#8B5CF6" id="stat-shueki">0</div>
-        <div class="stat-label">収益</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('hansha')">
-        <div class="stat-num" style="color:#1f2937" id="stat-hansha">0</div>
-        <div class="stat-label">反社</div>
-      </div>
-    </div>
-
-    <div class="filter-bar">
-      <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">すべて</button>
-      <button class="filter-btn" data-filter="tochi"    onclick="setFilter('tochi')">🟢 土地</button>
-      <button class="filter-btn" data-filter="tatemono" onclick="setFilter('tatemono')">🔴 建物</button>
-      <button class="filter-btn" data-filter="rentou"   onclick="setFilter('rentou')">🟠 連棟</button>
-      <button class="filter-btn" data-filter="shintiku" onclick="setFilter('shintiku')">⬜ 新築</button>
-      <button class="filter-btn" data-filter="souko"    onclick="setFilter('souko')">🟡 倉庫</button>
-      <button class="filter-btn" data-filter="shueki"   onclick="setFilter('shueki')">🟣 収益</button>
-      <button class="filter-btn" data-filter="hansha"   onclick="setFilter('hansha')">⚫ 反社</button>
-    </div>
-
-    <button id="bulkDeleteBtn" onclick="bulkDelete()">🗑 0件削除</button>
-
-    <div id="pinList"><div class="empty">データを読み込み中…</div></div>
-  </div>
-
-  <div class="right-panel">
-    <div id="map"></div>
-    <div id="streetview"></div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
-</body>
-</html>
