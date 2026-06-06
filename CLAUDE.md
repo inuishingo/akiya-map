@@ -39,7 +39,7 @@ status              // one of the STATUS keys below
 memo                // free text
 branch              // hardcoded "名古屋" (Nagoya)
 createdAt           // new Date().toISOString()  — a STRING, not a Firestore timestamp
-chiban              // 地番 (lot number) — added only via admin.html inline edit
+chiban              // 地番 (lot number) — auto-fetched on tap in index.html (ZENRIN bm, nearest by distance); also editable via admin.html inline edit
 ```
 
 `createdAt` being an ISO string matters: admin filtering/sorting relies on string operations (`createdAt.slice(0,10)` for the date, `orderBy("createdAt", "desc")` for sort). Keep it as an ISO string for new writes.
@@ -54,7 +54,7 @@ Markers display the first character of the label (`s.label[0]`) on a colored pin
 
 ### Reverse geocoding
 
-`index.html` does not call ZENRIN directly for addresses — it hits a **Cloud Run proxy**: `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=..&lon=..`, reading `json.result.item[0].address`. This proxy is external to this repo.
+`index.html` does not call ZENRIN directly for addresses — it hits a **Cloud Run proxy**: `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=..&lon=..`, reading `json.result.item[0].address`. The same proxy also serves **地番検索** via `?type=bm&lat=..&lon=..`, returning `result.item[]` where each candidate has `address`, `address_detail2` (地番), and `distance`; `index.html`'s `fetchChiban()` picks the nearest by `distance`. This proxy is external to this repo.
 
 ### Offline support (index.html only)
 

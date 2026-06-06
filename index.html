@@ -38,6 +38,7 @@
     let currentUser = null;
     let markers = [];
     let pendingLatLng = null;
+    let pendingChiban = "";
     let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue") || "[]");
     let editingPinId = null;
 
@@ -190,6 +191,7 @@
       document.getElementById("deleteBtn").style.display = "none";
       document.getElementById("pinModal").style.display = "flex";
       reverseGeocode(pendingLatLng);
+      fetchChiban(pendingLatLng);
     }
 
     // ===== PIN MODAL（編集）=====
@@ -207,6 +209,7 @@
     window.closeModal = () => {
       document.getElementById("pinModal").style.display = "none";
       pendingLatLng = null;
+      pendingChiban = "";
       editingPinId = null;
     };
 
@@ -222,6 +225,26 @@
         document.getElementById("addressLabel").textContent = addr;
       } catch {
         document.getElementById("addressLabel").textContent = "（オフライン）";
+      }
+    }
+
+    // ===== 地番取得（ZENRIN bm）=====
+    // タップ地点の最寄り地番をプロキシ(type=bm)から取得し、distance最小の候補を採用。
+    // UIには出さず pendingChiban に保持して保存時にだけ書き込む。
+    async function fetchChiban(latlng) {
+      pendingChiban = "";
+      try {
+        const res = await fetch(
+          `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`
+        );
+        const json = await res.json();
+        const items = json.result?.item;
+        if (Array.isArray(items) && items.length > 0) {
+          const nearest = items.reduce((a, b) => (a.distance <= b.distance ? a : b));
+          pendingChiban = nearest.address_detail2 || "";
+        }
+      } catch {
+        // オフライン・取得失敗時は地番なしで保存
       }
     }
 
@@ -251,6 +274,7 @@
           lat: pendingLatLng.lat,
           lng: pendingLatLng.lng,
           address,
+          chiban: pendingChiban,
           status,
           memo,
           branch: "名古屋",
