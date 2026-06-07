@@ -39,8 +39,13 @@ status              // one of the STATUS keys below
 memo                // free text
 branch              // hardcoded "名古屋" (Nagoya)
 createdAt           // new Date().toISOString()  — a STRING, not a Firestore timestamp
-chiban              // 地番 (lot number) — auto-fetched on tap in index.html (ZENRIN bm, nearest by distance); also editable via admin.html inline edit
+chiban              // 地番 (lot number) — auto-fetched on tap in index.html (reverse=親番 + bm=枝番補完); editable in BOTH index.html (pin modal input) and admin.html (inline edit)
+chibanManual        // boolean — true when chiban was hand-edited. Manual edits WIN: any future auto re-fetch/re-process MUST NOT overwrite chiban when chibanManual===true
+needsReview         // boolean — flags ambiguous auto-results for clerk review (連棟/残地併存 等). Cleared (set false) on manual chiban edit. ※auto-flagging logic is a later phase; only the clear-on-edit side is implemented now
+reviewReason        // string — short JP label for why needsReview was set; removed (deleteField) on manual chiban edit
 ```
+
+**地番の手修正は最優先**: 地番は現場(index.html のピンモーダル)・事務所(admin.html のインライン)どちらでも編集可。手修正すると `chibanManual:true` が立ち、`needsReview` 解除＋`reviewReason` 削除。`chibanManual===true` の doc は、今後の自動再取得・再処理で**自動値で上書きしてはならない**（コードで必ずガードする）。
 
 `createdAt` being an ISO string matters: admin filtering/sorting relies on string operations (`createdAt.slice(0,10)` for the date, `orderBy("createdAt", "desc")` for sort). Keep it as an ISO string for new writes.
 

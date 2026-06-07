@@ -13,7 +13,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy }
+    import { getFirestore, collection, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -215,8 +215,9 @@
           ${p.memo ? `<div class="pin-memo">📝 ${p.memo}</div>` : ""}
           <div class="pin-detail-row">
             <span class="detail-label">地番</span>
-            <input class="detail-input" value="${p.chiban || ""}" placeholder="未入力"
-              onchange="saveField('${p.id}','chiban',this.value)" onclick="event.stopPropagation()">
+            <input class="detail-input ${p.chibanManual ? "manual" : ""}" value="${p.chiban || ""}" placeholder="未入力"
+              onchange="saveChiban('${p.id}',this.value)" onclick="event.stopPropagation()">
+            ${p.chibanManual ? `<span class="manual-badge" title="手修正済み">✎手修正</span>` : ""}
           </div>
           <div class="pin-actions">
             <a class="sv-btn" href="${svUrl}" target="_blank" onclick="event.stopPropagation()">📷 ストリートビュー</a>
@@ -298,10 +299,17 @@
       }
     };
 
-    // ===== SAVE FIELD =====
-    window.saveField = async (id, field, value) => {
+    // ===== SAVE 地番（手修正）=====
+    // 手修正は自動再取得より優先。chibanManual を立て、要確認フラグを解除する。
+    window.saveChiban = async (id, value) => {
       try {
-        await updateDoc(doc(db, "pins", id), { [field]: value });
+        await updateDoc(doc(db, "pins", id), {
+          chiban: value.trim(),
+          chibanManual: true,
+          needsReview: false,
+          reviewReason: deleteField(),
+        });
+        showToast("地番を保存しました");
       } catch(e) { showToast("保存に失敗しました", "error"); }
     };
 
@@ -468,7 +476,7 @@
     .pin-memo { font-size: 12px; color: #64748b; margin-bottom: 8px; }
 
     .pin-detail-row {
-      display: grid; grid-template-columns: 32px 1fr; gap: 4px; align-items: center;
+      display: grid; grid-template-columns: 32px 1fr auto; gap: 4px; align-items: center;
       margin-bottom: 8px;
     }
     .detail-label { font-size: 11px; color: #94a3b8; font-weight: 500; }
@@ -477,6 +485,11 @@
       font-size: 12px; font-family: inherit; outline: none; color: #1e293b; width: 100%;
     }
     .detail-input:focus { border-color: #3b82f6; }
+    .detail-input.manual { border-color: #16a34a; background: #f0fdf4; }
+    .manual-badge {
+      font-size: 10px; color: #16a34a; background: #dcfce7; font-weight: 600;
+      padding: 2px 6px; border-radius: 999px; white-space: nowrap;
+    }
 
     .pin-actions { display: flex; gap: 6px; align-items: center; }
     .sv-btn {

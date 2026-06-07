@@ -17,7 +17,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, deleteDoc, doc, serverTimestamp }
+    import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, deleteDoc, doc, deleteField, serverTimestamp }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -41,6 +41,7 @@
     let pendingChiban = "";
     let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue") || "[]");
     let editingPinId = null;
+    let editingPinData = null;
 
     const STATUS = {
       tochi:    { label: "土地",   color: "#10B981", text: "#fff" },
@@ -185,9 +186,12 @@
     // ===== PIN MODAL（新規）=====
     function openPinModal() {
       editingPinId = null;
+      editingPinData = null;
       document.getElementById("modalTitle").textContent = "ピンを追加";
       document.getElementById("statusSelect").value = "tochi";
       document.getElementById("memo").value = "";
+      document.getElementById("chibanInput").value = "";
+      document.getElementById("chibanInput").placeholder = "地番取得中…";
       document.getElementById("deleteBtn").style.display = "none";
       document.getElementById("pinModal").style.display = "flex";
       reverseGeocode(pendingLatLng);
@@ -197,11 +201,14 @@
     // ===== PIN MODAL（編集）=====
     function openEditModal(id, data, marker) {
       editingPinId = id;
+      editingPinData = data;
       pendingLatLng = { lat: data.lat, lng: data.lng };
       document.getElementById("modalTitle").textContent = "ピンを編集";
       document.getElementById("statusSelect").value = data.status;
       document.getElementById("memo").value = data.memo || "";
       document.getElementById("addressLabel").textContent = data.address || "取得中…";
+      document.getElementById("chibanInput").value = data.chiban || "";
+      document.getElementById("chibanInput").placeholder = "地番";
       document.getElementById("deleteBtn").style.display = "block";
       document.getElementById("pinModal").style.display = "flex";
     }
@@ -211,6 +218,7 @@
       pendingLatLng = null;
       pendingChiban = "";
       editingPinId = null;
+      editingPinData = null;
     };
 
     // ===== GEOCODE（ZENRIN）=====
@@ -233,10 +241,12 @@
     //   bm の distance最小だと境界付近で隣の地番（例:23の敷地で22）を拾うため不採用。
     // 枝番は reverse が返さないので bm の候補から親番一致のものを探して補完する。
     //   bm が上位5件にキャップされ親番が出ないケースは親番のみ（例:23-2→23）で許容。
-    // 数値は全角で返るため NFKC で半角化。UIには出さず pendingChiban に保持。
+    // 数値は全角で返るため NFKC で半角化。取得結果は pendingChiban（自動値の基準）に
+    // 保持しつつ、新規追加時は地番入力欄(#chibanInput)へ反映して現場で修正できるようにする。
     async function fetchChiban(latlng) {
       pendingChiban = "";
       const norm = (s) => (typeof s === "string" ? s.normalize("NFKC").trim() : "");
+      const input = document.getElementById("chibanInput");
       try {
         // --- 親番: reverse（地番レベル TBN のときのみ有効）---
         const revRes = await fetch(
@@ -270,6 +280,12 @@
         pendingChiban = edaban ? `${oyaban}-${edaban}` : oyaban;
       } catch {
         // オフライン・取得失敗時は地番なしで保存
+      } finally {
+        // 新規追加時のみ自動値を入力欄へ反映（編集中は手入力値を保持）。
+        if (!editingPinId && input) {
+          input.value = pendingChiban;
+          input.placeholder = pendingChiban ? "地番" : "地番（自動取得できず・手入力）";
+        }
       }
     }
 
@@ -283,9 +299,20 @@
       btn.disabled = true;
       btn.textContent = "保存中…";
 
+      const chiban = document.getElementById("chibanInput").value.trim();
+
       if (editingPinId) {
         try {
-          await updateDoc(doc(db, "pins", editingPinId), { status, memo, address });
+          const update = { status, memo, address };
+          // 地番を手修正したときだけ chiban を更新し、手修正フラグ(chibanManual)を
+          // 立てて要確認フラグを解除する（手修正は自動再取得より優先）。
+          if (chiban !== (editingPinData?.chiban || "")) {
+            update.chiban = chiban;
+            update.chibanManual = true;
+            update.needsReview = false;
+            update.reviewReason = deleteField();
+          }
+          await updateDoc(doc(db, "pins", editingPinId), update);
           showToast("更新しました");
           closeModal();
           loadMyPins();
@@ -299,7 +326,9 @@
           lat: pendingLatLng.lat,
           lng: pendingLatLng.lng,
           address,
-          chiban: pendingChiban,
+          chiban,
+          // 自動値から変更して保存した場合は手修正扱い（自動再取得で上書きしない）。
+          chibanManual: chiban !== (pendingChiban || ""),
           status,
           memo,
           branch: "名古屋",
@@ -502,6 +531,9 @@
     <div class="modal-handle"></div>
     <div class="modal-title" id="modalTitle">ピンを追加</div>
     <div class="address-box" id="addressLabel">住所取得中…</div>
+    <div class="field-label">地番（自動取得・表札を見て修正可）</div>
+    <input id="chibanInput" type="text" placeholder="地番"
+      style="width:100%;box-sizing:border-box;padding:12px;border:1px solid #d1d5db;border-radius:10px;font-size:16px;font-family:inherit;margin-bottom:4px;">
     <div class="field-label">ステータス</div>
     <div class="status-grid">
       <div><input class="status-option" type="radio" name="status" id="s-tochi" value="tochi" checked><label class="status-label" for="s-tochi">🌿 土地</label></div>
