@@ -44,22 +44,23 @@
     let editingPinData = null;
 
     // 全12種。グループ（建物系→土地系→NG系）順。色は確定値。
+    // color は地図ピンの色分けに使用（削除しない）。emoji はモーダルのボタン表示用。
     const STATUS = {
       // 建物系
-      akiya:   { label: "空家",   color: "#3B82F6", text: "#fff" },
-      chikuko: { label: "築古",   color: "#6366F1", text: "#fff" },
-      haikyo:  { label: "廃墟",   color: "#A855F7", text: "#fff" },
-      renpei:  { label: "連棟",   color: "#8B5CF6", text: "#fff" },
-      shueki:  { label: "収益",   color: "#0EA5E9", text: "#fff" },
-      souko:   { label: "倉庫",   color: "#64748B", text: "#fff" },
+      akiya:   { label: "空家",   color: "#3B82F6", text: "#fff", emoji: "🏚️" },
+      chikuko: { label: "築古",   color: "#6366F1", text: "#fff", emoji: "🧱" },
+      haikyo:  { label: "廃墟",   color: "#A855F7", text: "#fff", emoji: "🕸️" },
+      renpei:  { label: "連棟",   color: "#8B5CF6", text: "#fff", emoji: "🏘️" },
+      shueki:  { label: "収益",   color: "#0EA5E9", text: "#fff", emoji: "💰" },
+      souko:   { label: "倉庫",   color: "#64748B", text: "#fff", emoji: "📦" },
       // 土地系
-      sarachi: { label: "更地",   color: "#10B981", text: "#fff" },
-      zasshu:  { label: "雑種地", color: "#84CC16", text: "#fff" },
-      parking: { label: "駐車場", color: "#14B8A6", text: "#fff" },
-      tahata:  { label: "田・畑", color: "#65A30D", text: "#fff" },
+      sarachi: { label: "更地",   color: "#10B981", text: "#fff", emoji: "🟩" },
+      zasshu:  { label: "雑種地", color: "#84CC16", text: "#fff", emoji: "🌿" },
+      parking: { label: "駐車場", color: "#14B8A6", text: "#fff", emoji: "🅿️" },
+      tahata:  { label: "田・畑", color: "#65A30D", text: "#fff", emoji: "🌾" },
       // NG系
-      hansha:  { label: "反社",   color: "#EF4444", text: "#fff" },
-      ng:      { label: "NG",     color: "#6B7280", text: "#fff" },
+      hansha:  { label: "反社",   color: "#EF4444", text: "#fff", emoji: "🚫" },
+      ng:      { label: "NG",     color: "#6B7280", text: "#fff", emoji: "⛔" },
     };
     const STATUS_GROUPS = [
       { label: "建物系", keys: ["akiya", "chikuko", "haikyo", "renpei", "shueki", "souko"] },
@@ -77,7 +78,7 @@
           ${g.keys.map(k => {
             const s = STATUS[k];
             return `<div><input class="status-option" type="radio" name="status" id="s-${k}" value="${k}">
-              <label class="status-label" for="s-${k}" style="--c:${s.color}"><span class="dot"></span>${s.label}</label></div>`;
+              <label class="status-label" for="s-${k}" style="--c:${s.color}"><span class="emoji">${s.emoji}</span>${s.label}</label></div>`;
           }).join("")}
         </div>`).join("");
       document.getElementById("statusGroups").innerHTML = html;
@@ -508,14 +509,9 @@
       padding: 10px 8px; border-radius: 8px; border: 2px solid #374151;
       font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.15s; color: #9ca3af;
     }
-    .status-label .dot {
-      width: 10px; height: 10px; border-radius: 50%; background: var(--c); flex-shrink: 0;
-    }
+    .status-label .emoji { font-size: 15px; line-height: 1; flex-shrink: 0; }
     .status-option:checked + .status-label {
       border-color: transparent; color: #fff; background: var(--c);
-    }
-    .status-option:checked + .status-label .dot {
-      background: #fff;
     }
 
     textarea#memo {
