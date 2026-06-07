@@ -152,8 +152,8 @@
           return;
         }
 
-        // 名古屋駅付近を初期表示
-        mapOptions.center = new ZDC.LatLng(35.1709, 136.8815);
+        // まず仮の中心＝名古屋駅で即表示（白画面回避）。現在地は取得でき次第寄せる。
+        mapOptions.center = new ZDC.LatLng(35.170, 136.882);
         mapOptions.zoom = 15;
         mapOptions.movable = true;
         mapOptions.zoomable = true;
@@ -168,11 +168,16 @@
             map.addControl(new ZDC.ZoomButton('top-left'));
             map.addControl(new ZDC.ScaleBar('bottom-left'));
 
-            // 現在地に移動
+            // 現在地が取れたらそこへ寄せる。失敗・拒否・タイムアウト時は名古屋駅のまま（止めない）。
             if (navigator.geolocation) {
-              navigator.geolocation.getCurrentPosition(pos => {
-                map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
-              });
+              navigator.geolocation.getCurrentPosition(
+                pos => {
+                  map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
+                  map.setZoom(16);
+                },
+                () => { /* 取得失敗時は仮の中心(名古屋駅)を維持 */ },
+                { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
+              );
             }
 
             // クリックでピン追加
