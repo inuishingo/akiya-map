@@ -229,6 +229,11 @@
     }
 
     // ===== LIST =====
+    // 固定連番の表示用フォーマット：3桁ゼロ埋め(#001)。1000件超は自然に4桁へ拡張。
+    function fmtSeq(n) {
+      return n != null ? "#" + String(n).padStart(3, "0") : "";
+    }
+
     function renderList() {
       const pins = filtered();
       const container = document.getElementById("pinList");
@@ -255,6 +260,7 @@
           <div class="pin-card-top">
             <input type="checkbox" class="pin-check" ${isChecked ? "checked" : ""}
               onclick="toggleCheck('${p.id}',event)">
+            ${p.seqNo != null ? `<span class="pin-seq">${fmtSeq(p.seqNo)}</span>` : ""}
             <span class="status-badge" style="background:${sColor};color:#fff">${sLabel}</span>
             <span class="pin-date">${date}</span>
             <span class="pin-staff">${p.email || "–"}</span>
@@ -316,9 +322,11 @@
       filtered().forEach(p => {
         // 未定義ステータスでも落ちない・透明にならないようガード
         const s = STATUS[p.status];
+        // マーカーには固定連番(seqNo)を表示。色はカテゴリ色を維持。
+        // seqNo 無し（万一の旧データ）はステータス頭文字→"?"でフォールバック（落とさない）。
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
-          { color: s ? s.color : FALLBACK_COLOR, text: s ? s.label[0] : "?" }
+          { color: s ? s.color : FALLBACK_COLOR, text: p.seqNo != null ? String(p.seqNo) : (s ? s.label[0] : "?") }
         );
         marker.pinId = p.id;
         marker.addEventListener("click", function() { selectPin(p.id); });
@@ -336,6 +344,10 @@
       if (card) {
         card.classList.add("selected");
         card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        // 一時ハイライト：タップ毎に再生されるようリフローを挟んでアニメを付け直す
+        card.classList.remove("flash");
+        void card.offsetWidth;
+        card.classList.add("flash");
       }
 
       renderMapMarkers();
@@ -508,9 +520,16 @@
     .pin-card.selected { border-color: #3b82f6; box-shadow: 0 0 0 2px #bfdbfe; background: #eff6ff; }
     .pin-card.checked { background: #fef9c3; border-color: #eab308; }
     .pin-card.checked.selected { background: #fef9c3; border-color: #3b82f6; }
+    /* ピンタップ時の一時ハイライト（数秒フラッシュ） */
+    .pin-card.flash { animation: cardFlash 2s ease-out; }
+    @keyframes cardFlash {
+      0%   { background: #fde68a; box-shadow: 0 0 0 3px #fbbf24; }
+      100% { background: #fff;    box-shadow: none; }
+    }
 
     .pin-card-top { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
     .pin-check { width: 16px; height: 16px; cursor: pointer; flex-shrink: 0; }
+    .pin-seq { font-size: 13px; font-weight: 800; color: #334155; font-variant-numeric: tabular-nums; flex-shrink: 0; }
     .status-badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
     .pin-date { font-size: 11px; color: #94a3b8; margin-left: auto; }
     .pin-staff { font-size: 11px; color: #94a3b8; }

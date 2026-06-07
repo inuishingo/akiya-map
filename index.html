@@ -17,7 +17,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, deleteDoc, doc, deleteField, serverTimestamp }
+    import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, deleteDoc, doc, deleteField, serverTimestamp, runTransaction }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -98,6 +98,8 @@
       const remaining = [];
       for (const item of offlineQueue) {
         try {
+          // オフライン中に採番できなかったピンは同期時に採番（既に番号があれば維持）。
+          if (item.seqNo == null) item.seqNo = await nextSeqNo();
           await addDoc(collection(db, "pins"), item);
         } catch(e) {
           remaining.push(item);
@@ -217,11 +219,13 @@
     function renderMarker(id, data) {
       // 未定義ステータスでも落ちない・透明にならないようガード。
       const s = STATUS[data.status];
+      // マーカーには固定連番(seqNo)を表示。色はカテゴリ色を維持。
+      // seqNo 無し（万一の旧データ）はステータス頭文字→"?"でフォールバック（落とさない）。
       const marker = new ZDC.Marker(
         new ZDC.LatLng(data.lat, data.lng),
         {
           color: s ? s.color : FALLBACK_COLOR,
-          text: s ? s.label[0] : "?",
+          text: data.seqNo != null ? String(data.seqNo) : (s ? s.label[0] : "?"),
         }
       );
       marker.pinId = id;
@@ -339,6 +343,22 @@
       }
     }
 
+    // ===== 固定連番の採番 =====
+    // meta/counter を runTransaction で読み→その値を返し→next を+1。
+    // 同時登録でも番号が衝突しない。番号は一度振ったら固定（削除しても繰り上げない＝欠番あり運用）。
+    // 初期状態（ドキュメント無し）は next:1 から開始。
+    async function nextSeqNo() {
+      const counterRef = doc(db, "meta", "counter");
+      let seq;
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(counterRef);
+        const next = snap.exists() ? (Number(snap.data().next) || 1) : 1;
+        seq = next;
+        tx.set(counterRef, { next: next + 1 }, { merge: true });
+      });
+      return seq;
+    }
+
     // ===== SAVE PIN =====
     window.savePin = async () => {
       if (!pendingLatLng && !editingPinId) return;
@@ -387,6 +407,8 @@
         };
         if (navigator.onLine) {
           try {
+            // 固定連番を採番してから保存（オンライン時のみ。オフラインは同期時に採番）。
+            pinData.seqNo = await nextSeqNo();
             const ref = await addDoc(collection(db, "pins"), pinData);
             renderMarker(ref.id, pinData);
             showToast("保存しました");
