@@ -168,10 +168,15 @@
             map.addControl(new ZDC.ZoomButton('top-left'));
             map.addControl(new ZDC.ScaleBar('bottom-left'));
 
-            // 現在地が取れたらそこへ寄せる。失敗・拒否・タイムアウト時は名古屋駅のまま（止めない）。
-            if (navigator.geolocation) {
+            // モバイル(スマホ/タブレット)のみ現在地に寄せる。PCは位置推定が粗く岡崎等にズレるため取りに行かない。
+            // 失敗・拒否・タイムアウト・低精度(>1000m)時は仮の中心(名古屋駅)を維持（止めない）。
+            const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+              || (window.matchMedia && window.matchMedia("(pointer:coarse)").matches);
+            if (isMobile && navigator.geolocation) {
               navigator.geolocation.getCurrentPosition(
                 pos => {
+                  // 推定が粗い(>1000m)場合は飛ばさず仮中心を維持
+                  if (pos.coords.accuracy > 1000) return;
                   map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
                   map.setZoom(16);
                 },
