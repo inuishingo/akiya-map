@@ -54,7 +54,11 @@ Markers display the first character of the label (`s.label[0]`) on a colored pin
 
 ### Reverse geocoding
 
-`index.html` does not call ZENRIN directly for addresses — it hits a **Cloud Run proxy**: `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=..&lon=..`, reading `json.result.item[0].address`. The same proxy also serves **地番検索** via `?type=bm&lat=..&lon=..`, returning `result.item[]` where each candidate has `address`, `address_detail2` (地番), and `distance`; `index.html`'s `fetchChiban()` picks the nearest by `distance`. This proxy is external to this repo.
+`index.html` does not call ZENRIN directly for addresses — it hits a **Cloud Run proxy**: `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=..&lon=..`, reading `json.result.item[0].address`. The same proxy also serves **地番検索** via `?type=bm&lat=..&lon=..`, returning `result.item[]` where each candidate has `address`, `address_detail2` (親番/parent lot), `address_branch2` (枝番/branch, may be null), and `distance`. This proxy is external to this repo.
+
+**地番取得ロジック (`fetchChiban()`)**: 親番は **reverse を主ソース**にする（`address_level==="TBN"` のときの `address_detail2`）。bm の `distance` 最小だと**区画境界でひとつ隣の地番を拾う**（reverse は point-in-polygon で正しく当てる）ため。枝番は reverse が返さないので **bm の候補から親番一致のものを探して補完**し、`親番-枝番` の形に結合する。数値は ZENRIN が**全角**で返すので `normalize("NFKC")` で半角化してから保存する。
+
+**【次フェーズ課題】bm 候補のキャップ**: bm は `info.hit` が多くても `item[]` を**上位5件にキャップ**して返す（`count` パラメータは無効）。このため親番が5件圏外だと枝番が補完できず**親番止まり**になる（例: `23-2` → `23`）。枝番まで確実に取るには**プロキシ側（別リポジトリ）で件数上限の緩和**が必要。`type=bm` の `address`/`address_detail2`/`address_branch2` 等は ZENRIN が Shift-JIS の全角で返すが、現状プロキシは正しい UTF-8 全角で返せている（取り違えは無し。NFKC 正規化はアプリ側で実施済み）。
 
 ### Offline support (index.html only)
 

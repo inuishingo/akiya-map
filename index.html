@@ -228,21 +228,46 @@
       }
     }
 
-    // ===== 地番取得（ZENRIN bm）=====
-    // タップ地点の最寄り地番をプロキシ(type=bm)から取得し、distance最小の候補を採用。
-    // UIには出さず pendingChiban に保持して保存時にだけ書き込む。
+    // ===== 地番取得（ZENRIN reverse + bm）=====
+    // 親番は reverse(point-in-polygon)を主ソースに採用し、区画境界での隣地誤取得を防ぐ。
+    //   bm の distance最小だと境界付近で隣の地番（例:23の敷地で22）を拾うため不採用。
+    // 枝番は reverse が返さないので bm の候補から親番一致のものを探して補完する。
+    //   bm が上位5件にキャップされ親番が出ないケースは親番のみ（例:23-2→23）で許容。
+    // 数値は全角で返るため NFKC で半角化。UIには出さず pendingChiban に保持。
     async function fetchChiban(latlng) {
       pendingChiban = "";
+      const norm = (s) => (typeof s === "string" ? s.normalize("NFKC").trim() : "");
       try {
-        const res = await fetch(
-          `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`
+        // --- 親番: reverse（地番レベル TBN のときのみ有効）---
+        const revRes = await fetch(
+          `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`
         );
-        const json = await res.json();
-        const items = json.result?.item;
-        if (Array.isArray(items) && items.length > 0) {
-          const nearest = items.reduce((a, b) => (a.distance <= b.distance ? a : b));
-          pendingChiban = nearest.address_detail2 || "";
+        const revJson = await revRes.json();
+        const revItem = revJson.result?.item?.[0];
+        if (!revItem || revItem.address_level !== "TBN") return; // 地番が確定しない地点
+        const oyaban = norm(revItem.address_detail2);
+        if (!oyaban) return;
+
+        // --- 枝番: bm の候補から親番一致を探して補完 ---
+        let edaban = "";
+        try {
+          const bmRes = await fetch(
+            `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`
+          );
+          const bmJson = await bmRes.json();
+          const items = bmJson.result?.item;
+          if (Array.isArray(items)) {
+            // 親番が一致し枝番を持つ候補のうち、最も近いもの
+            const match = items
+              .filter((x) => norm(x.address_detail2) === oyaban && norm(x.address_branch2))
+              .sort((a, b) => a.distance - b.distance)[0];
+            if (match) edaban = norm(match.address_branch2);
+          }
+        } catch {
+          // bm 失敗時は親番のみで確定
         }
+
+        pendingChiban = edaban ? `${oyaban}-${edaban}` : oyaban;
       } catch {
         // オフライン・取得失敗時は地番なしで保存
       }
