@@ -43,15 +43,53 @@
     let editingPinId = null;
     let editingPinData = null;
 
+    // 全12種。グループ（建物系→土地系→NG系）順。色は確定値。
     const STATUS = {
-      tochi:    { label: "土地",   color: "#10B981", text: "#fff" },
-      tatemono: { label: "建物",   color: "#EF4444", text: "#fff" },
-      rentou:   { label: "連棟",   color: "#F97316", text: "#fff" },
-      shintiku: { label: "新築",   color: "#9CA3AF", text: "#fff" },
-      souko:    { label: "倉庫",   color: "#EAB308", text: "#fff" },
-      shueki:   { label: "収益",   color: "#8B5CF6", text: "#fff" },
-      hansha:   { label: "反社",   color: "#1f2937", text: "#fff" },
+      // 建物系
+      akiya:   { label: "空家",   color: "#3B82F6", text: "#fff" },
+      chikuko: { label: "築古",   color: "#6366F1", text: "#fff" },
+      haikyo:  { label: "廃墟",   color: "#A855F7", text: "#fff" },
+      renpei:  { label: "連棟",   color: "#8B5CF6", text: "#fff" },
+      shueki:  { label: "収益",   color: "#0EA5E9", text: "#fff" },
+      souko:   { label: "倉庫",   color: "#64748B", text: "#fff" },
+      // 土地系
+      sarachi: { label: "更地",   color: "#10B981", text: "#fff" },
+      zasshu:  { label: "雑種地", color: "#84CC16", text: "#fff" },
+      parking: { label: "駐車場", color: "#14B8A6", text: "#fff" },
+      tahata:  { label: "田・畑", color: "#65A30D", text: "#fff" },
+      // NG系
+      hansha:  { label: "反社",   color: "#EF4444", text: "#fff" },
+      ng:      { label: "NG",     color: "#6B7280", text: "#fff" },
     };
+    const STATUS_GROUPS = [
+      { label: "建物系", keys: ["akiya", "chikuko", "haikyo", "renpei", "shueki", "souko"] },
+      { label: "土地系", keys: ["sarachi", "zasshu", "parking", "tahata"] },
+      { label: "NG系",   keys: ["hansha", "ng"] },
+    ];
+    // 未定義ステータス（旧データ等）のフォールバック色
+    const FALLBACK_COLOR = "#9CA3AF";
+
+    // ===== ステータス選択UI（グループ見出し付き2列グリッド）=====
+    function renderStatusOptions() {
+      const html = STATUS_GROUPS.map(g => `
+        <div class="status-group-label">${g.label}</div>
+        <div class="status-grid">
+          ${g.keys.map(k => {
+            const s = STATUS[k];
+            return `<div><input class="status-option" type="radio" name="status" id="s-${k}" value="${k}">
+              <label class="status-label" for="s-${k}" style="--c:${s.color}"><span class="dot"></span>${s.label}</label></div>`;
+          }).join("")}
+        </div>`).join("");
+      document.getElementById("statusGroups").innerHTML = html;
+    }
+    function setStatusRadio(key) {
+      const el = document.getElementById("s-" + key);
+      if (el) { el.checked = true; return; }
+      // 未定義キー（旧データ編集時など）は未選択にして再選択を促す
+      const cur = document.querySelector('input[name="status"]:checked');
+      if (cur) cur.checked = false;
+    }
+    renderStatusOptions();
 
     // ===== OFFLINE SYNC =====
     async function syncOfflineQueue() {
@@ -166,12 +204,13 @@
     }
 
     function renderMarker(id, data) {
-      const s = STATUS[data.status] || STATUS.tochi;
+      // 未定義ステータスでも落ちない・透明にならないようガード。
+      const s = STATUS[data.status];
       const marker = new ZDC.Marker(
         new ZDC.LatLng(data.lat, data.lng),
         {
-          color: s.color,
-          text: s.label[0],
+          color: s ? s.color : FALLBACK_COLOR,
+          text: s ? s.label[0] : "?",
         }
       );
       marker.pinId = id;
@@ -188,7 +227,7 @@
       editingPinId = null;
       editingPinData = null;
       document.getElementById("modalTitle").textContent = "ピンを追加";
-      document.getElementById("statusSelect").value = "tochi";
+      setStatusRadio("akiya");
       document.getElementById("memo").value = "";
       document.getElementById("chibanInput").value = "";
       document.getElementById("chibanInput").placeholder = "地番取得中…";
@@ -204,7 +243,7 @@
       editingPinData = data;
       pendingLatLng = { lat: data.lat, lng: data.lng };
       document.getElementById("modalTitle").textContent = "ピンを編集";
-      document.getElementById("statusSelect").value = data.status;
+      setStatusRadio(data.status);
       document.getElementById("memo").value = data.memo || "";
       document.getElementById("addressLabel").textContent = data.address || "取得中…";
       document.getElementById("chibanInput").value = data.chiban || "";
@@ -292,7 +331,8 @@
     // ===== SAVE PIN =====
     window.savePin = async () => {
       if (!pendingLatLng && !editingPinId) return;
-      const status = document.getElementById("statusSelect").value;
+      const status = document.querySelector('input[name="status"]:checked')?.value;
+      if (!status) { showToast("ステータスを選択してください", "warn"); return; }
       const memo   = document.getElementById("memo").value.trim();
       const address = document.getElementById("addressLabel").textContent;
       const btn = document.getElementById("saveBtn");
@@ -460,21 +500,23 @@
       font-size: 13px; color: #9ca3af; margin-bottom: 16px; line-height: 1.5;
     }
     .field-label { font-size: 12px; color: #6b7280; font-weight: 500; margin-bottom: 6px; }
-    .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+    .status-group-label { font-size: 12px; color: #6b7280; font-weight: 700; margin: 2px 0 6px; }
+    .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
     .status-option { display: none; }
     .status-label {
-      display: flex; align-items: center; justify-content: center;
+      display: flex; align-items: center; justify-content: center; gap: 6px;
       padding: 10px 8px; border-radius: 8px; border: 2px solid #374151;
       font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.15s; color: #9ca3af;
     }
-    .status-option:checked + .status-label { border-color: transparent; color: #fff; }
-    #s-tochi:checked    + .status-label { background: #10B981; }
-    #s-tatemono:checked + .status-label { background: #EF4444; }
-    #s-rentou:checked   + .status-label { background: #F97316; }
-    #s-shintiku:checked + .status-label { background: #9CA3AF; }
-    #s-souko:checked    + .status-label { background: #EAB308; color: #111; }
-    #s-shueki:checked   + .status-label { background: #8B5CF6; }
-    #s-hansha:checked   + .status-label { background: #1f2937; }
+    .status-label .dot {
+      width: 10px; height: 10px; border-radius: 50%; background: var(--c); flex-shrink: 0;
+    }
+    .status-option:checked + .status-label {
+      border-color: transparent; color: #fff; background: var(--c);
+    }
+    .status-option:checked + .status-label .dot {
+      background: #fff;
+    }
 
     textarea#memo {
       width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #374151;
@@ -535,24 +577,7 @@
     <input id="chibanInput" type="text" placeholder="地番"
       style="width:100%;box-sizing:border-box;padding:12px;border:1px solid #d1d5db;border-radius:10px;font-size:16px;font-family:inherit;margin-bottom:4px;">
     <div class="field-label">ステータス</div>
-    <div class="status-grid">
-      <div><input class="status-option" type="radio" name="status" id="s-tochi" value="tochi" checked><label class="status-label" for="s-tochi">🌿 土地</label></div>
-      <div><input class="status-option" type="radio" name="status" id="s-tatemono" value="tatemono"><label class="status-label" for="s-tatemono">🏚 建物</label></div>
-      <div><input class="status-option" type="radio" name="status" id="s-rentou" value="rentou"><label class="status-label" for="s-rentou">🏘 連棟</label></div>
-      <div><input class="status-option" type="radio" name="status" id="s-shintiku" value="shintiku"><label class="status-label" for="s-shintiku">🏠 新築</label></div>
-      <div><input class="status-option" type="radio" name="status" id="s-souko" value="souko"><label class="status-label" for="s-souko">🏗 倉庫</label></div>
-      <div><input class="status-option" type="radio" name="status" id="s-shueki" value="shueki"><label class="status-label" for="s-shueki">🏢 収益</label></div>
-      <div><input class="status-option" type="radio" name="status" id="s-hansha" value="hansha"><label class="status-label" for="s-hansha">⚫ 反社</label></div>
-    </div>
-    <select id="statusSelect" style="display:none">
-      <option value="tochi">土地</option>
-      <option value="tatemono">建物</option>
-      <option value="rentou">連棟</option>
-      <option value="shintiku">新築</option>
-      <option value="souko">倉庫</option>
-      <option value="shueki">収益</option>
-      <option value="hansha">反社</option>
-    </select>
+    <div id="statusGroups"></div>
     <div class="field-label">メモ</div>
     <textarea id="memo" placeholder="気づいたことを入力（任意）"></textarea>
     <div class="modal-actions">
@@ -566,11 +591,6 @@
 <div class="toast" id="toast"></div>
 
 <script>
-  document.querySelectorAll('.status-option').forEach(r => {
-    r.addEventListener('change', () => {
-      document.getElementById('statusSelect').value = r.value;
-    });
-  });
   function updateOnlineStatus() {
     document.getElementById('offlineBadge').style.display = navigator.onLine ? 'none' : 'block';
   }

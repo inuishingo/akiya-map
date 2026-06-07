@@ -38,15 +38,59 @@
     let checkedIds = new Set();
     let selectedPinId = null;
 
+    // 全12種。index.html と同一のキー・ラベル・色で統一。
     const STATUS = {
-      tochi:    { label: "土地",   color: "#10B981", bg: "#ecfdf5", fg: "#065f46" },
-      tatemono: { label: "建物",   color: "#EF4444", bg: "#fef2f2", fg: "#991b1b" },
-      rentou:   { label: "連棟",   color: "#F97316", bg: "#fff7ed", fg: "#9a3412" },
-      shintiku: { label: "新築",   color: "#9CA3AF", bg: "#f9fafb", fg: "#4b5563" },
-      souko:    { label: "倉庫",   color: "#EAB308", bg: "#fefce8", fg: "#854d0e" },
-      shueki:   { label: "収益",   color: "#8B5CF6", bg: "#f5f3ff", fg: "#5b21b6" },
-      hansha:   { label: "反社",   color: "#1f2937", bg: "#111827", fg: "#d1d5db" },
+      // 建物系
+      akiya:   { label: "空家",   color: "#3B82F6" },
+      chikuko: { label: "築古",   color: "#6366F1" },
+      haikyo:  { label: "廃墟",   color: "#A855F7" },
+      renpei:  { label: "連棟",   color: "#8B5CF6" },
+      shueki:  { label: "収益",   color: "#0EA5E9" },
+      souko:   { label: "倉庫",   color: "#64748B" },
+      // 土地系
+      sarachi: { label: "更地",   color: "#10B981" },
+      zasshu:  { label: "雑種地", color: "#84CC16" },
+      parking: { label: "駐車場", color: "#14B8A6" },
+      tahata:  { label: "田・畑", color: "#65A30D" },
+      // NG系
+      hansha:  { label: "反社",   color: "#EF4444" },
+      ng:      { label: "NG",     color: "#6B7280" },
     };
+    const STATUS_GROUPS = [
+      { key: "building", label: "建物系", keys: ["akiya", "chikuko", "haikyo", "renpei", "shueki", "souko"] },
+      { key: "land",     label: "土地系", keys: ["sarachi", "zasshu", "parking", "tahata"] },
+      { key: "ng",       label: "NG系",   keys: ["hansha", "ng"] },
+    ];
+    // 未定義ステータス（旧データ等）のフォールバック色
+    const FALLBACK_COLOR = "#9CA3AF";
+
+    // グループ見出し付き <optgroup> を生成（selected 指定で現在値を選択）。
+    function statusOptionsHTML(selected) {
+      const known = STATUS_GROUPS.map(g =>
+        `<optgroup label="${g.label}">` +
+        g.keys.map(k => `<option value="${k}" ${selected === k ? "selected" : ""}>${STATUS[k].label}</option>`).join("") +
+        `</optgroup>`
+      ).join("");
+      // 未定義キー（旧データ）は壊さず現状値を選択肢として先頭に残す
+      const legacy = (selected && !STATUS[selected])
+        ? `<option value="${selected}" selected>${selected}（旧）</option>` : "";
+      return legacy + known;
+    }
+
+    // 種別フィルタのドロップダウン（すべて＋グループ見出し付き）を描画
+    function renderStatusFilter() {
+      const sel = document.getElementById("statusFilter");
+      if (!sel) return;
+      sel.innerHTML =
+        `<option value="all">種別：すべて</option>` +
+        STATUS_GROUPS.map(g =>
+          `<optgroup label="${g.label}">` +
+          g.keys.map(k => `<option value="${k}">${STATUS[k].label}</option>`).join("") +
+          `</optgroup>`
+        ).join("");
+      sel.value = activeStatusFilter;
+    }
+    renderStatusFilter();
 
     function makeSvgUrl(color, text) {
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="40" viewBox="0 0 32 40">
@@ -128,9 +172,11 @@
       Object.keys(STATUS).forEach(k => counts[k] = 0);
       allPins.forEach(p => { if (counts[p.status] !== undefined) counts[p.status]++; });
       document.getElementById("stat-total").textContent = allPins.length;
-      Object.keys(STATUS).forEach(k => {
-        const el = document.getElementById("stat-" + k);
-        if (el) el.textContent = counts[k];
+      // グループ小計（建物系・土地系・NG系）。カードが存在すれば反映。
+      STATUS_GROUPS.forEach(g => {
+        const sub = g.keys.reduce((n, k) => n + counts[k], 0);
+        const el = document.getElementById("stat-group-" + g.key);
+        if (el) el.textContent = sub;
       });
     }
 
@@ -167,8 +213,8 @@
     // ===== STATUS FILTER =====
     window.setFilter = (f) => {
       activeStatusFilter = f;
-      document.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
-      document.querySelector(`[data-filter="${f}"]`).classList.add("active");
+      const sel = document.getElementById("statusFilter");
+      if (sel && sel.value !== f) sel.value = f;
       renderList();
       renderMapMarkers();
     };
@@ -196,7 +242,10 @@
         return;
       }
       container.innerHTML = pins.map(p => {
-        const s = STATUS[p.status] || STATUS.tatemono;
+        // 未定義ステータスでも崩れないようガード
+        const s = STATUS[p.status];
+        const sLabel = s ? s.label : (p.status || "不明");
+        const sColor = s ? s.color : FALLBACK_COLOR;
         const date = p.createdAt ? p.createdAt.slice(0, 10) : "–";
         const isChecked = checkedIds.has(p.id);
         const isSelected = selectedPinId === p.id;
@@ -206,7 +255,7 @@
           <div class="pin-card-top">
             <input type="checkbox" class="pin-check" ${isChecked ? "checked" : ""}
               onclick="toggleCheck('${p.id}',event)">
-            <span class="status-badge" style="background:${s.bg};color:${s.fg}">${s.label}</span>
+            <span class="status-badge" style="background:${sColor};color:#fff">${sLabel}</span>
             <span class="pin-date">${date}</span>
             <span class="pin-staff">${p.email || "–"}</span>
             <button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>
@@ -222,9 +271,7 @@
           <div class="pin-actions">
             <a class="sv-btn" href="${svUrl}" target="_blank" onclick="event.stopPropagation()">📷 ストリートビュー</a>
             <select class="status-sel" onchange="updateStatus('${p.id}',this.value)" onclick="event.stopPropagation()">
-              ${Object.entries(STATUS).map(([k,v]) =>
-                `<option value="${k}" ${p.status===k?"selected":""}>${v.label}</option>`
-              ).join("")}
+              ${statusOptionsHTML(p.status)}
             </select>
           </div>
         </div>`;
@@ -267,10 +314,11 @@
       markers.forEach(m => map.removeWidget(m));
       markers = [];
       filtered().forEach(p => {
-        const s = STATUS[p.status] || STATUS.tatemono;
+        // 未定義ステータスでも落ちない・透明にならないようガード
+        const s = STATUS[p.status];
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
-          { color: s.color, text: s.label[0] }
+          { color: s ? s.color : FALLBACK_COLOR, text: s ? s.label[0] : "?" }
         );
         marker.pinId = p.id;
         marker.addEventListener("click", function() { selectPin(p.id); });
@@ -432,12 +480,12 @@
       border-bottom: 1px solid #f1f5f9; flex-shrink: 0;
     }
     .filter-bar::-webkit-scrollbar { display: none; }
-    .filter-btn {
-      padding: 4px 10px; border-radius: 20px; border: 1px solid #e2e8f0;
-      font-size: 11px; font-weight: 500; cursor: pointer; white-space: nowrap;
-      background: #fff; color: #64748b; transition: all 0.15s;
+    .status-filter-sel {
+      flex: 1; padding: 6px 10px; border-radius: 8px; border: 1px solid #e2e8f0;
+      font-size: 12px; font-weight: 500; color: #1e293b; background: #fff;
+      cursor: pointer; font-family: inherit; outline: none;
     }
-    .filter-btn.active { background: #1e293b; color: #fff; border-color: #1e293b; }
+    .status-filter-sel:focus { border-color: #3b82f6; }
 
     #bulkDeleteBtn {
       display: none; align-items: center; justify-content: center;
@@ -543,50 +591,31 @@
   </div>
 
   <div class="left-panel">
+    <!-- 集計カウンタ：総件数＋グループ小計（建物系/土地系/NG系）の4枚。表示専用。
+         数字は updateStats() が stat-total / stat-group-* に反映。絞り込みは下のドロップダウンで。 -->
     <div class="stats-bar">
       <div class="stat-item" onclick="setFilter('all')">
         <div class="stat-num" id="stat-total">0</div>
         <div class="stat-label">総件数</div>
       </div>
-      <div class="stat-item" onclick="setFilter('tochi')">
-        <div class="stat-num" style="color:#10B981" id="stat-tochi">0</div>
-        <div class="stat-label">土地</div>
+      <div class="stat-item">
+        <div class="stat-num" style="color:#3B82F6" id="stat-group-building">0</div>
+        <div class="stat-label">建物系</div>
       </div>
-      <div class="stat-item" onclick="setFilter('tatemono')">
-        <div class="stat-num" style="color:#EF4444" id="stat-tatemono">0</div>
-        <div class="stat-label">建物</div>
+      <div class="stat-item">
+        <div class="stat-num" style="color:#10B981" id="stat-group-land">0</div>
+        <div class="stat-label">土地系</div>
       </div>
-      <div class="stat-item" onclick="setFilter('rentou')">
-        <div class="stat-num" style="color:#F97316" id="stat-rentou">0</div>
-        <div class="stat-label">連棟</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('shintiku')">
-        <div class="stat-num" style="color:#9CA3AF" id="stat-shintiku">0</div>
-        <div class="stat-label">新築</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('souko')">
-        <div class="stat-num" style="color:#EAB308" id="stat-souko">0</div>
-        <div class="stat-label">倉庫</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('shueki')">
-        <div class="stat-num" style="color:#8B5CF6" id="stat-shueki">0</div>
-        <div class="stat-label">収益</div>
-      </div>
-      <div class="stat-item" onclick="setFilter('hansha')">
-        <div class="stat-num" style="color:#1f2937" id="stat-hansha">0</div>
-        <div class="stat-label">反社</div>
+      <div class="stat-item">
+        <div class="stat-num" style="color:#EF4444" id="stat-group-ng">0</div>
+        <div class="stat-label">NG系</div>
       </div>
     </div>
 
     <div class="filter-bar">
-      <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">すべて</button>
-      <button class="filter-btn" data-filter="tochi"    onclick="setFilter('tochi')">🟢 土地</button>
-      <button class="filter-btn" data-filter="tatemono" onclick="setFilter('tatemono')">🔴 建物</button>
-      <button class="filter-btn" data-filter="rentou"   onclick="setFilter('rentou')">🟠 連棟</button>
-      <button class="filter-btn" data-filter="shintiku" onclick="setFilter('shintiku')">⬜ 新築</button>
-      <button class="filter-btn" data-filter="souko"    onclick="setFilter('souko')">🟡 倉庫</button>
-      <button class="filter-btn" data-filter="shueki"   onclick="setFilter('shueki')">🟣 収益</button>
-      <button class="filter-btn" data-filter="hansha"   onclick="setFilter('hansha')">⚫ 反社</button>
+      <select id="statusFilter" class="status-filter-sel" onchange="setFilter(this.value)">
+        <option value="all">種別：すべて</option>
+      </select>
     </div>
 
     <button id="bulkDeleteBtn" onclick="bulkDelete()">🗑 0件削除</button>

@@ -51,11 +51,15 @@ reviewReason        // string — short JP label for why needsReview was set; re
 
 ### STATUS taxonomy (shared, keep in sync across pages)
 
-Seven keys, each with a Japanese label and a color. The same set is redefined independently in `index.html`, `admin.html`, and must stay consistent:
+**12 keys in 3 groups**, each with a Japanese label and a color. `STATUS` and `STATUS_GROUPS` are redefined independently in `index.html` and `admin.html` and MUST stay consistent (same keys/labels/colors/order):
 
-`tochi`(土地/green) · `tatemono`(建物/red) · `rentou`(連棟/orange) · `shintiku`(新築/gray) · `souko`(倉庫/yellow) · `shueki`(収益/purple) · `hansha`(反社/black)
+- **建物系 (building)**: `akiya`(空家/#3B82F6) · `chikuko`(築古/#6366F1) · `haikyo`(廃墟/#A855F7) · `renpei`(連棟/#8B5CF6) · `shueki`(収益/#0EA5E9) · `souko`(倉庫/#64748B)
+- **土地系 (land)**: `sarachi`(更地/#10B981) · `zasshu`(雑種地/#84CC16) · `parking`(駐車場/#14B8A6) · `tahata`(田・畑/#65A30D)
+- **NG系 (ng)**: `hansha`(反社/#EF4444) · `ng`(NG/#6B7280)
 
-Markers display the first character of the label (`s.label[0]`) on a colored pin.
+`STATUS_GROUPS` drives the grouped pin-picker (index.html modal), the grouped filter dropdown + group subtotals (admin.html), nothing flat. Markers show the first character of the label (`s.label[0]`) on a colored pin.
+
+**Undefined-status guard (required)**: old/unknown `status` values must not break the UI. Marker color falls back to `FALLBACK_COLOR` (#9CA3AF) with text `?`; admin badge shows the raw value; legacy keys appear only under the "すべて" filter and are kept (non-destructive) in the per-card status `<select>`. The pre-2026-06 keys (`tochi/tatemono/rentou/shintiku/souko/shueki/hansha`) are retired — note `souko/shueki/hansha` are REUSED keys with new colors, and old `souko/shueki/hansha` pins were test data (no migration).
 
 ### Reverse geocoding
 
