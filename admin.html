@@ -422,7 +422,7 @@
     }
     window.exportCSV = () => {
       const pins = filtered();
-      const header = ["発見日","担当者","住居表示","地番表示","地番","レ","ステータス","メモ","緯度","経度","拠点"];
+      const header = ["発見日","担当者","所在地","住居表記","地番","レ","ステータス","メモ","緯度","経度","拠点"];
       const rows = pins.map(p => {
         const [town, banchi] = splitAddress(p.address);
         return [
