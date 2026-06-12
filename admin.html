@@ -429,7 +429,8 @@
         p.createdAt?.slice(0,10) || "",
         p.email || "",
         town,
-        banchi,
+        // 番地（例 25-4）はExcelが日付に誤変換するため、先頭にタブを付けて文字列強制
+        banchi ? "\t" + banchi : "",
         p.chiban || "",
         "",
         STATUS[p.status]?.label || p.status,
