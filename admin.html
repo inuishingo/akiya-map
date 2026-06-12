@@ -407,13 +407,29 @@
     };
 
     // ===== CSV EXPORT =====
+    // 住居表示を「町名まで」と「番地のみ」に分割する。
+    // 例: 愛知県名古屋市中村区亀島2丁目25-4 → ["愛知県名古屋市中村区亀島2丁目", "25-4"]
+    function splitAddress(addr) {
+      const a = (addr || "").trim();
+      if (!a) return ["", ""];
+      // 丁目があればそこで分割（丁目内の数字は町名側に残す）
+      const m1 = a.match(/^(.*丁目)(.*)$/);
+      if (m1) return [m1[1].trim(), m1[2].trim()];
+      // 丁目なし: 末尾の番地（数字＋ハイフン＋番地/号/の）を切り出す
+      const m2 = a.match(/^(.*?)([0-9０-９][0-9０-９\-－‐番地号の]*)$/);
+      if (m2) return [m2[1].trim(), m2[2].trim()];
+      return [a, ""];
+    }
     window.exportCSV = () => {
       const pins = filtered();
-      const header = ["発見日","担当者","住所","地番","レ","ステータス","メモ","緯度","経度","拠点"];
-      const rows = pins.map(p => [
+      const header = ["発見日","担当者","住居表示","地番表示","地番","レ","ステータス","メモ","緯度","経度","拠点"];
+      const rows = pins.map(p => {
+        const [town, banchi] = splitAddress(p.address);
+        return [
         p.createdAt?.slice(0,10) || "",
         p.email || "",
-        p.address || "",
+        town,
+        banchi,
         p.chiban || "",
         "",
         STATUS[p.status]?.label || p.status,
@@ -421,7 +437,7 @@
         p.lat || "",
         p.lng || "",
         p.branch || "",
-      ].map(v => `"${String(v).replace(/"/g,'""')}"`));
+      ].map(v => `"${String(v).replace(/"/g,'""')}"`); });
       const csv = [header, ...rows].map(r => r.join(",")).join("\n");
       const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
       const url = URL.createObjectURL(blob);
