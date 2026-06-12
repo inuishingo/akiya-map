@@ -467,7 +467,7 @@
         p.createdAt?.slice(0,10) || "",
         p.email || "",
         town,
-        // TSVはExcelが開く際に日付自動変換しないため、番地(例 71-1)はそのままで可
+        // 番地(例 71-1)はプレーン値。Excelでの日付誤変換(Jan-71等)は許容する方針
         banchi,
         p.chiban || "",
         "",
@@ -476,17 +476,16 @@
         p.lat || "",
         p.lng || "",
         p.branch || "",
-      // TSVなので各値のタブ・改行はスペース化して列ズレ/行ズレを防ぐ
-      ].map(v => String(v).replace(/[\t\r\n]+/g, " ")); });
-      const tsv = [header, ...rows].map(r => r.join("\t")).join("\n");
-      const blob = new Blob(["\uFEFF" + tsv], { type: "text/tab-separated-values;charset=utf-8;" });
+      ].map(v => `"${String(v).replace(/"/g,'""')}"`); });
+      const csv = [header, ...rows].map(r => r.join(",")).join("\n");
+      const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `空家マップ_${new Date().toISOString().slice(0,10)}.tsv`;
+      a.download = `空家マップ_${new Date().toISOString().slice(0,10)}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-      showToast("TSVを出力しました");
+      showToast("CSVを出力しました");
     };
 
     // ===== TOAST =====
@@ -700,7 +699,7 @@
     <select id="staffFilter" onchange="setStaffFilter(this.value)">
       <option value="all">担当者：すべて</option>
     </select>
-    <button class="csv-btn" onclick="exportCSV()">📥 TSV出力</button>
+    <button class="csv-btn" onclick="exportCSV()">📥 CSV出力</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
   </div>
 
