@@ -64,6 +64,23 @@
     // 未定義ステータス（旧データ等）のフォールバック色
     const FALLBACK_COLOR = "#9CA3AF";
 
+    // ===== 担当者カラー（地図ピン） =====
+    // 担当者(メールアドレス)ごとに固定色を割り当てる。最大6色、7人目以降はデフォルト色。
+    // 割当はFirestore上のメールアドレス昇順で自動付与（人が増減しても順序は安定）。
+    const STAFF_PALETTE = ["#2563EB","#DC2626","#059669","#D97706","#7C3AED","#DB2777"];
+    const STAFF_DEFAULT_COLOR = "#9CA3AF";
+    let staffColorMap = {};
+    function buildStaffColors() {
+      const emails = [...new Set(allPins.map(p => p.email).filter(Boolean))].sort();
+      staffColorMap = {};
+      emails.forEach((e, i) => {
+        staffColorMap[e] = i < STAFF_PALETTE.length ? STAFF_PALETTE[i] : STAFF_DEFAULT_COLOR;
+      });
+    }
+    function staffColor(email) {
+      return staffColorMap[email] || STAFF_DEFAULT_COLOR;
+    }
+
     // グループ見出し付き <optgroup> を生成（selected 指定で現在値を選択）。
     function statusOptionsHTML(selected) {
       const known = STATUS_GROUPS.map(g =>
@@ -158,6 +175,7 @@
       const q = query(collection(db, "pins"), orderBy("createdAt", "desc"));
       onSnapshot(q, snap => {
         allPins = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        buildStaffColors();
         updateStats();
         updateStaffFilter();
         updateDateFilter();
@@ -324,11 +342,11 @@
       filtered().forEach(p => {
         // 未定義ステータスでも落ちない・透明にならないようガード
         const s = STATUS[p.status];
-        // マーカー本体は「カテゴリ色＋ステータス頭文字」。固定連番(seqNo)は
-        // マーカー上のHTMLオーバーレイ(#001形式)で表示する（下の UserWidget / index.html と同実装）。
+        // マーカー色は「担当者(メール)ごとの固定色」。頭文字はステータスを示す。
+        // 固定連番(seqNo)はマーカー上のHTMLオーバーレイ(#001形式)で表示する（下の UserWidget）。
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
-          { color: s ? s.color : FALLBACK_COLOR, text: s ? s.label[0] : "?" }
+          { color: staffColor(p.email), text: s ? s.label[0] : "?" }
         );
         marker.pinId = p.id;
         marker.addEventListener("click", function() { selectPin(p.id); });
