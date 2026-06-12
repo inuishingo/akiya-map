@@ -71,16 +71,26 @@
     const FALLBACK_COLOR = "#9CA3AF";
 
     // ===== 担当者カラー（#001ラベル背景） =====
-    // admin.html と同じパレット。index は自分のピンのみ読む（全担当者の一覧を
-    // 持てない）ため、自分のメールアドレスの決定的ハッシュで色を1つに決める。
-    // ※admin は全担当者のメール昇順で割当のため、同一人物でも色が一致しない場合あり。
+    // admin.html と完全に同じロジック：Firestoreの全ピンからメール一覧を作り、
+    // 昇順ソートして先頭から STAFF_PALETTE を割当（7人目以降・未割当はデフォルト色）。
+    // index は自分のピンしか描画しないが、色割当は全担当者基準にするため全ピンを読む。
     const STAFF_PALETTE = ["#2563EB","#DC2626","#059669","#D97706","#7C3AED","#DB2777"];
     const STAFF_DEFAULT_COLOR = "#9CA3AF";
+    let staffColorMap = {};
+    async function buildStaffColors() {
+      try {
+        const snap = await getDocs(collection(db, "pins"));
+        const emails = [...new Set(snap.docs.map(d => d.data().email).filter(Boolean))].sort();
+        staffColorMap = {};
+        emails.forEach((e, i) => {
+          staffColorMap[e] = i < STAFF_PALETTE.length ? STAFF_PALETTE[i] : STAFF_DEFAULT_COLOR;
+        });
+      } catch (e) {
+        // 全ピン読取がFirestoreルールやオフラインでNGの場合はデフォルト色にフォールバック
+      }
+    }
     function staffColor(email) {
-      if (!email) return STAFF_DEFAULT_COLOR;
-      let h = 0;
-      for (let i = 0; i < email.length; i++) h = (h * 31 + email.charCodeAt(i)) >>> 0;
-      return STAFF_PALETTE[h % STAFF_PALETTE.length];
+      return staffColorMap[email] || STAFF_DEFAULT_COLOR;
     }
 
     // ===== ステータス選択UI（グループ見出し付き2列グリッド）=====
@@ -221,6 +231,8 @@
       markers.forEach(m => map.removeWidget(m));
       markers = [];
       try {
+        // 担当者カラー（全担当者基準）を先に構築してからマーカーを描画
+        await buildStaffColors();
         const q = query(collection(db, "pins"), where("uid", "==", currentUser.uid));
         const snap = await getDocs(q);
         snap.forEach(d => renderMarker(d.id, d.data()));
