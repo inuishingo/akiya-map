@@ -219,13 +219,14 @@
     function renderMarker(id, data) {
       // 未定義ステータスでも落ちない・透明にならないようガード。
       const s = STATUS[data.status];
-      // マーカーには固定連番(seqNo)を表示。色はカテゴリ色を維持。
+      // マーカー本体は「カテゴリ色＋ステータス頭文字」。固定連番(seqNo)は
+      // マーカー上のHTMLオーバーレイ(#001形式)で表示する（下の UserWidget）。
       // seqNo 無し（万一の旧データ）はステータス頭文字→"?"でフォールバック（落とさない）。
       const marker = new ZDC.Marker(
         new ZDC.LatLng(data.lat, data.lng),
         {
           color: s ? s.color : FALLBACK_COLOR,
-          text: data.seqNo != null ? String(data.seqNo) : (s ? s.label[0] : "?"),
+          text: s ? s.label[0] : "?",
         }
       );
       marker.pinId = id;
@@ -235,6 +236,30 @@
       });
       map.addWidget(marker);
       markers.push(marker);
+
+      // ピン番号ラベル(#001形式)をマーカーの上にHTMLオーバーレイ表示。
+      // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
+      if (data.seqNo != null) {
+        const label = "#" + String(data.seqNo).padStart(3, "0");
+        const seqLabel = new ZDC.UserWidget(
+          new ZDC.LatLng(data.lat, data.lng),
+          {
+            htmlSource:
+              '<div style="transform:translateX(-50%);white-space:nowrap;'
+              + 'padding:1px 6px;border-radius:9px;'
+              + 'background:rgba(17,24,39,.85);color:#fff;'
+              + 'font-size:11px;font-weight:700;line-height:1.6;'
+              + 'border:1px solid rgba(255,255,255,.65);'
+              + 'box-shadow:0 1px 3px rgba(0,0,0,.35);'
+              + 'pointer-events:none;">' + label + '</div>',
+            offset: new ZDC.Point(0, -58),
+            propagation: true,
+          }
+        );
+        map.addWidget(seqLabel);
+        // markers 配列に入れておけば loadMyPins() の removeWidget ループで一緒に消える。
+        markers.push(seqLabel);
+      }
     }
 
     // ===== PIN MODAL（新規）=====
