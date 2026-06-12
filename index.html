@@ -70,6 +70,23 @@
     // 未定義ステータス（旧データ等）のフォールバック色
     const FALLBACK_COLOR = "#9CA3AF";
 
+    // ===== 担当者カラー（#001ラベル背景） =====
+    // admin.html と同じパレット。index は自分のピンのみ読むため、読み込んだ
+    // ピンのメールから割り当てる（実質1色）。7人目以降・未割当はデフォルト色。
+    const STAFF_PALETTE = ["#2563EB","#DC2626","#059669","#D97706","#7C3AED","#DB2777"];
+    const STAFF_DEFAULT_COLOR = "#9CA3AF";
+    let staffColorMap = {};
+    function buildStaffColors(emails) {
+      const uniq = [...new Set((emails || []).filter(Boolean))].sort();
+      staffColorMap = {};
+      uniq.forEach((e, i) => {
+        staffColorMap[e] = i < STAFF_PALETTE.length ? STAFF_PALETTE[i] : STAFF_DEFAULT_COLOR;
+      });
+    }
+    function staffColor(email) {
+      return staffColorMap[email] || STAFF_DEFAULT_COLOR;
+    }
+
     // ===== ステータス選択UI（グループ見出し付き2列グリッド）=====
     function renderStatusOptions() {
       const html = STATUS_GROUPS.map(g => `
@@ -210,6 +227,8 @@
       try {
         const q = query(collection(db, "pins"), where("uid", "==", currentUser.uid));
         const snap = await getDocs(q);
+        // #001ラベルの担当者カラー用にメール一覧から色を構築（描画前に必須）
+        buildStaffColors(snap.docs.map(d => d.data().email));
         snap.forEach(d => renderMarker(d.id, d.data()));
       } catch(e) {
         // オフライン時は無視
@@ -241,13 +260,14 @@
       // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
       if (data.seqNo != null) {
         const label = "#" + String(data.seqNo).padStart(3, "0");
+        // 背景は担当者カラー（文字は白固定）
         const seqLabel = new ZDC.UserWidget(
           new ZDC.LatLng(data.lat, data.lng),
           {
             htmlSource:
               '<div style="transform:translateX(-50%);white-space:nowrap;'
               + 'padding:1px 6px;border-radius:9px;'
-              + 'background:rgba(17,24,39,.85);color:#fff;'
+              + 'background:' + staffColor(data.email) + ';color:#fff;'
               + 'font-size:11px;font-weight:700;line-height:1.6;'
               + 'border:1px solid rgba(255,255,255,.65);'
               + 'box-shadow:0 1px 3px rgba(0,0,0,.35);'
