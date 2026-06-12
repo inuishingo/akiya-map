@@ -260,6 +260,16 @@
       document.getElementById("bulkDeleteBtn").style.display = hasChecked ? "flex" : "none";
       document.getElementById("bulkDeleteBtn").textContent = `🗑 ${checkedIds.size}件削除`;
 
+      // 全選択チェックボックスの状態を「現在表示中のピン」基準で同期
+      const selCb = document.getElementById("selectAllCheck");
+      if (selCb) {
+        const allChecked = pins.length > 0 && pins.every(p => checkedIds.has(p.id));
+        selCb.checked = allChecked;
+        selCb.indeterminate = !allChecked && pins.some(p => checkedIds.has(p.id));
+      }
+      const selCnt = document.getElementById("selectCount");
+      if (selCnt) selCnt.textContent = checkedIds.size ? `${checkedIds.size}件選択中` : "";
+
       if (pins.length === 0) {
         container.innerHTML = `<div class="empty">該当するピンがありません</div>`;
         return;
@@ -309,6 +319,14 @@
       e.stopPropagation();
       if (checkedIds.has(id)) { checkedIds.delete(id); }
       else { checkedIds.add(id); }
+      renderList();
+    };
+
+    // ===== 全選択 / 全解除（現在表示中のピン基準） =====
+    window.toggleSelectAll = (el) => {
+      const pins = filtered();
+      if (el.checked) { pins.forEach(p => checkedIds.add(p.id)); }
+      else { pins.forEach(p => checkedIds.delete(p.id)); }
       renderList();
     };
 
@@ -439,7 +457,9 @@
       return [a, ""];
     }
     window.exportCSV = () => {
-      const pins = filtered();
+      // 選択中（チェック済み）のピンのみ出力
+      const pins = allPins.filter(p => checkedIds.has(p.id));
+      if (pins.length === 0) { showToast("選択中のピンがありません", "error"); return; }
       const header = ["発見日","担当者","所在地","住居表記","地番","レ","ステータス","メモ","緯度","経度","拠点"];
       const rows = pins.map(p => {
         const [town, banchi] = splitAddress(p.address);
@@ -558,6 +578,18 @@
       cursor: pointer; font-family: inherit; outline: none;
     }
     .status-filter-sel:focus { border-color: #3b82f6; }
+
+    .select-all-bar {
+      display: flex; align-items: center; justify-content: space-between;
+      margin: 6px 8px 0; padding: 6px 10px;
+      border-radius: 8px; background: #f8fafc; border: 1px solid #e2e8f0;
+    }
+    .select-all-label {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 12px; font-weight: 600; color: #334155; cursor: pointer; user-select: none;
+    }
+    .select-all-label input { cursor: pointer; }
+    .select-count { font-size: 12px; color: #64748b; }
 
     #bulkDeleteBtn {
       display: none; align-items: center; justify-content: center;
@@ -697,6 +729,14 @@
       <select id="statusFilter" class="status-filter-sel" onchange="setFilter(this.value)">
         <option value="all">種別：すべて</option>
       </select>
+    </div>
+
+    <div class="select-all-bar">
+      <label class="select-all-label">
+        <input type="checkbox" id="selectAllCheck" onchange="toggleSelectAll(this)">
+        全選択
+      </label>
+      <span class="select-count" id="selectCount"></span>
     </div>
 
     <button id="bulkDeleteBtn" onclick="bulkDelete()">🗑 0件削除</button>
