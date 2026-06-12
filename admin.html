@@ -467,9 +467,8 @@
         p.createdAt?.slice(0,10) || "",
         p.email || "",
         town,
-        // 番地（例 71-1）はExcelが日付(Jan-71等)に誤変換するため、="71-1" のExcel式形式で
-        // 文字列強制。一律クォートを通すと "=""71-1""" となり、Excelが復号→式→文字列で表示する。
-        banchi ? `="${banchi}"` : "",
+        // TSVはExcelが開く際に日付自動変換しないため、番地(例 71-1)はそのままで可
+        banchi,
         p.chiban || "",
         "",
         STATUS[p.status]?.label || p.status,
@@ -477,16 +476,17 @@
         p.lat || "",
         p.lng || "",
         p.branch || "",
-      ].map(v => `"${String(v).replace(/"/g,'""')}"`); });
-      const csv = [header, ...rows].map(r => r.join(",")).join("\n");
-      const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+      // TSVなので各値のタブ・改行はスペース化して列ズレ/行ズレを防ぐ
+      ].map(v => String(v).replace(/[\t\r\n]+/g, " ")); });
+      const tsv = [header, ...rows].map(r => r.join("\t")).join("\n");
+      const blob = new Blob(["\uFEFF" + tsv], { type: "text/tab-separated-values;charset=utf-8;" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `空家マップ_${new Date().toISOString().slice(0,10)}.csv`;
+      a.download = `空家マップ_${new Date().toISOString().slice(0,10)}.tsv`;
       a.click();
       URL.revokeObjectURL(url);
-      showToast("CSVを出力しました");
+      showToast("TSVを出力しました");
     };
 
     // ===== TOAST =====
@@ -700,7 +700,7 @@
     <select id="staffFilter" onchange="setStaffFilter(this.value)">
       <option value="all">担当者：すべて</option>
     </select>
-    <button class="csv-btn" onclick="exportCSV()">📥 CSV出力</button>
+    <button class="csv-btn" onclick="exportCSV()">📥 TSV出力</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
   </div>
 
