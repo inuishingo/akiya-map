@@ -28,5 +28,12 @@ service cloud.firestore {
       allow read: if isSignedIn();
       allow write: if false;
     }
+
+    // メール→表示名の対応。手動でdoc追加運用（doc ID=メール, field name）。
+    // 読み取りのみ許可。クライアントからの改変は不可。
+    match /displayNames/{email} {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
   }
 }

@@ -93,6 +93,23 @@
       return staffColorMap[email] || STAFF_DEFAULT_COLOR;
     }
 
+    // メール→表示名マップ。displayNames コレクション（doc ID=メール, field name）を全件読む。
+    // 未登録メールはメールのままフォールバック（落とさない）。手動でdoc追加すれば即反映。
+    let staffNameMap = {};
+    async function buildStaffNames() {
+      staffNameMap = {};
+      try {
+        const snap = await getDocs(collection(db, "displayNames"));
+        snap.forEach(d => {
+          const n = d.data().name;
+          if (n) staffNameMap[d.id] = n;   // d.id = メールアドレス
+        });
+      } catch(e) {}
+    }
+    function staffName(email) {
+      return staffNameMap[email] || email || "–";
+    }
+
     // ===== ステータス選択UI（グループ見出し付き2列グリッド）=====
     function renderStatusOptions() {
       const html = STATUS_GROUPS.map(g => `
@@ -231,8 +248,9 @@
       markers.forEach(m => map.removeWidget(m));
       markers = [];
       try {
-        // 担当者カラー（全担当者基準）を先に構築してからマーカーを描画
+        // 担当者カラー・表示名（全担当者基準）を先に構築してからマーカーを描画
         await buildStaffColors();
+        await buildStaffNames();
         const q = query(collection(db, "pins"), where("uid", "==", currentUser.uid));
         const snap = await getDocs(q);
         snap.forEach(d => renderMarker(d.id, d.data()));

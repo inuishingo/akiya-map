@@ -13,7 +13,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy }
+    import { getFirestore, collection, getDocs, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -81,6 +81,23 @@
       return staffColorMap[email] || STAFF_DEFAULT_COLOR;
     }
 
+    // メール→表示名マップ。displayNames コレクション（doc ID=メール, field name）を全件読む。
+    // 未登録メールはメールのままフォールバック（落とさない）。手動でdoc追加すれば即反映。
+    let staffNameMap = {};
+    async function buildStaffNames() {
+      staffNameMap = {};
+      try {
+        const snap = await getDocs(collection(db, "displayNames"));
+        snap.forEach(d => {
+          const n = d.data().name;
+          if (n) staffNameMap[d.id] = n;   // d.id = メールアドレス
+        });
+      } catch(e) {}
+    }
+    function staffName(email) {
+      return staffNameMap[email] || email || "–";
+    }
+
     // グループ見出し付き <optgroup> を生成（selected 指定で現在値を選択）。
     function statusOptionsHTML(selected) {
       const known = STATUS_GROUPS.map(g =>
@@ -118,12 +135,14 @@
     }
 
     // ===== AUTH =====
-    onAuthStateChanged(auth, user => {
+    onAuthStateChanged(auth, async user => {
       if (user) {
         document.getElementById("loginScreen").style.display = "none";
         document.getElementById("adminScreen").style.display = "grid";
         document.getElementById("userLabel").textContent = user.email;
         initMap();
+        // 表示名マップを先に構築してから購読開始（一覧の担当者を表示名で出すため）
+        await buildStaffNames();
         listenPins();
       } else {
         document.getElementById("loginScreen").style.display = "flex";
@@ -293,7 +312,7 @@
             ${p.seqNo != null ? `<span class="pin-seq">${fmtSeq(p.seqNo)}</span>` : ""}
             <span class="status-badge" style="background:${sColor};color:#fff">${sLabel}</span>
             <span class="pin-date">${date}</span>
-            <span class="pin-staff">${p.email || "–"}</span>
+            <span class="pin-staff">${staffName(p.email)}</span>
             <button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>
           </div>
           <div class="pin-address">${p.address || "住所なし"}</div>
