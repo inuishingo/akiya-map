@@ -74,8 +74,8 @@
     // admin.html と完全に同じロジック：Firestoreの全ピンからメール一覧を作り、
     // 昇順ソートして先頭から STAFF_PALETTE を割当（7人目以降・未割当はデフォルト色）。
     // index は自分のピンしか描画しないが、色割当は全担当者基準にするため全ピンを読む。
-    const STAFF_PALETTE = ["#2563EB","#DC2626","#059669","#D97706","#7C3AED","#DB2777"];
-    const STAFF_DEFAULT_COLOR = "#9CA3AF";
+    const STAFF_PALETTE = ["#2563EB","#0891B2","#059669","#D97706","#7C3AED","#DB2777"];
+    const STAFF_DEFAULT_COLOR = "#65A30D";
     let staffColorMap = {};
     async function buildStaffColors() {
       try {
