@@ -223,7 +223,7 @@
       const sel = document.getElementById("staffFilter");
       const current = sel.value;
       sel.innerHTML = `<option value="all">担当者：すべて</option>` +
-        emails.map(e => `<option value="${e}" ${e===current?"selected":""}>${e}</option>`).join("");
+        emails.map(e => `<option value="${e}" ${e===current?"selected":""}>${staffName(e)}</option>`).join("");
     }
 
     window.setStaffFilter = (val) => {
@@ -487,7 +487,7 @@
         const [town, banchi] = splitAddress(p.address);
         return [
         p.createdAt?.slice(0,10) || "",
-        p.email || "",
+        staffName(p.email),
         town,
         // 番地・地番(例 71-1 / 12)はExcelが日付(Jan-71等)に誤変換するため、="..." のExcel式形式で
         // 文字列強制。一律クォートを通すと "=""71-1""" となり、Excelが復号→式→文字列で表示する。
