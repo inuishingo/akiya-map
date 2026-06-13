@@ -59,7 +59,7 @@
       parking: { label: "駐車場", color: "#14B8A6", text: "#fff", emoji: "🅿️" },
       tahata:  { label: "田・畑", color: "#65A30D", text: "#fff", emoji: "🌾" },
       // NG系
-      hansha:  { label: "反社",   color: "#EF4444", text: "#fff", emoji: "🚫" },
+      hansha:  { label: "反社",   color: "#1F2937", text: "#fff", emoji: "🚫" },
       ng:      { label: "NG",     color: "#6B7280", text: "#fff", emoji: "⛔" },
     };
     const STATUS_GROUPS = [
@@ -268,7 +268,7 @@
         const label = "#" + String(data.seqNo).padStart(3, "0");
         // 背景は担当者カラー（文字は白固定）。ただし地番取得に失敗（needsReview or 地番未取得）
         // のピンは赤背景で目立たせ、事務所での要確認を促す。
-        const chibanFailed = data.needsReview === true || !data.chiban;
+        const chibanFailed = data.needsReview === true || !(data.chiban && String(data.chiban).trim());
         const labelBg = chibanFailed ? "#EF4444" : staffColor(data.email);
         const seqLabel = new ZDC.UserWidget(
           new ZDC.LatLng(data.lat, data.lng),

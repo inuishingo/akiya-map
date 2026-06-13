@@ -55,7 +55,7 @@ reviewReason        // string — short JP label for why needsReview was set; re
 
 - **建物系 (building)**: `akiya`(空家/#3B82F6) · `chikuko`(築古/#6366F1) · `haikyo`(廃墟/#A855F7) · `renpei`(連棟/#8B5CF6) · `shueki`(収益/#0EA5E9) · `souko`(倉庫/#64748B)
 - **土地系 (land)**: `sarachi`(更地/#10B981) · `zasshu`(雑種地/#84CC16) · `parking`(駐車場/#14B8A6) · `tahata`(田・畑/#65A30D)
-- **NG系 (ng)**: `hansha`(反社/#EF4444) · `ng`(NG/#6B7280)
+- **NG系 (ng)**: `hansha`(反社/#1F2937) · `ng`(NG/#6B7280)
 
 `STATUS_GROUPS` drives the grouped pin-picker (index.html modal), the grouped filter dropdown + group subtotals (admin.html), nothing flat. Markers show the first character of the label (`s.label[0]`) on a colored pin.
 

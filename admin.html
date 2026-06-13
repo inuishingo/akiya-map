@@ -53,7 +53,7 @@
       parking: { label: "駐車場", color: "#14B8A6" },
       tahata:  { label: "田・畑", color: "#65A30D" },
       // NG系
-      hansha:  { label: "反社",   color: "#EF4444" },
+      hansha:  { label: "反社",   color: "#1F2937" },
       ng:      { label: "NG",     color: "#6B7280" },
     };
     const STATUS_GROUPS = [
@@ -278,15 +278,15 @@
         // 未定義ステータスでも崩れないようガード
         const s = STATUS[p.status];
         const sLabel = s ? s.label : (p.status || "不明");
-        const sColor = s ? s.color : FALLBACK_COLOR;
+        // 地番エラー（needsReview or 地番未取得）はバッジを赤にして要確認を示す
+        const chibanFailed = p.needsReview === true || !(p.chiban && p.chiban.trim());
+        const sColor = chibanFailed ? "#EF4444" : (s ? s.color : FALLBACK_COLOR);
         const date = p.createdAt ? p.createdAt.slice(0, 10) : "–";
         const isChecked = checkedIds.has(p.id);
         const isSelected = selectedPinId === p.id;
-        // 地番未入力（空白のみ含む）のカードは黄色背景で要対応を示す
-        const noChiban = !(p.chiban && p.chiban.trim());
         const svUrl = `https://maps.google.com/maps?q=&layer=c&cbll=${p.lat},${p.lng}`;
         return `
-        <div class="pin-card ${noChiban ? "no-chiban" : ""} ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
+        <div class="pin-card ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
           <div class="pin-card-top">
             <input type="checkbox" class="pin-check" ${isChecked ? "checked" : ""}
               onclick="toggleCheck('${p.id}',event)">
@@ -374,13 +374,16 @@
         // ピン番号ラベル(#001形式)をマーカーの上にHTMLオーバーレイ表示。
         // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
         if (p.seqNo != null) {
+          // 地番取得失敗（needsReview or 地番未取得）は赤背景で要確認を示す。現地画面(index.html)と色基準を統一。
+          const chibanFailed = p.needsReview === true || !(p.chiban && String(p.chiban).trim());
+          const labelBg = chibanFailed ? "#EF4444" : staffColor(p.email);
           const seqLabel = new ZDC.UserWidget(
             new ZDC.LatLng(p.lat, p.lng),
             {
               htmlSource:
                 '<div style="transform:translateX(-50%);white-space:nowrap;'
                 + 'padding:1px 6px;border-radius:9px;'
-                + 'background:' + staffColor(p.email) + ';color:#fff;'
+                + 'background:' + labelBg + ';color:#fff;'
                 + 'font-size:11px;font-weight:700;line-height:1.6;'
                 + 'border:1px solid rgba(255,255,255,.65);'
                 + 'box-shadow:0 1px 3px rgba(0,0,0,.35);'
@@ -609,8 +612,6 @@
       border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px;
       margin-bottom: 8px; cursor: pointer; transition: all 0.15s; background: #fff;
     }
-    /* 地番未入力カード（後続の .selected / .checked が背景を上書きする） */
-    .pin-card.no-chiban { background: #fef3c7; border-color: #f59e0b; }
     .pin-card:hover { border-color: #94a3b8; }
     .pin-card.selected { border-color: #3b82f6; box-shadow: 0 0 0 2px #bfdbfe; background: #eff6ff; }
     .pin-card.checked { background: #fef9c3; border-color: #eab308; }
