@@ -303,9 +303,12 @@
         const date = p.createdAt ? p.createdAt.slice(0, 10) : "–";
         const isChecked = checkedIds.has(p.id);
         const isSelected = selectedPinId === p.id;
-        // CSV出力済み（exportedAt あり）はグレーアウト＋出力済バッジで未出力と区別
+        // CSV出力済み（exportedAt あり）はグレーアウト＋出力済行で未出力と区別。
+        // 「拾った情報(発見日/担当者)」と「出力した情報」を分けるためカード末尾に独立行で出す。
         const exported = !!p.exportedAt;
-        const exportedDate = p.exportedAt ? p.exportedAt.slice(0,10) : "";
+        const exportedByName = p.exportedBy ? staffName(p.exportedBy) : "";
+        const exportedMD = p.exportedAt
+          ? `${Number(p.exportedAt.slice(5,7))}/${Number(p.exportedAt.slice(8,10))}` : "";
         const svUrl = `https://maps.google.com/maps?q=&layer=c&cbll=${p.lat},${p.lng}`;
         return `
         <div class="pin-card ${exported ? "exported" : ""} ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
@@ -315,7 +318,6 @@
             ${p.seqNo != null ? `<span class="pin-seq">${fmtSeq(p.seqNo)}</span>` : ""}
             <span class="status-badge" style="background:${sColor};color:#fff">${sLabel}</span>
             <span class="pin-date">${date}</span>
-            ${exported ? `<span class="exported-badge">✓出力済 ${exportedDate}</span>` : ""}
             <span class="pin-staff">${staffName(p.email)}</span>
             <button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>
           </div>
@@ -333,6 +335,7 @@
               ${statusOptionsHTML(p.status)}
             </select>
           </div>
+          ${exported ? `<div class="export-line">✓ CSV出力済 ${exportedMD}${exportedByName ? ` ・ ${exportedByName}` : ""}</div>` : ""}
         </div>`;
       }).join("");
     }
@@ -515,8 +518,9 @@
       // 出力対象に exportedAt を記録（一覧で出力済みグレーアウト表示に使う）。
       // CSVは既にDL済みなので書き込み失敗は握りつぶし、出力自体は止めない。
       const exportedAt = new Date().toISOString();
+      const exportedBy = auth.currentUser?.email || "";
       await Promise.all(
-        pins.map(p => updateDoc(doc(db, "pins", p.id), { exportedAt }).catch(()=>{}))
+        pins.map(p => updateDoc(doc(db, "pins", p.id), { exportedAt, exportedBy }).catch(()=>{}))
       );
       showToast(`CSVを出力しました（${pins.length}件・出力済みに記録）`);
     };
@@ -649,9 +653,10 @@
     .pin-card.exported { opacity: 0.55; }
     .pin-card.exported.selected,
     .pin-card.exported.checked { opacity: 1; }  /* 選択/チェック時は見やすく戻す */
-    .exported-badge {
-      font-size: 10px; font-weight: 700; color: #fff; background: #6b7280;
-      padding: 1px 6px; border-radius: 4px; margin-left: 4px;
+    .export-line {
+      font-size: 11px; font-weight: 700; color: #fff; background: #6b7280;
+      padding: 2px 8px; border-radius: 4px; margin-top: 6px;
+      display: inline-block;
     }
     /* ピンタップ時の一時ハイライト（数秒フラッシュ） */
     .pin-card.flash { animation: cardFlash 2s ease-out; }
