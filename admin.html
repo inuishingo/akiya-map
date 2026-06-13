@@ -303,15 +303,19 @@
         const date = p.createdAt ? p.createdAt.slice(0, 10) : "–";
         const isChecked = checkedIds.has(p.id);
         const isSelected = selectedPinId === p.id;
+        // CSV出力済み（exportedAt あり）はグレーアウト＋出力済バッジで未出力と区別
+        const exported = !!p.exportedAt;
+        const exportedDate = p.exportedAt ? p.exportedAt.slice(0,10) : "";
         const svUrl = `https://maps.google.com/maps?q=&layer=c&cbll=${p.lat},${p.lng}`;
         return `
-        <div class="pin-card ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
+        <div class="pin-card ${exported ? "exported" : ""} ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
           <div class="pin-card-top">
             <input type="checkbox" class="pin-check" ${isChecked ? "checked" : ""}
               onclick="toggleCheck('${p.id}',event)">
             ${p.seqNo != null ? `<span class="pin-seq">${fmtSeq(p.seqNo)}</span>` : ""}
             <span class="status-badge" style="background:${sColor};color:#fff">${sLabel}</span>
             <span class="pin-date">${date}</span>
+            ${exported ? `<span class="exported-badge">✓出力済 ${exportedDate}</span>` : ""}
             <span class="pin-staff">${staffName(p.email)}</span>
             <button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>
           </div>
@@ -478,7 +482,7 @@
       if (m2) return [m2[1].trim(), m2[2].trim()];
       return [a, ""];
     }
-    window.exportCSV = () => {
+    window.exportCSV = async () => {
       // 選択中（チェック済み）のピンのみ出力
       const pins = allPins.filter(p => checkedIds.has(p.id));
       if (pins.length === 0) { showToast("選択中のピンがありません", "error"); return; }
@@ -508,7 +512,13 @@
       a.download = `空家マップ_${new Date().toISOString().slice(0,10)}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-      showToast("CSVを出力しました");
+      // 出力対象に exportedAt を記録（一覧で出力済みグレーアウト表示に使う）。
+      // CSVは既にDL済みなので書き込み失敗は握りつぶし、出力自体は止めない。
+      const exportedAt = new Date().toISOString();
+      await Promise.all(
+        pins.map(p => updateDoc(doc(db, "pins", p.id), { exportedAt }).catch(()=>{}))
+      );
+      showToast(`CSVを出力しました（${pins.length}件・出力済みに記録）`);
     };
 
     // ===== TOAST =====
@@ -635,6 +645,14 @@
     .pin-card.selected { border-color: #3b82f6; box-shadow: 0 0 0 2px #bfdbfe; background: #eff6ff; }
     .pin-card.checked { background: #fef9c3; border-color: #eab308; }
     .pin-card.checked.selected { background: #fef9c3; border-color: #3b82f6; }
+    /* CSV出力済みピン：グレーアウトで未出力と区別 */
+    .pin-card.exported { opacity: 0.55; }
+    .pin-card.exported.selected,
+    .pin-card.exported.checked { opacity: 1; }  /* 選択/チェック時は見やすく戻す */
+    .exported-badge {
+      font-size: 10px; font-weight: 700; color: #fff; background: #6b7280;
+      padding: 1px 6px; border-radius: 4px; margin-left: 4px;
+    }
     /* ピンタップ時の一時ハイライト（数秒フラッシュ） */
     .pin-card.flash { animation: cardFlash 2s ease-out; }
     @keyframes cardFlash {
