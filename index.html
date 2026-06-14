@@ -38,6 +38,8 @@
     let currentUser = null;
     let markers = [];
     let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（loadMyPinsで消さない）
+    let followMode = true;       // 追従モード（カーナビ式）。既定ON。手動パンでOFF、📍でON復帰
+    let watchId = null;          // watchPosition のID（二重起動防止）
     let pendingLatLng = null;
     let pendingChiban = "";
     let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue") || "[]");
@@ -227,6 +229,8 @@
                 () => { /* 取得失敗時は仮の中心(名古屋駅)を維持 */ },
                 { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
               );
+              // 継続追跡を開始（青ドット更新＋追従）。二重起動はwatchIdで防止。
+              startLocationWatch();
             }
 
             // クリックでピン追加
@@ -234,6 +238,9 @@
               pendingLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
               openPinModal();
             });
+
+            // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
+            attachManualPanDetection();
 
             loadMyPins();
           },
@@ -553,8 +560,60 @@
       map.addWidget(myLocationMarker);
     }
 
-    // ===== LOCATE =====
+    // ===== 追従モード（カーナビ式）=====
+    // followMode=true: 現在地に地図を追従。手動で地図を動かすと解除、📍で復帰。
+    function setFollow(on) {
+      if (followMode === on) return;
+      followMode = on;
+      updateLocateBtn();
+    }
+    function updateLocateBtn() {
+      const b = document.querySelector(".locate-btn");
+      if (b) b.classList.toggle("following", followMode); // ON=青塗り / OFF=グレー
+    }
+
+    // watchPosition で継続追跡。位置更新ごとに青ドットを更新し、追従中のみ地図も寄せる。
+    function startLocationWatch() {
+      if (watchId != null) return;             // 二重起動防止
+      if (!navigator.geolocation) return;
+      watchId = navigator.geolocation.watchPosition(
+        pos => {
+          if (pos.coords.accuracy > 1000) return;  // 既存ガード踏襲（粗い測位は無視）
+          const lat = pos.coords.latitude, lng = pos.coords.longitude;
+          showMyLocation(lat, lng);                // 青ドットは常に現在地へ（followの有無に関係なく）
+          if (followMode) { map.setCenter(new ZDC.LatLng(lat, lng)); } // 追従中のみ地図も追従
+        },
+        () => { /* 取得失敗は無視（前回位置を維持） */ },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 5000 }
+      );
+    }
+
+    // 地図の手動パン検出：地図DOMへのタッチ/マウスのドラッグだけを「手動操作」とみなす。
+    // プログラムからの map.setCenter は touch/mouse 入力を発生させないため、追従中の自動寄せを
+    // 手動操作と誤判定しない（isAutoMovingフラグ不要）。タップ(ピン追加)は移動量しきい値で除外。
+    function attachManualPanDetection() {
+      const el = document.getElementById("map");
+      if (!el) return;
+      let startXY = null, mouseDown = false;
+      el.addEventListener("touchstart", e => {
+        startXY = (e.touches && e.touches.length === 1)
+          ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null;
+      }, { capture: true, passive: true });
+      el.addEventListener("touchmove", e => {
+        if (!startXY || !e.touches || e.touches.length !== 1) return; // ピンチズームは対象外
+        const dx = e.touches[0].clientX - startXY.x, dy = e.touches[0].clientY - startXY.y;
+        if (Math.hypot(dx, dy) > 8) setFollow(false);  // 8px超え＝ドラッグ＝手動操作で追従解除
+      }, { capture: true, passive: true });
+      // PC（マウスドラッグ）
+      el.addEventListener("mousedown", () => { mouseDown = true; }, { capture: true });
+      el.addEventListener("mousemove", () => { if (mouseDown) setFollow(false); }, { capture: true });
+      window.addEventListener("mouseup", () => { mouseDown = false; }, true);
+    }
+
+    // ===== LOCATE（📍：現在地へ寄せる＋追従ON復帰）=====
     window.locateMe = () => {
+      setFollow(true);          // 追従ON復帰
+      startLocationWatch();     // 追跡が未開始/停止なら再開（watchIdで二重起動防止）
       if (!navigator.geolocation || !map) return;
       navigator.geolocation.getCurrentPosition(pos => {
         map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
@@ -618,9 +677,13 @@
     .locate-btn {
       position: fixed; bottom: 24px; right: 16px; z-index: 100;
       width: 48px; height: 48px; border-radius: 50%; background: #1f2937;
-      border: 1px solid #374151; color: #60a5fa; font-size: 20px;
+      border: 1px solid #374151; color: #9ca3af; font-size: 20px;
       display: flex; align-items: center; justify-content: center;
       cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    /* 追従ON＝青塗り（カーナビ式で現在地に追従中） / OFF＝上のグレー */
+    .locate-btn.following {
+      background: #2563EB; border-color: #2563EB; color: #fff;
     }
     .offline-badge {
       position: fixed; top: 60px; left: 50%; transform: translateX(-50%);
@@ -704,7 +767,7 @@
   </div>
   <div id="map"></div>
   <div class="offline-badge" id="offlineBadge">📡 オフライン</div>
-  <button class="locate-btn" onclick="locateMe()" title="現在地">📍</button>
+  <button class="locate-btn following" onclick="locateMe()" title="現在地">📍</button>
 </div>
 
 <div id="pinModal" onclick="if(event.target===this)closeModal()">
