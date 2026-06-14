@@ -37,11 +37,37 @@
     let map = null;
     let currentUser = null;
     let markers = [];
+    let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（loadMyPinsで消さない）
     let pendingLatLng = null;
     let pendingChiban = "";
     let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue") || "[]");
     let editingPinId = null;
     let editingPinData = null;
+
+    // ===== DEBUG PANEL（?debug=1 の時だけ）===== ※原因特定後にこのブロックとdbg()呼び出しを丸ごと削除する
+    // 通常URL（現場のバイトが使う本番）では DEBUG=false → パネル要素を一切生成しない＝既存挙動と完全に同一。
+    // 判定: ?debug=1 のときだけ true。dbg() はコンソールにも出すが、画面パネルが主。
+    const DEBUG = new URLSearchParams(location.search).get("debug") === "1";
+    let _dbgPanel = null;
+    const _dbgLines = [];
+    function dbg(msg) {
+      try { console.log("[dbg]", msg); } catch (_) {}
+      if (!DEBUG) return; // 本番は何も描画しない
+      if (!_dbgPanel) {
+        _dbgPanel = document.createElement("div");
+        _dbgPanel.id = "debugPanel";
+        _dbgPanel.style.cssText =
+          "position:fixed;left:8px;right:8px;bottom:8px;z-index:99999;"
+          + "max-height:42vh;overflow:hidden;background:rgba(0,0,0,.72);color:#fff;"
+          + "font:11px/1.5 monospace;padding:8px 10px;border-radius:8px;"
+          + "white-space:pre-wrap;word-break:break-all;pointer-events:none;"; // 操作の邪魔をしない
+        document.body.appendChild(_dbgPanel);
+      }
+      const t = new Date().toTimeString().slice(0, 8);
+      _dbgLines.push(t + "  " + msg);
+      if (_dbgLines.length > 16) _dbgLines.shift();
+      _dbgPanel.textContent = _dbgLines.join("\n");
+    }
 
     // 全12種。グループ（建物系→土地系→NG系）順。色は確定値。
     // color は地図ピンの色分けに使用（削除しない）。emoji はモーダルのボタン表示用。
@@ -217,12 +243,14 @@
             if (isMobile && navigator.geolocation) {
               navigator.geolocation.getCurrentPosition(
                 pos => {
+                  dbg('init GPS 到達 lat=' + pos.coords.latitude + ' lng=' + pos.coords.longitude + ' acc=' + pos.coords.accuracy);
                   // 推定が粗い(>1000m)場合は飛ばさず仮中心を維持
-                  if (pos.coords.accuracy > 1000) return;
+                  if (pos.coords.accuracy > 1000) { dbg('init skip acc=' + pos.coords.accuracy + ' (>1000)'); return; }
                   map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
                   map.setZoom(16);
+                  showMyLocation(pos.coords.latitude, pos.coords.longitude);
                 },
-                () => { /* 取得失敗時は仮の中心(名古屋駅)を維持 */ },
+                () => { dbg('init GPS 取得失敗（仮中心維持）'); /* 取得失敗時は仮の中心(名古屋駅)を維持 */ },
                 { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
               );
             }
@@ -523,13 +551,53 @@
       setTimeout(() => { t.style.opacity = "0"; }, 2800);
     }
 
+    // ===== 現在地（青ドット）=====
+    // 物件ピン(renderMarker)は ZDC.Marker のティアドロップ型＋頭文字＋#001ラベル。
+    // 現在地は同じ ZDC.UserWidget API（seqLabelと同じ作法）で、形の違う「青い丸ドット
+    // ＋白縁＋パルス」を出して明確に区別する。更新は removeWidget→addWidget（既存と同じ作法）。
+    // markers配列には入れない＝loadMyPins()の消去ループで消えず、現在地は出しっぱなし。
+    function showMyLocation(lat, lng) {
+      dbg('showMyLocation 到達 lat=' + lat + ' lng=' + lng + ' map?=' + !!map);
+      if (!map) return;
+      try {
+        if (myLocationMarker) { map.removeWidget(myLocationMarker); myLocationMarker = null; }
+        // 正常表示できている seqLabel と「完全に同じ作法」に揃える：
+        //   横中央寄せは transform:translateX(-50%)、縦位置は offset で調整（seqLabelは Point(0,-58)）。
+        //   ここは18pxドットを点に重ねたいので offset Y=-9（高さ半分ぶん上げて中心を点に合わせる）。
+        // パルスは単一要素の box-shadow アニメ（実寸0崩れ・widget内クリップ回避）。
+        myLocationMarker = new ZDC.UserWidget(
+          new ZDC.LatLng(lat, lng),
+          {
+            htmlSource:
+              '<div style="transform:translateX(-50%);'
+              + 'width:18px;height:18px;border-radius:50%;'
+              + 'background:#2563EB;border:2px solid #fff;'
+              + 'box-shadow:0 0 0 0 rgba(37,99,235,.5);'
+              + 'animation:locPulse 1.6s ease-out infinite;'
+              + 'pointer-events:none;"></div>',
+            offset: new ZDC.Point(0, -9),
+            propagation: true,
+          }
+        );
+        map.addWidget(myLocationMarker);
+        dbg('widget OK（addWidget成功） lat=' + lat + ' lng=' + lng);
+      } catch (e) {
+        dbg('EXCEPTION: ' + ((e && (e.message || e.toString())) || 'unknown') + ((e && e.stack) ? '\n' + e.stack : ''));
+      }
+    }
+
     // ===== LOCATE =====
     window.locateMe = () => {
       if (!navigator.geolocation || !map) return;
-      navigator.geolocation.getCurrentPosition(pos => {
-        map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
-        map.setZoom(17);
-      });
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          dbg('btn GPS 到達 lat=' + pos.coords.latitude + ' lng=' + pos.coords.longitude + ' acc=' + pos.coords.accuracy);
+          map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
+          map.setZoom(17);
+          showMyLocation(pos.coords.latitude, pos.coords.longitude);
+        },
+        err => { dbg('btn GPS 取得失敗: ' + (err && err.message)); }
+      );
     };
 
     // ===== ENTER KEY LOGIN =====
@@ -543,6 +611,14 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Noto Sans JP', sans-serif; background: #0f1117; color: #f0f0f0; height: 100dvh; overflow: hidden; }
+
+    /* 現在地（青ドット）のパルス。単一要素の box-shadow で広がる輪を表現
+       （transform は中心合わせで固定使用するためアニメは box-shadow のみ触る） */
+    @keyframes locPulse {
+      0%   { box-shadow: 0 0 0 0 rgba(37,99,235,.5); }
+      70%  { box-shadow: 0 0 0 16px rgba(37,99,235,0); }
+      100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); }
+    }
 
     #loginScreen {
       display: flex; flex-direction: column; align-items: center; justify-content: center;
