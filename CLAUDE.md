@@ -84,3 +84,22 @@ Writes fall back to a `localStorage` queue (`offlineQueue`) when `navigator.onLi
 No commands to build or run. Open the `.html` files directly in a browser, or serve the folder statically (e.g. `python -m http.server`) — a server is preferable so ZENRIN referer-auth and Firebase auth behave. Geolocation and the camera/StreetView links need HTTPS or `localhost`.
 
 Deployment is via the GitHub repo `inuishingo/akiya-map` (static hosting). Commits to `main` are the unit of change; there is no CI.
+
+## 【未実装・要件メモ】グリッド アーカイブ機能
+
+目的：1年サイクルの再調査時に、過去の調査済みグリッドをエリア単位/日付単位で一斉に「現役表示から外す」。ただし調査履歴はデータとして残す（復元可能）。
+
+設計方針：
+- survey_grids に status フィールド追加：active（表示）/ archived（非表示・記録保持）
+- 「解除」は削除ではなく active→archived への変更
+- 地図の青塗りは status=active のマスのみ
+
+機能：
+A. 範囲アーカイブ（管理画面）：範囲選択モード→矩形ドラッグ→中のactiveマスを選択→「N件をアーカイブしますか？」確認ダイアログ（件数表示）→OKで一括archived化
+B. 日付アーカイブ（管理画面）：「指定日以前に調査したマスをアーカイブ」→該当件数表示→確認→一括archived化
+C. 復元（保険）：アーカイブ済みを見る履歴表示モード→個別/範囲で archived→active に戻せる
+
+注意：
+- 一括操作は必ず件数表示＋確認ダイアログ（誤操作防止）
+- status未設定の既存マスはactive扱いで後方互換（フィールド無し＝active と解釈。これをやらないと既存の塗りが全部消えて見える事故になる）
+- 別ブランチ（feature/grid-archive）で実装、グリッド本体の本番安定を確認後に着手
