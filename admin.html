@@ -496,10 +496,10 @@
       // 先頭に No 列（#001形式）。列順: No/発見日/担当者/所在地/住居表記/地番/レ/ステータス/メモ/緯度/経度/拠点
       const header = ["No","発見日","担当者","所在地","住居表記","地番","レ","ステータス","メモ","緯度","経度","拠点"];
       const aoa = [header];
-      pins.forEach((p, i) => {
+      pins.forEach((p) => {
         const [town, banchi] = splitAddress(p.address);
         aoa.push([
-          "#" + String(i + 1).padStart(3, "0"),   // No: 連番を #001 形式で
+          fmtSeq(p.seqNo),   // No: 地図ピン・カードと同じ固定連番(seqNo)を fmtSeq で #000 形式に。出力ループでの再採番はしない
           p.createdAt?.slice(0,10) || "",
           staffName(p.email),
           town,
@@ -514,9 +514,9 @@
         ]);
       });
       const ws = XLSX.utils.aoa_to_sheet(aoa);
-      // 住居表記(列E=4)・地番(列F=5)は "71-1" 等をExcelが日付化しないよう文字列型(t:'s')で固定。
-      // xlsxはセル型を保持するので、CSV時代の ="..." 式ハックは不要。
-      const STR_COLS = [4, 5];
+      // No(列A=0)・住居表記(列E=4)・地番(列F=5)は "71-1"/"#313" 等をExcelが日付/数値化しないよう
+      // 文字列型(t:'s')で固定。xlsxはセル型を保持するので、CSV時代の ="..." 式ハックは不要。
+      const STR_COLS = [0, 4, 5];
       for (let r = 1; r < aoa.length; r++) {
         STR_COLS.forEach(c => {
           const cell = ws[XLSX.utils.encode_cell({ r, c })];
