@@ -41,6 +41,11 @@
     let checkedIds = new Set();
     let selectedPinId = null;
 
+    // ===== 調査グリッド(MVP) 状態 — 管理画面は表示専用（俯瞰のみ・タップ編集なし） =====
+    let gridMode = false;       // グリッド進捗オーバーレイの表示ON/OFF（初期OFF）
+    let gridWidgets = [];       // グリッド線＋塗りのZDCウィジェット（markersとは別管理）
+    let surveyedCells = {};     // gridId -> Firestoreミラー（調査済みマス）
+
     // 全12種。index.html と同一のキー・ラベル・色で統一。
     const STATUS = {
       // 建物系
@@ -147,6 +152,7 @@
         // 表示名マップを先に構築してから購読開始（一覧の担当者を表示名で出すため）
         await buildStaffNames();
         listenPins();
+        listenSurveyGrids();   // 調査グリッドの進捗をリアルタイム購読（表示はトグルON時のみ）
       } else {
         document.getElementById("loginScreen").style.display = "flex";
         document.getElementById("adminScreen").style.display = "none";
@@ -167,6 +173,83 @@
     };
     window.doLogout = () => signOut(auth);
 
+    // ===== 調査グリッド(survey grid) MVP — 表示専用 =====
+    // index.html と同一定義（原点/サイズ/版）。管理画面は俯瞰のみでマスのタップ編集はしない。
+    const GRID = { lat0: 35.00, lng0: 136.80, refLat: 35.2, sizeM: 250, version: "v1-250m" };
+    const GRID_DLAT = GRID.sizeM / 111000;
+    const GRID_DLNG = GRID.sizeM / (111000 * Math.cos(GRID.refLat * Math.PI / 180));
+
+    function gridCellCorners(row, col) {
+      const s = GRID.lat0 + row * GRID_DLAT, n = GRID.lat0 + (row + 1) * GRID_DLAT;
+      const w = GRID.lng0 + col * GRID_DLNG, e = GRID.lng0 + (col + 1) * GRID_DLNG;
+      return [ new ZDC.LatLng(s, w), new ZDC.LatLng(n, w), new ZDC.LatLng(n, e), new ZDC.LatLng(s, e) ];
+    }
+
+    // 調査済みマスをリアルタイム購読（現場の記録が即・管理画面に反映）。
+    function listenSurveyGrids() {
+      onSnapshot(collection(db, "survey_grids"), snap => {
+        surveyedCells = {};
+        snap.forEach(d => { surveyedCells[d.id] = d.data(); });
+        if (gridMode) redrawGrid();
+      });
+    }
+
+    function clearGridWidgets() {
+      gridWidgets.forEach(w => { try { map.removeWidget(w); } catch (e) {} });
+      gridWidgets = [];
+    }
+
+    // 可視範囲のグリッド線＋（調査済み）塗りを描画。地図移動(idle)ごとに呼ぶ。表示専用。
+    function redrawGrid() {
+      if (!map) return;
+      clearGridWidgets();
+      if (!gridMode) return;
+      const b = map.getLatLngBounds();
+      const sw = b.getSouthWest(), ne = b.getNorthEast();
+      const rMin = Math.floor((sw.lat - GRID.lat0) / GRID_DLAT);
+      const rMax = Math.floor((ne.lat - GRID.lat0) / GRID_DLAT);
+      const cMin = Math.floor((sw.lng - GRID.lng0) / GRID_DLNG);
+      const cMax = Math.floor((ne.lng - GRID.lng0) / GRID_DLNG);
+      if ((rMax - rMin) <= 60 && (cMax - cMin) <= 60) {
+        for (let r = rMin; r <= rMax + 1; r++) {
+          const lat = GRID.lat0 + r * GRID_DLAT;
+          const ln = new ZDC.Polyline(
+            [ new ZDC.LatLng(lat, GRID.lng0 + cMin * GRID_DLNG), new ZDC.LatLng(lat, GRID.lng0 + (cMax + 1) * GRID_DLNG) ],
+            { color: "#1D4ED8", width: 1, opacity: 0.25 }
+          );
+          map.addWidget(ln); gridWidgets.push(ln);
+        }
+        for (let c = cMin; c <= cMax + 1; c++) {
+          const lng = GRID.lng0 + c * GRID_DLNG;
+          const ln = new ZDC.Polyline(
+            [ new ZDC.LatLng(GRID.lat0 + rMin * GRID_DLAT, lng), new ZDC.LatLng(GRID.lat0 + (rMax + 1) * GRID_DLAT, lng) ],
+            { color: "#1D4ED8", width: 1, opacity: 0.25 }
+          );
+          map.addWidget(ln); gridWidgets.push(ln);
+        }
+      }
+      Object.values(surveyedCells).forEach(cell => {
+        if (cell.row == null || cell.col == null) return;
+        if (cell.row < rMin - 1 || cell.row > rMax + 1 || cell.col < cMin - 1 || cell.col > cMax + 1) return;
+        const poly = new ZDC.Polygon(
+          gridCellCorners(cell.row, cell.col),
+          { fill: "#3B82F6", fillOpacity: 0.30, stroke: "#1D4ED8", strokeWidth: 1 }
+        );
+        map.addWidget(poly); gridWidgets.push(poly);   // 表示専用：clickは付けない
+      });
+    }
+
+    // グリッド進捗オーバーレイの表示ON/OFF。ボタン色で状態を明示。
+    window.toggleGridMode = () => {
+      gridMode = !gridMode;
+      const btn = document.getElementById("gridBtn");
+      if (btn) {
+        btn.classList.toggle("active", gridMode);
+        btn.textContent = gridMode ? "▦ グリッドON" : "▦ グリッド";
+      }
+      redrawGrid();
+    };
+
     // ===== MAP =====
     function initMap() {
       if (map) return;
@@ -185,6 +268,8 @@
           function() {
             map.addControl(new ZDC.ZoomButton('top-left'));
             map.addControl(new ZDC.ScaleBar('bottom-left'));
+            // 地図移動・ズーム完了(idle)でグリッドを可視範囲だけ再描画（gridMode中のみ）。
+            map.addEventListener("idle", function() { if (gridMode) redrawGrid(); });
             renderMapMarkers();
           },
           function() { console.error("地図初期化失敗"); }
@@ -599,6 +684,12 @@
       padding: 7px 16px; border-radius: 6px; background: #10b981; color: #fff;
       font-size: 13px; font-weight: 700; border: none; cursor: pointer;
     }
+    /* 調査グリッド進捗の表示トグル。OFF=グレー枠 / ON=青塗りで状態を明示 */
+    .grid-btn {
+      padding: 7px 14px; border-radius: 6px; background: transparent;
+      border: 1px solid #334155; color: #94a3b8; font-size: 13px; font-weight: 700; cursor: pointer;
+    }
+    .grid-btn.active { background: #2563eb; border-color: #2563eb; color: #fff; }
     .logout-btn {
       padding: 7px 14px; border-radius: 6px; background: transparent;
       border: 1px solid #334155; color: #94a3b8; font-size: 13px; cursor: pointer;
@@ -759,6 +850,7 @@
     <select id="staffFilter" onchange="setStaffFilter(this.value)">
       <option value="all">担当者：すべて</option>
     </select>
+    <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
     <button class="csv-btn" onclick="exportExcel()">📥 Excel出力</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
   </div>

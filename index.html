@@ -17,7 +17,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, deleteDoc, doc, deleteField, serverTimestamp, runTransaction }
+    import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, deleteDoc, doc, setDoc, deleteField, serverTimestamp, runTransaction }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -45,6 +45,13 @@
     let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue") || "[]");
     let editingPinId = null;
     let editingPinData = null;
+
+    // ===== 調査グリッド(MVP) 状態 =====
+    // 既存のピン機能には非干渉。初期OFFで、ONの間だけマスタップを有効化する。
+    let gridMode = false;             // 調査グリッド記録モード（初期OFF＝従来のピン追加のまま）
+    let gridWidgets = [];             // グリッド線＋塗りのZDCウィジェット（markersとは別管理）
+    let surveyedCells = {};           // gridId -> Firestoreミラー（調査済みマス）
+    const gridToggleLock = new Set(); // 同一マスの二重トグル防止（map/polygon両クリック対策）
 
     // 全12種。グループ（建物系→土地系→NG系）順。色は確定値。
     // color は地図ピンの色分けに使用（削除しない）。emoji はモーダルのボタン表示用。
@@ -188,6 +195,132 @@
       await signOut(auth);
     };
 
+    // ===== 調査グリッド(survey grid) MVP =====
+    // 既存のピン機能とは非干渉。gridMode(初期OFF)中のみ map クリックでマスをトグルする。
+    // 250m固定グリッド。原点(南西)から機械的に敷く。経度は固定の基準緯度cosで換算。
+    // 将来ZENRINのページ図郭へ差し替える前提で、原点/サイズは gridVersion で版管理する。
+    const GRID = { lat0: 35.00, lng0: 136.80, refLat: 35.2, sizeM: 250, version: "v1-250m" };
+    const GRID_DLAT = GRID.sizeM / 111000;                                           // 緯度1マス(°)
+    const GRID_DLNG = GRID.sizeM / (111000 * Math.cos(GRID.refLat * Math.PI / 180)); // 経度1マス(°)
+
+    function gridCellOf(lat, lng) {
+      const row = Math.floor((lat - GRID.lat0) / GRID_DLAT);
+      const col = Math.floor((lng - GRID.lng0) / GRID_DLNG);
+      return { row, col, id: "G_" + row + "_" + col };
+    }
+    function gridCellCorners(row, col) {
+      const s = GRID.lat0 + row * GRID_DLAT, n = GRID.lat0 + (row + 1) * GRID_DLAT;
+      const w = GRID.lng0 + col * GRID_DLNG, e = GRID.lng0 + (col + 1) * GRID_DLNG;
+      return [ new ZDC.LatLng(s, w), new ZDC.LatLng(n, w), new ZDC.LatLng(n, e), new ZDC.LatLng(s, e) ];
+    }
+    function gridCellCenter(row, col) {
+      return { lat: GRID.lat0 + (row + 0.5) * GRID_DLAT, lng: GRID.lng0 + (col + 0.5) * GRID_DLNG };
+    }
+
+    // 調査済みマスを全件読み込み（リロード復元＆他調査員の済みマス共有）。
+    async function loadSurveyGrids() {
+      try {
+        const snap = await getDocs(collection(db, "survey_grids"));
+        surveyedCells = {};
+        snap.forEach(d => { surveyedCells[d.id] = d.data(); });
+        if (gridMode) redrawGrid();
+      } catch (e) { /* オフライン等は無視（再オンライン/再ログインで再取得） */ }
+    }
+
+    function clearGridWidgets() {
+      gridWidgets.forEach(w => { try { map.removeWidget(w); } catch (e) {} });
+      gridWidgets = [];
+    }
+
+    // 可視範囲のグリッド線＋（調査済み）塗りを描画。地図移動(idle)ごとに呼ぶ。
+    function redrawGrid() {
+      if (!map) return;
+      clearGridWidgets();
+      if (!gridMode) return;
+      const b = map.getLatLngBounds();
+      const sw = b.getSouthWest(), ne = b.getNorthEast();
+      const rMin = Math.floor((sw.lat - GRID.lat0) / GRID_DLAT);
+      const rMax = Math.floor((ne.lat - GRID.lat0) / GRID_DLAT);
+      const cMin = Math.floor((sw.lng - GRID.lng0) / GRID_DLNG);
+      const cMax = Math.floor((ne.lng - GRID.lng0) / GRID_DLNG);
+      // 罫線は枠が多すぎる(ズームアウトしすぎ)場合は描かない＝現場端末の負荷保護。
+      // 塗りは調査済みマスのみ(少数)なので常時描く。
+      if ((rMax - rMin) <= 60 && (cMax - cMin) <= 60) {
+        for (let r = rMin; r <= rMax + 1; r++) {
+          const lat = GRID.lat0 + r * GRID_DLAT;
+          const ln = new ZDC.Polyline(
+            [ new ZDC.LatLng(lat, GRID.lng0 + cMin * GRID_DLNG), new ZDC.LatLng(lat, GRID.lng0 + (cMax + 1) * GRID_DLNG) ],
+            { color: "#1D4ED8", width: 1, opacity: 0.25 }
+          );
+          map.addWidget(ln); gridWidgets.push(ln);
+        }
+        for (let c = cMin; c <= cMax + 1; c++) {
+          const lng = GRID.lng0 + c * GRID_DLNG;
+          const ln = new ZDC.Polyline(
+            [ new ZDC.LatLng(GRID.lat0 + rMin * GRID_DLAT, lng), new ZDC.LatLng(GRID.lat0 + (rMax + 1) * GRID_DLAT, lng) ],
+            { color: "#1D4ED8", width: 1, opacity: 0.25 }
+          );
+          map.addWidget(ln); gridWidgets.push(ln);
+        }
+      }
+      Object.values(surveyedCells).forEach(cell => {
+        if (cell.row == null || cell.col == null) return;
+        if (cell.row < rMin - 1 || cell.row > rMax + 1 || cell.col < cMin - 1 || cell.col > cMax + 1) return;
+        const poly = new ZDC.Polygon(
+          gridCellCorners(cell.row, cell.col),
+          { fill: "#3B82F6", fillOpacity: 0.30, stroke: "#1D4ED8", strokeWidth: 1 }
+        );
+        // 塗り済みマスのタップでも解除できるよう、polygon自身にもclickを付ける（mapクリックと二重発火はlockで吸収）。
+        poly.addEventListener("click", () => {
+          const c = gridCellCenter(cell.row, cell.col);
+          toggleGridCell(c.lat, c.lng);
+        });
+        map.addWidget(poly); gridWidgets.push(poly);
+      });
+    }
+
+    // マスを調査済み/解除でトグル。doc ID = gridId で set/delete（重複しない）。
+    async function toggleGridCell(lat, lng) {
+      if (!currentUser) return;
+      const cell = gridCellOf(lat, lng);
+      if (gridToggleLock.has(cell.id)) return;        // 同一タップの二重処理防止
+      gridToggleLock.add(cell.id);
+      setTimeout(() => gridToggleLock.delete(cell.id), 350);
+      const ref = doc(db, "survey_grids", cell.id);
+      if (surveyedCells[cell.id]) {
+        const prev = surveyedCells[cell.id];          // 楽観更新→失敗時に戻す
+        delete surveyedCells[cell.id];
+        redrawGrid();
+        try { await deleteDoc(ref); showToast("調査済みを解除：" + cell.id); }
+        catch (e) { surveyedCells[cell.id] = prev; redrawGrid(); showToast("解除の保存に失敗しました", "error"); }
+      } else {
+        const data = {
+          gridId: cell.id, row: cell.row, col: cell.col,
+          surveyedDate: new Date().toISOString().slice(0, 10), // 調査日
+          surveyedBy: currentUser.email || "",                  // 調査担当者
+          recordedAt: new Date().toISOString(),                 // 記録日時
+          branch: "名古屋",
+          gridVersion: GRID.version,
+        };
+        surveyedCells[cell.id] = data;
+        redrawGrid();
+        try { await setDoc(ref, data); showToast("調査済みに記録：" + cell.id); }
+        catch (e) { delete surveyedCells[cell.id]; redrawGrid(); showToast("記録の保存に失敗しました", "error"); }
+      }
+    }
+
+    // 記録モードのON/OFF。ボタン色＋上部バナーで状態を明示（ONのままピン追加できない事故を防ぐ）。
+    window.toggleGridMode = () => {
+      gridMode = !gridMode;
+      const btn = document.getElementById("gridBtn");
+      const banner = document.getElementById("gridBanner");
+      if (btn) btn.classList.toggle("active", gridMode);
+      if (banner) banner.style.display = gridMode ? "block" : "none";
+      redrawGrid();
+      showToast(gridMode ? "調査グリッド：ON（マスをタップで記録）" : "調査グリッド：OFF（通常のピン追加に戻りました）",
+                gridMode ? "warn" : "ok");
+    };
+
     // ===== MAP INIT =====
     function initMap() {
       if (map) return;
@@ -233,16 +366,21 @@
               startLocationWatch();
             }
 
-            // クリックでピン追加
+            // クリック：グリッド記録モードON時はマスをトグル、OFF時は従来どおりピン追加。
             map.addEventListener("click", function(e) {
+              if (gridMode) { toggleGridCell(e.latlng.lat, e.latlng.lng); return; }
               pendingLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
               openPinModal();
             });
+
+            // 地図移動・ズーム完了(idle)でグリッドを可視範囲だけ再描画（gridMode中のみ）。
+            map.addEventListener("idle", function() { if (gridMode) redrawGrid(); });
 
             // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
             attachManualPanDetection();
 
             loadMyPins();
+            loadSurveyGrids();   // 調査済みマスを先読み（gridMode ON時に即描画できるように）
           },
           function() {
             showToast("地図の初期化に失敗しました", "error");
@@ -690,6 +828,23 @@
       background: #f97316; color: #fff; font-size: 12px; font-weight: 700;
       padding: 4px 14px; border-radius: 20px; z-index: 200; display: none;
     }
+    /* 調査グリッド：記録モードのトグルボタン（📍の上に重ねて配置） */
+    .grid-btn {
+      position: fixed; bottom: 84px; right: 16px; z-index: 100;
+      width: 48px; height: 48px; border-radius: 50%; background: #1f2937;
+      border: 1px solid #374151; color: #9ca3af; font-size: 22px;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    /* 記録ON＝緑塗りで明確化（ONのまま気づかずピン追加できない事故を防ぐ） */
+    .grid-btn.active { background: #059669; border-color: #059669; color: #fff; }
+    /* 記録ON中の上部バナー（オフラインバッジと重ならないよう下にずらす） */
+    .grid-banner {
+      display: none; position: fixed; top: 96px; left: 50%; transform: translateX(-50%);
+      background: #059669; color: #fff; font-size: 12px; font-weight: 700;
+      padding: 6px 14px; border-radius: 20px; z-index: 200; max-width: 92%;
+      text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
 
     #pinModal {
       display: none; position: fixed; inset: 0; z-index: 300;
@@ -767,6 +922,8 @@
   </div>
   <div id="map"></div>
   <div class="offline-badge" id="offlineBadge">📡 オフライン</div>
+  <div class="grid-banner" id="gridBanner">🗺️ 調査グリッド記録モード：マスをタップで調査済み/解除（ピン追加は一時停止中）</div>
+  <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド記録モード">▦</button>
   <button class="locate-btn following" onclick="locateMe()" title="現在地">📍</button>
 </div>
 

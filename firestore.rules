@@ -35,5 +35,19 @@ service cloud.firestore {
       allow read: if isSignedIn();
       allow write: if false;
     }
+
+    // ───────────────────────────────────────────────────────────────
+    // 【案・未適用】調査グリッド進捗（feature/grid）。doc ID = gridId（例: "G_75_29"）。
+    //   下のブロックは“提案”であり、まだ有効化していない（コメントアウト＝既定で deny のまま）。
+    //   本番反映のタイミングはオーナー(乾)判断。デプロイ時にこのコメントを外して適用すること。
+    //   surveyedBy を自分のメールに限定してなりすまし作成を防止。読み取り/更新/削除はログイン必須。
+    // match /survey_grids/{gridId} {
+    //   allow read:   if isSignedIn();
+    //   allow create: if isSignedIn()
+    //                 && request.resource.data.surveyedBy == request.auth.token.email;
+    //   allow update: if isSignedIn();
+    //   allow delete: if isSignedIn();
+    // }
+    // ───────────────────────────────────────────────────────────────
   }
 }
