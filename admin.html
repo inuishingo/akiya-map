@@ -9,6 +9,9 @@
 
   <script src="https://test-js.zmaps-api.com/zma_loader.js?key=2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW&auth=referer"></script>
 
+  <!-- SheetJS (xlsx): Excel出力に使用。グローバル XLSX を定義する -->
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
@@ -303,7 +306,7 @@
         const date = p.createdAt ? p.createdAt.slice(0, 10) : "–";
         const isChecked = checkedIds.has(p.id);
         const isSelected = selectedPinId === p.id;
-        // CSV出力済み（exportedAt あり）はグレーアウト＋出力済行で未出力と区別。
+        // Excel出力済み（exportedAt あり）はグレーアウト＋出力済行で未出力と区別。
         // 「拾った情報(発見日/担当者)」と「出力した情報」を分けるためカード末尾に独立行で出す。
         const exported = !!p.exportedAt;
         const exportedByName = p.exportedBy ? staffName(p.exportedBy) : "";
@@ -335,7 +338,7 @@
               ${statusOptionsHTML(p.status)}
             </select>
           </div>
-          ${exported ? `<div class="export-line">✓ CSV出力済 ${exportedMD}${exportedByName ? ` ・ ${exportedByName}` : ""}</div>` : ""}
+          ${exported ? `<div class="export-line">✓ Excel出力済 ${exportedMD}${exportedByName ? ` ・ ${exportedByName}` : ""}</div>` : ""}
         </div>`;
       }).join("");
     }
@@ -471,7 +474,7 @@
       } catch(e) { showToast("更新に失敗しました", "error"); }
     };
 
-    // ===== CSV EXPORT =====
+    // ===== EXCEL EXPORT (SheetJS) =====
     // 住居表示を「町名まで」と「番地のみ」に分割する。
     // 例: 愛知県名古屋市中村区亀島2丁目25-4 → ["愛知県名古屋市中村区亀島2丁目", "25-4"]
     function splitAddress(addr) {
@@ -485,44 +488,57 @@
       if (m2) return [m2[1].trim(), m2[2].trim()];
       return [a, ""];
     }
-    window.exportCSV = async () => {
+    window.exportExcel = async () => {
       // 選択中（チェック済み）のピンのみ出力
       const pins = allPins.filter(p => checkedIds.has(p.id));
       if (pins.length === 0) { showToast("選択中のピンがありません", "error"); return; }
-      const header = ["発見日","担当者","所在地","住居表記","地番","レ","ステータス","メモ","緯度","経度","拠点"];
-      const rows = pins.map(p => {
+      if (typeof XLSX === "undefined") { showToast("Excelライブラリの読込に失敗しました", "error"); return; }
+      // 先頭に No 列（#001形式）。列順: No/発見日/担当者/所在地/住居表記/地番/レ/ステータス/メモ/緯度/経度/拠点
+      const header = ["No","発見日","担当者","所在地","住居表記","地番","レ","ステータス","メモ","緯度","経度","拠点"];
+      const aoa = [header];
+      pins.forEach((p, i) => {
         const [town, banchi] = splitAddress(p.address);
-        return [
-        p.createdAt?.slice(0,10) || "",
-        staffName(p.email),
-        town,
-        // 番地・地番(例 71-1 / 12)はExcelが日付(Jan-71等)に誤変換するため、="..." のExcel式形式で
-        // 文字列強制。一律クォートを通すと "=""71-1""" となり、Excelが復号→式→文字列で表示する。
-        banchi ? `="${banchi}"` : "",
-        p.chiban ? `="${p.chiban}"` : "",
-        "",
-        STATUS[p.status]?.label || p.status,
-        p.memo || "",
-        p.lat || "",
-        p.lng || "",
-        p.branch || "",
-      ].map(v => `"${String(v).replace(/"/g,'""')}"`); });
-      const csv = [header, ...rows].map(r => r.join(",")).join("\n");
-      const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `空家マップ_${new Date().toISOString().slice(0,10)}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
+        aoa.push([
+          "#" + String(i + 1).padStart(3, "0"),   // No: 連番を #001 形式で
+          p.createdAt?.slice(0,10) || "",
+          staffName(p.email),
+          town,
+          banchi || "",        // 住居表記(番地)：型は下で文字列に固定
+          p.chiban || "",      // 地番：型は下で文字列に固定
+          "",
+          STATUS[p.status]?.label || p.status,
+          p.memo || "",
+          p.lat ?? "",
+          p.lng ?? "",
+          p.branch || "",
+        ]);
+      });
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      // 住居表記(列E=4)・地番(列F=5)は "71-1" 等をExcelが日付化しないよう文字列型(t:'s')で固定。
+      // xlsxはセル型を保持するので、CSV時代の ="..." 式ハックは不要。
+      const STR_COLS = [4, 5];
+      for (let r = 1; r < aoa.length; r++) {
+        STR_COLS.forEach(c => {
+          const cell = ws[XLSX.utils.encode_cell({ r, c })];
+          if (cell && cell.v !== "") { cell.t = "s"; cell.v = String(cell.v); delete cell.w; delete cell.z; }
+        });
+      }
+      // 列幅（実務で見やすい既定）
+      ws["!cols"] = [
+        { wch: 6 }, { wch: 12 }, { wch: 10 }, { wch: 28 }, { wch: 12 }, { wch: 12 },
+        { wch: 4 }, { wch: 8 }, { wch: 24 }, { wch: 11 }, { wch: 11 }, { wch: 8 },
+      ];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "空家マップ");
+      XLSX.writeFile(wb, `空家マップ_${new Date().toISOString().slice(0,10)}.xlsx`);
       // 出力対象に exportedAt を記録（一覧で出力済みグレーアウト表示に使う）。
-      // CSVは既にDL済みなので書き込み失敗は握りつぶし、出力自体は止めない。
+      // ファイルは既にDL済みなので書き込み失敗は握りつぶし、出力自体は止めない。
       const exportedAt = new Date().toISOString();
       const exportedBy = auth.currentUser?.email || "";
       await Promise.all(
         pins.map(p => updateDoc(doc(db, "pins", p.id), { exportedAt, exportedBy }).catch(()=>{}))
       );
-      showToast(`CSVを出力しました（${pins.length}件・出力済みに記録）`);
+      showToast(`Excelを出力しました（${pins.length}件・出力済みに記録）`);
     };
 
     // ===== TOAST =====
@@ -649,7 +665,7 @@
     .pin-card.selected { border-color: #3b82f6; box-shadow: 0 0 0 2px #bfdbfe; background: #eff6ff; }
     .pin-card.checked { background: #fef9c3; border-color: #eab308; }
     .pin-card.checked.selected { background: #fef9c3; border-color: #3b82f6; }
-    /* CSV出力済みピン：グレーアウトで未出力と区別 */
+    /* Excel出力済みピン：グレーアウトで未出力と区別 */
     .pin-card.exported { opacity: 0.55; }
     .pin-card.exported.selected,
     .pin-card.exported.checked { opacity: 1; }  /* 選択/チェック時は見やすく戻す */
@@ -743,7 +759,7 @@
     <select id="staffFilter" onchange="setStaffFilter(this.value)">
       <option value="all">担当者：すべて</option>
     </select>
-    <button class="csv-btn" onclick="exportCSV()">📥 CSV出力</button>
+    <button class="csv-btn" onclick="exportExcel()">📥 Excel出力</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
   </div>
 
