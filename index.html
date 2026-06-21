@@ -81,22 +81,29 @@
     const FALLBACK_COLOR = "#9CA3AF";
 
     // ===== 担当者カラー（#001ラベル背景） =====
-    // admin.html と完全に同じロジック：Firestoreの全ピンからメール一覧を作り、
-    // 昇順ソートして先頭から STAFF_PALETTE を割当（7人目以降・未割当はデフォルト色）。
-    // index は自分のピンしか描画しないが、色割当は全担当者基準にするため全ピンを読む。
-    const STAFF_PALETTE = ["#2563EB","#0891B2","#059669","#D97706","#7C3AED","#DB2777"];
+    // admin.html と完全に同じロジック：pins と survey_grids(surveyedBy) のメールを統合し、
+    // 昇順ソートして先頭から STAFF_PALETTE を割当（11人目以降・未割当はデフォルト色）。
+    // index は自分のピンしか描画しないが、色割当は全担当者基準にするため全ピン＋全グリッドを読む。
+    // ※既存6色は順序ごと固定（既存ピン色を変えない）。末尾4色は調査員7〜10人目用に追加。
+    const STAFF_PALETTE = ["#2563EB","#0891B2","#059669","#D97706","#7C3AED","#DB2777","#DC2626","#A21CAF","#B45309","#475569"];
     const STAFF_DEFAULT_COLOR = "#65A30D";
     let staffColorMap = {};
     async function buildStaffColors() {
       try {
-        const snap = await getDocs(collection(db, "pins"));
-        const emails = [...new Set(snap.docs.map(d => d.data().email).filter(Boolean))].sort();
+        const [pinSnap, gridSnap] = await Promise.all([
+          getDocs(collection(db, "pins")),
+          getDocs(collection(db, "survey_grids")),
+        ]);
+        const emails = [...new Set([
+          ...pinSnap.docs.map(d => d.data().email),
+          ...gridSnap.docs.map(d => d.data().surveyedBy),
+        ].filter(Boolean))].sort();
         staffColorMap = {};
         emails.forEach((e, i) => {
           staffColorMap[e] = i < STAFF_PALETTE.length ? STAFF_PALETTE[i] : STAFF_DEFAULT_COLOR;
         });
       } catch (e) {
-        // 全ピン読取がFirestoreルールやオフラインでNGの場合はデフォルト色にフォールバック
+        // 全ピン/グリッド読取がFirestoreルールやオフラインでNGの場合はデフォルト色にフォールバック
       }
     }
     function staffColor(email) {
@@ -266,9 +273,10 @@
       Object.values(surveyedCells).forEach(cell => {
         if (cell.row == null || cell.col == null) return;
         if (cell.row < rMin - 1 || cell.row > rMax + 1 || cell.col < cMin - 1 || cell.col > cMax + 1) return;
+        const fillCol = staffColor(cell.surveyedBy);   // 担当者色（null/未登録はdefaultにフォールバック）
         const poly = new ZDC.Polygon(
           gridCellCorners(cell.row, cell.col),
-          { fill: "#3B82F6", fillOpacity: 0.30, stroke: "#1D4ED8", strokeWidth: 1 }
+          { fill: fillCol, fillOpacity: 0.30, stroke: fillCol, strokeWidth: 1 }
         );
         // 塗り済みマスのタップでも解除できるよう、polygon自身にもclickを付ける（mapクリックと二重発火はlockで吸収）。
         poly.addEventListener("click", () => {
