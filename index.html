@@ -17,7 +17,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, deleteDoc, doc, setDoc, deleteField, serverTimestamp, runTransaction }
+    import { getFirestore, collection, addDoc, query, where, getDocs, onSnapshot, updateDoc, deleteDoc, doc, setDoc, deleteField, serverTimestamp, runTransaction }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -37,7 +37,8 @@
     let map = null;
     let currentUser = null;
     let markers = [];
-    let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（loadMyPinsで消さない）
+    let pinsUnsub = null;   // pins onSnapshot の解除関数（多重購読防止）
+    let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（listenPinsで消さない）
     let followMode = true;       // 追従モード（カーナビ式）。既定ON。手動パンでOFF、📍でON復帰
     let watchId = null;          // watchPosition のID（二重起動防止）
     let pendingLatLng = null;
@@ -171,8 +172,14 @@
         document.getElementById("mapScreen").style.display = "flex";
         document.getElementById("userLabel").textContent = user.email;
         initMap();
+        // 再ログイン時は initMap が早期returnするため、map既存ならここで購読を張り直す
+        // （初回ログインは map 生成後の ready コールバック内で listenPins する）
+        if (map) listenPins();
         syncOfflineQueue();
       } else {
+        // ログアウト：購読解除＋マーカー消去（再ログイン時の多重購読・残像を防ぐ）
+        if (pinsUnsub) { pinsUnsub(); pinsUnsub = null; }
+        if (map) { markers.forEach(m => { try { map.removeWidget(m); } catch(e){} }); markers = []; }
         document.getElementById("loginScreen").style.display = "flex";
         document.getElementById("mapScreen").style.display = "none";
       }
@@ -382,7 +389,7 @@
             // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
             attachManualPanDetection();
 
-            loadMyPins();
+            listenPins();
             loadSurveyGrids();   // 調査済みマスを先読み（gridMode ON時に即描画できるように）
           },
           function() {
@@ -392,21 +399,18 @@
       });
     }
 
-    // ===== LOAD PINS =====
-    async function loadMyPins() {
-      if (!currentUser) return;
-      markers.forEach(m => map.removeWidget(m));
-      markers = [];
-      try {
-        // 担当者カラー・表示名（全担当者基準）を先に構築してからマーカーを描画
+    // ===== LISTEN PINS（全調査員のピンをリアルタイム共有。admin.html と同じ全件購読方式）=====
+    function listenPins() {
+      if (!map) return;
+      if (pinsUnsub) pinsUnsub();   // 多重購読防止：既存リスナーを解除してから張り直す
+      pinsUnsub = onSnapshot(collection(db, "pins"), async snap => {
+        // 担当者カラー・表示名（全担当者基準）を先に構築してからマーカーを再描画
         await buildStaffColors();
         await buildStaffNames();
-        const q = query(collection(db, "pins"), where("uid", "==", currentUser.uid));
-        const snap = await getDocs(q);
-        snap.forEach(d => renderMarker(d.id, d.data()));
-      } catch(e) {
-        // オフライン時は無視
-      }
+        markers.forEach(m => map.removeWidget(m));
+        markers = [];
+        snap.forEach(d => renderMarker(d.id, d.data()));   // docID基準で全件再描画＝重複なし
+      }, e => { /* オフライン/権限エラーは無視（再オンライン・再ログインで復帰） */ });
     }
 
     function renderMarker(id, data) {
@@ -454,7 +458,7 @@
           }
         );
         map.addWidget(seqLabel);
-        // markers 配列に入れておけば loadMyPins() の removeWidget ループで一緒に消える。
+        // markers 配列に入れておけば listenPins() の removeWidget ループで一緒に消える。
         markers.push(seqLabel);
       }
     }
@@ -608,7 +612,6 @@
           await updateDoc(doc(db, "pins", editingPinId), update);
           showToast("更新しました");
           closeModal();
-          loadMyPins();
         } catch(e) {
           showToast("更新に失敗しました", "error");
         }
@@ -658,7 +661,6 @@
         await deleteDoc(doc(db, "pins", editingPinId));
         showToast("削除しました");
         closeModal();
-        loadMyPins();
       } catch(e) {
         showToast("削除に失敗しました", "error");
       }
@@ -677,7 +679,7 @@
     // 物件ピン(renderMarker)は ZDC.Marker のティアドロップ型＋頭文字＋#001ラベル。
     // 現在地は同じ ZDC.UserWidget API（seqLabelと同じ作法）で、形の違う「青い丸ドット
     // ＋白縁＋パルス」を出して明確に区別する。更新は removeWidget→addWidget（既存と同じ作法）。
-    // markers配列には入れない＝loadMyPins()の消去ループで消えず、現在地は出しっぱなし。
+    // markers配列には入れない＝listenPins()の消去ループで消えず、現在地は出しっぱなし。
     function showMyLocation(lat, lng) {
       if (!map) return;
       if (myLocationMarker) { map.removeWidget(myLocationMarker); myLocationMarker = null; }
