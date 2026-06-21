@@ -81,29 +81,24 @@
     const FALLBACK_COLOR = "#9CA3AF";
 
     // ===== 担当者カラー（#001ラベル背景） =====
-    // admin.html と完全に同じロジック：pins と survey_grids(surveyedBy) のメールを統合し、
-    // 昇順ソートして先頭から STAFF_PALETTE を割当（11人目以降・未割当はデフォルト色）。
-    // index は自分のピンしか描画しないが、色割当は全担当者基準にするため全ピン＋全グリッドを読む。
-    // ※既存6色は順序ごと固定（既存ピン色を変えない）。末尾4色は調査員7〜10人目用に追加。
+    // 担当者色は displayNames レジストリの order（0始まりの固定index）で決まる（admin.html と同一方式）。
+    // 並び順・在席に依存しないので各人の色は不変。order を持つ doc だけが色付け対象（＝調査員）。
+    // order 無し/範囲外/未登録（事務員等）は STAFF_DEFAULT_COLOR。既存6色は順序ごと固定・末尾4色は7〜10人目用。
     const STAFF_PALETTE = ["#2563EB","#0891B2","#059669","#D97706","#7C3AED","#DB2777","#DC2626","#A21CAF","#B45309","#475569"];
     const STAFF_DEFAULT_COLOR = "#65A30D";
     let staffColorMap = {};
     async function buildStaffColors() {
+      staffColorMap = {};
       try {
-        const [pinSnap, gridSnap] = await Promise.all([
-          getDocs(collection(db, "pins")),
-          getDocs(collection(db, "survey_grids")),
-        ]);
-        const emails = [...new Set([
-          ...pinSnap.docs.map(d => d.data().email),
-          ...gridSnap.docs.map(d => d.data().surveyedBy),
-        ].filter(Boolean))].sort();
-        staffColorMap = {};
-        emails.forEach((e, i) => {
-          staffColorMap[e] = i < STAFF_PALETTE.length ? STAFF_PALETTE[i] : STAFF_DEFAULT_COLOR;
+        const snap = await getDocs(collection(db, "displayNames"));
+        snap.forEach(d => {
+          const o = d.data().order;   // 0始まりの固定index（number型）。無ければ色対象外
+          if (Number.isInteger(o) && o >= 0 && o < STAFF_PALETTE.length) {
+            staffColorMap[d.id] = STAFF_PALETTE[o];   // d.id = メールアドレス
+          }
         });
       } catch (e) {
-        // 全ピン/グリッド読取がFirestoreルールやオフラインでNGの場合はデフォルト色にフォールバック
+        // displayNames 読取NG時は全員 STAFF_DEFAULT_COLOR にフォールバック
       }
     }
     function staffColor(email) {

@@ -73,21 +73,25 @@
     const FALLBACK_COLOR = "#9CA3AF";
 
     // ===== 担当者カラー（地図ピン） =====
-    // 担当者(メールアドレス)ごとに固定色を割り当てる。最大10色、11人目以降はデフォルト色。
-    // 割当は pins と survey_grids(surveyedBy) を統合したメール昇順で自動付与（人が増減しても順序は安定）。
-    // ※既存6色は順序ごと固定（既存ピン色を変えない）。末尾4色は調査員7〜10人目用に追加。index.html と同一定義。
+    // 担当者色は displayNames レジストリの order（0始まりの固定index）で決まる（index.html と同一方式）。
+    // 並び順・在席に依存しないので各人の色は不変。order を持つ doc だけが色付け対象（＝調査員）。
+    // order 無し/範囲外/未登録（事務員等）は STAFF_DEFAULT_COLOR。STAFF_PALETTE は両ファイル同一定義。
     const STAFF_PALETTE = ["#2563EB","#0891B2","#059669","#D97706","#7C3AED","#DB2777","#DC2626","#A21CAF","#B45309","#475569"];
     const STAFF_DEFAULT_COLOR = "#65A30D";
     let staffColorMap = {};
-    function buildStaffColors() {
-      const emails = [...new Set([
-        ...allPins.map(p => p.email),
-        ...Object.values(surveyedCells).map(c => c.surveyedBy),
-      ].filter(Boolean))].sort();
+    async function buildStaffColors() {
       staffColorMap = {};
-      emails.forEach((e, i) => {
-        staffColorMap[e] = i < STAFF_PALETTE.length ? STAFF_PALETTE[i] : STAFF_DEFAULT_COLOR;
-      });
+      try {
+        const snap = await getDocs(collection(db, "displayNames"));
+        snap.forEach(d => {
+          const o = d.data().order;   // 0始まりの固定index（number型）。無ければ色対象外
+          if (Number.isInteger(o) && o >= 0 && o < STAFF_PALETTE.length) {
+            staffColorMap[d.id] = STAFF_PALETTE[o];   // d.id = メールアドレス
+          }
+        });
+      } catch (e) {
+        // displayNames 読取NG時は全員 STAFF_DEFAULT_COLOR にフォールバック
+      }
     }
     function staffColor(email) {
       return staffColorMap[email] || STAFF_DEFAULT_COLOR;
@@ -153,8 +157,9 @@
         document.getElementById("adminScreen").style.display = "grid";
         document.getElementById("userLabel").textContent = user.email;
         initMap();
-        // 表示名マップを先に構築してから購読開始（一覧の担当者を表示名で出すため）
+        // 表示名・担当者色マップ（どちらも displayNames 由来）を先に構築してから購読開始
         await buildStaffNames();
+        await buildStaffColors();
         listenPins();
         listenSurveyGrids();   // 調査グリッドの進捗をリアルタイム購読（表示はトグルON時のみ）
       } else {
@@ -194,8 +199,6 @@
       onSnapshot(collection(db, "survey_grids"), snap => {
         surveyedCells = {};
         snap.forEach(d => { surveyedCells[d.id] = d.data(); });
-        buildStaffColors();      // グリッドだけ記録した調査員も色マップに反映
-        renderMapMarkers();      // 色割当の変化をピン表示にも反映
         if (gridMode) redrawGrid();
       });
     }
@@ -289,7 +292,6 @@
       const q = query(collection(db, "pins"), orderBy("createdAt", "desc"));
       onSnapshot(q, snap => {
         allPins = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        buildStaffColors();
         updateStats();
         updateStaffFilter();
         updateDateFilter();
