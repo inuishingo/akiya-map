@@ -7,6 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
 
+  <!-- TODO: 本番移行時に本番キー(js-api 本番ドメイン)へ差し替え。現状は検証環境キー(test-js)。 -->
   <script src="https://test-js.zmaps-api.com/zma_loader.js?key=2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW&auth=referer"></script>
 
   <!-- SheetJS (xlsx): Excel出力に使用。グローバル XLSX を定義する -->
@@ -271,6 +272,9 @@
         mapOptions.zoomable = true;
         mapOptions.mouseOperation = true;
         mapOptions.touchOperation = true;
+        // 下地を常時「標準住宅地図デザイン」に（表札＋住居表示。大縮尺=ズームインで視認）。
+        // TODO: 本番キーでは契約発行の住宅地図デザインIDへ差し替え（検証環境は Ai3Y2Jwp）。
+        mapOptions.zipsMapType = 'Ai3Y2Jwp';
 
         map = new ZDC.Map(
           document.getElementById("map"),
@@ -280,12 +284,95 @@
             map.addControl(new ZDC.ScaleBar('bottom-left'));
             // 地図移動・ズーム完了(idle)でグリッドを可視範囲だけ再描画（gridMode中のみ）。
             map.addEventListener("idle", function() { if (gridMode) redrawGrid(); });
+            // 用途地域/地番レイヤ：移動・ズーム後に再描画／用途地域ON時はクリックで属性取得
+            map.addEventListener("idle", function(){ redrawActiveLayers(); });
+            map.addEventListener("click", function(e){ if (youtoOn && e && e.latlng) queryYouto(e.latlng); });
             renderMapMarkers();
           },
           function() { console.error("地図初期化失敗"); }
         );
       });
     }
+
+    // ===== ZENRIN データ重畳（用途地域 / 地番）=====
+    // bluemap_test.html で実証済みロジックの移植。認証は3ヘッダ（x-api-key + Authorization:referer + Referer自動）。
+    // TODO: 本番キーに差し替え（WMS_KEY。現状は検証環境キー test-web と対）。
+    const WMS_KEY        = "2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW";
+    const BLUEMAP_BASE   = "https://test-web.zmaps-api.com/map/wms/bluemap";
+    const YOUTO_BASE     = "https://test-web.zmaps-api.com/map/wms/youto";
+    const BLUEMAP_LAYERS = "lp1,ll1,lc1,lw1";
+    const YOUTO_LAYERS   = "lp1,ll1";
+    // 地番/表札が読める閾値ズーム。引いて見えない時だけここまで寄せる（密集地でも読めるよう20）
+    const ZOOM_READABLE  = 20;
+    let youtoOn = false, chibanOn = false;
+    const layerWidgets = { bluemap:null, youto:null };
+    let layerRedrawing = false, layerRedrawQueued = false;
+
+    function wmsHeaders(){ return { "Content-Type":"application/x-www-form-urlencoded", "x-api-key":WMS_KEY, "Authorization":"referer" }; }
+    function layerBBoxArr(){ const b=map.getLatLngBounds(); const sw=map.latlngToWebMercator(b.getSouthWest()); const ne=map.latlngToWebMercator(b.getNorthEast()); return [sw[0],sw[1],ne[0],ne[1]]; }
+    function removeLayerWidget(slot){ if(layerWidgets[slot]){ try{ map.removeWidget(layerWidgets[slot]); }catch(e){} layerWidgets[slot]=null; } }
+
+    async function drawWmsLayer(slot){
+      const conf = (slot==='youto') ? {base:YOUTO_BASE,layers:YOUTO_LAYERS,name:'用途地域'} : {base:BLUEMAP_BASE,layers:BLUEMAP_LAYERS,name:'地番'};
+      const size=map.getMapSize(); const bbox=layerBBoxArr().join(",");
+      const params={ VERSION:"1.3.0",REQUEST:"GetMap",LAYERS:conf.layers,CRS:"EPSG:3857",BBOX:bbox,WIDTH:size.width,HEIGHT:size.height,FORMAT:"image/png" };
+      try{
+        const res=await fetch(conf.base,{ method:"POST",headers:wmsHeaders(),body:new URLSearchParams(params) });
+        const ct=res.headers.get("content-type")||"";
+        if(res.ok && ct.indexOf("image")!==-1){
+          const blob=await res.blob(); const url=(window.URL||window.webkitURL).createObjectURL(blob);
+          const id=slot+"_wms_"+Date.now();
+          const w=new ZDC.UserWidget(map.getLatLngBounds().getNorthWest(),{ htmlSource:'<img id="'+id+'" src="" style="pointer-events:none">', propagation:true });
+          map.addWidget(w); layerWidgets[slot]=w; document.getElementById(id).src=url;
+        } else {
+          const body=await res.text().catch(()=> ""); showToast(conf.name+"の重畳に失敗（"+res.status+"）","error"); console.error(conf.name+" WMS",res.status,body);
+        }
+      }catch(e){ showToast(conf.name+"の重畳に失敗（通信/CORS）","error"); console.error(conf.name+" WMS exception",e); }
+    }
+
+    // ON中のレイヤを順序固定で再描画（用途地域=下→地番=上）し、グリッド・ピンを最前面へ積み直す。多重発火はコアレス。
+    async function redrawActiveLayers(){
+      if(!map) return;
+      if(layerRedrawing){ layerRedrawQueued=true; return; }
+      layerRedrawing=true;
+      try{
+        removeLayerWidget('youto'); removeLayerWidget('bluemap');
+        if(youtoOn)  await drawWmsLayer('youto');
+        if(chibanOn) await drawWmsLayer('bluemap');
+        if(youtoOn || chibanOn){ if(gridMode) redrawGrid(); renderMapMarkers(); } // 画像の上にグリッド→ピンを戻す
+      } finally {
+        layerRedrawing=false;
+        if(layerRedrawQueued){ layerRedrawQueued=false; redrawActiveLayers(); }
+      }
+    }
+
+    // クリック地点の用途地域属性（GetFeatureInfo）→右上ポップアップ
+    async function queryYouto(latlng){
+      const size=map.getMapSize(); const [minx,miny,maxx,maxy]=layerBBoxArr();
+      const p=map.latlngToWebMercator(latlng);
+      const I=Math.round((p[0]-minx)/(maxx-minx)*size.width);
+      const J=Math.round((maxy-p[1])/(maxy-miny)*size.height);
+      const params={ VERSION:"1.3.0",REQUEST:"GetFeatureInfo",LAYERS:YOUTO_LAYERS,QUERY_LAYERS:"lp1",CRS:"EPSG:3857",BBOX:[minx,miny,maxx,maxy].join(","),WIDTH:size.width,HEIGHT:size.height,FORMAT:"image/png",INFO_FORMAT:"application/json",I:I,J:J };
+      try{
+        const res=await fetch(YOUTO_BASE,{ method:"POST",headers:wmsHeaders(),body:new URLSearchParams(params) });
+        const ct=res.headers.get("content-type")||""; const txt=await res.text();
+        if(res.ok && ct.indexOf("json")!==-1){
+          let obj; try{ obj=JSON.parse(txt); }catch(e){ showToast("用途地域の属性取得に失敗","error"); return; }
+          const f=(obj.features&&obj.features[0]&&obj.features[0].properties)||null;
+          const box=document.getElementById("youtoInfo");
+          if(!f){ box.innerHTML='<span class="yi-close" onclick="closeYoutoInfo()">✕</span>この地点に用途地域データなし（区域外/調整区域の可能性）'; box.style.display="block"; return; }
+          box.innerHTML='<span class="yi-close" onclick="closeYoutoInfo()">✕</span>'
+            + '<b>用途地域</b>：'+(f.map||'-')+'<br>'
+            + '建ぺい率：'+f.kenpei+'% ／ 容積率：'+f.yoseki+'%<br>'
+            + '防火：'+f.bouka+' ／ 高度：'+f.koudo+' ／ 都計区分：'+f.tokei;
+          box.style.display="block";
+        } else { showToast("用途地域の属性取得に失敗（"+res.status+"）","error"); console.error("youto GFI",res.status,txt); }
+      }catch(e){ showToast("用途地域の属性取得に失敗（通信/CORS）","error"); console.error("youto GFI exception",e); }
+    }
+
+    window.closeYoutoInfo = () => { const b=document.getElementById("youtoInfo"); if(b) b.style.display="none"; };
+    window.toggleYouto    = () => { youtoOn=!youtoOn; const btn=document.getElementById("youtoBtn"); if(btn) btn.classList.toggle("active",youtoOn); if(!youtoOn) closeYoutoInfo(); redrawActiveLayers(); };
+    window.toggleChiban   = () => { chibanOn=!chibanOn; const btn=document.getElementById("chibanBtn"); if(btn) btn.classList.toggle("active",chibanOn); redrawActiveLayers(); };
 
     // ===== REALTIME LISTEN =====
     function listenPins() {
@@ -541,8 +628,11 @@
 
       const pin = allPins.find(p => p.id === id);
       if (pin && map) {
+        // 引いてたら閾値まで寄せ、既に寄ってたらズーム維持で中心だけ移動（事務員の作業ズームを壊さない）。
+        const targetZoom = Math.max(map.getZoom(), ZOOM_READABLE);
         map.setCenter(new ZDC.LatLng(pin.lat, pin.lng));
-        map.setZoom(17);
+        if (targetZoom !== map.getZoom()) map.setZoom(targetZoom);
+        // レイヤON中は B-1 で追加の "idle" リスナが移動完了後に redrawActiveLayers() を呼び追従する。
       }
     };
 
@@ -699,6 +789,17 @@
       border: 1px solid #334155; color: #94a3b8; font-size: 13px; font-weight: 700; cursor: pointer;
     }
     .grid-btn.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+    /* データ重畳トグル（用途地域/地番）。グリッドボタンと同系。ON時に色付け */
+    .layer-btn { padding:7px 14px;border-radius:6px;background:transparent;border:1px solid #334155;
+      color:#94a3b8;font-size:13px;font-weight:700;cursor:pointer; }
+    .layer-btn.active { background:#2563eb;border-color:#2563eb;color:#fff; }
+    .layer-btn.youto.active { background:#d97706;border-color:#d97706; } /* 用途地域ON=オレンジで区別 */
+    /* 用途地域 クリック属性ポップアップ（地図右上） */
+    .youto-info { position:absolute;top:10px;right:10px;max-width:300px;z-index:20;
+      background:rgba(15,23,42,.94);color:#e2e8f0;border:1px solid #334155;border-radius:8px;
+      padding:10px 12px;font-size:12px;line-height:1.6;box-shadow:0 4px 14px rgba(0,0,0,.4); }
+    .youto-info .yi-close { float:right;cursor:pointer;color:#94a3b8;font-weight:700;margin-left:8px; }
+    .youto-info b { color:#fbbf24; }
     .logout-btn {
       padding: 7px 14px; border-radius: 6px; background: transparent;
       border: 1px solid #334155; color: #94a3b8; font-size: 13px; cursor: pointer;
@@ -860,6 +961,8 @@
       <option value="all">担当者：すべて</option>
     </select>
     <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
+    <button class="layer-btn youto" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋クリックで属性">用途地域</button>
+    <button class="layer-btn" id="chibanBtn" onclick="toggleChiban()" title="地番（ブルーマップ）重畳">地番</button>
     <button class="csv-btn" onclick="exportExcel()">📥 Excel出力</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
   </div>
@@ -907,6 +1010,7 @@
 
   <div class="right-panel">
     <div id="map"></div>
+    <div id="youtoInfo" class="youto-info" style="display:none"></div>
   </div>
 </div>
 
