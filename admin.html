@@ -412,17 +412,28 @@
 
     window.setStaffFilter = (val) => {
       activeStaffFilter = val;
+      updateDateFilter();   // 担当者連動：日付リスト再生成＋無効日付は「すべて」にリセット
       renderList();
       renderMapMarkers();
     };
 
+    // createdAt(ISO/UTC) を JST(+9h) の YYYY-MM-DD に。表示・フィルタ・Excelで共通利用（UTCずれ防止）。
+    function jstYmd(iso) {
+      const t = Date.parse(iso || "");
+      if (Number.isNaN(t)) return "";
+      return new Date(t + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    }
+
     // ===== DATE FILTER =====
     function updateDateFilter() {
-      const dates = [...new Set(allPins.map(p => p.createdAt?.slice(0,10)).filter(Boolean))].sort().reverse();
+      // 現在の担当者フィルタで絞ったピン集合から、JST日付のユニーク一覧を作る（status/dateは除外＝循環回避）。
+      const base = allPins.filter(p => activeStaffFilter === "all" || p.email === activeStaffFilter);
+      const dates = [...new Set(base.map(p => jstYmd(p.createdAt)).filter(Boolean))].sort().reverse();
+      // 現在選択中の日付が新候補に無ければ「すべて」に戻す（無い日付を選んだままの0件破綻を防止）。
+      if (activeDateFilter !== "all" && !dates.includes(activeDateFilter)) activeDateFilter = "all";
       const sel = document.getElementById("dateFilter");
-      const current = sel.value;
       sel.innerHTML = `<option value="all">日付：すべて</option>` +
-        dates.map(d => `<option value="${d}" ${d===current?"selected":""}>${d}</option>`).join("");
+        dates.map(d => `<option value="${d}" ${d===activeDateFilter?"selected":""}>${d}</option>`).join("");
     }
 
     window.setDateFilter = (val) => {
@@ -444,7 +455,7 @@
       return allPins.filter(p => {
         const statusOk = activeStatusFilter === "all" || p.status === activeStatusFilter;
         const staffOk  = activeStaffFilter  === "all" || p.email === activeStaffFilter;
-        const dateOk   = activeDateFilter   === "all" || p.createdAt?.slice(0,10) === activeDateFilter;
+        const dateOk   = activeDateFilter   === "all" || jstYmd(p.createdAt) === activeDateFilter;
         return statusOk && staffOk && dateOk;
       });
     }
@@ -484,7 +495,7 @@
         // 地番エラー（needsReview or 地番未取得）はバッジを赤にして要確認を示す
         const chibanFailed = p.needsReview === true || !(p.chiban && p.chiban.trim());
         const sColor = chibanFailed ? "#EF4444" : (s ? s.color : FALLBACK_COLOR);
-        const date = p.createdAt ? p.createdAt.slice(0, 10) : "–";
+        const date = jstYmd(p.createdAt) || "–";
         const isChecked = checkedIds.has(p.id);
         const isSelected = selectedPinId === p.id;
         // Excel出力済み（exportedAt あり）はグレーアウト＋出力済行で未出力と区別。
@@ -677,30 +688,31 @@
       const pins = allPins.filter(p => checkedIds.has(p.id));
       if (pins.length === 0) { showToast("選択中のピンがありません", "error"); return; }
       if (typeof XLSX === "undefined") { showToast("Excelライブラリの読込に失敗しました", "error"); return; }
-      // 先頭に No 列（#001形式）。列順: No/発見日/担当者/所在地/住居表記/地番/レ/ステータス/メモ/緯度/経度/拠点
-      const header = ["No","発見日","担当者","所在地","住居表記","地番","レ","ステータス","メモ","緯度","経度","拠点"];
+      // 列順: No/所在地/住居表記/地番/レ/ステータス/メモ/発見日/担当者/緯度/経度/拠点
+      // （発見日・担当者はメモの右へ移動。レ＝REINS確認用の空白列は維持）
+      const header = ["No","所在地","住居表記","地番","レ","ステータス","メモ","発見日","担当者","緯度","経度","拠点"];
       const aoa = [header];
       pins.forEach((p) => {
         const [town, banchi] = splitAddress(p.address);
         aoa.push([
-          fmtSeq(p.seqNo),   // No: 地図ピン・カードと同じ固定連番(seqNo)を fmtSeq で #000 形式に。出力ループでの再採番はしない
-          p.createdAt?.slice(0,10) || "",
-          staffName(p.email),
-          town,
+          fmtSeq(p.seqNo),     // No: 地図ピン・カードと同じ固定連番(seqNo)。出力での再採番はしない
+          town,                // 所在地
           banchi || "",        // 住居表記(番地)：型は下で文字列に固定
           p.chiban || "",      // 地番：型は下で文字列に固定
-          "",
-          STATUS[p.status]?.label || p.status,
-          p.memo || "",
-          p.lat ?? "",
-          p.lng ?? "",
-          p.branch || "",
+          "",                  // レ：REINS確認用の空白列（事務員が手入力。維持）
+          STATUS[p.status]?.label || p.status, // ステータス
+          p.memo || "",        // メモ
+          jstYmd(p.createdAt), // 発見日：JST固定（表示・フィルタと一致）
+          staffName(p.email),  // 担当者
+          p.lat ?? "",         // 緯度
+          p.lng ?? "",         // 経度
+          p.branch || "",      // 拠点
         ]);
       });
       const ws = XLSX.utils.aoa_to_sheet(aoa);
-      // No(列A=0)・住居表記(列E=4)・地番(列F=5)は "71-1"/"#313" 等をExcelが日付/数値化しないよう
+      // No(列A=0)・住居表記(列C=2)・地番(列D=3)は "71-1"/"#313" 等をExcelが日付/数値化しないよう
       // 文字列型(t:'s')で固定。xlsxはセル型を保持するので、CSV時代の ="..." 式ハックは不要。
-      const STR_COLS = [0, 4, 5];
+      const STR_COLS = [0, 2, 3];
       for (let r = 1; r < aoa.length; r++) {
         STR_COLS.forEach(c => {
           const cell = ws[XLSX.utils.encode_cell({ r, c })];
@@ -709,8 +721,8 @@
       }
       // 列幅（実務で見やすい既定）
       ws["!cols"] = [
-        { wch: 6 }, { wch: 12 }, { wch: 10 }, { wch: 28 }, { wch: 12 }, { wch: 12 },
-        { wch: 4 }, { wch: 8 }, { wch: 24 }, { wch: 11 }, { wch: 11 }, { wch: 8 },
+        { wch: 6 }, { wch: 28 }, { wch: 12 }, { wch: 12 }, { wch: 4 }, { wch: 8 },
+        { wch: 24 }, { wch: 12 }, { wch: 10 }, { wch: 11 }, { wch: 11 }, { wch: 8 },
       ];
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "空家マップ");
