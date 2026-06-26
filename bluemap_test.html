@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ブルーマップ＋用途地域 重畳 契約検証（本番非影響）</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: "Noto Sans JP", sans-serif; background: #0f172a; color: #f1f5f9; }
+    .header { padding: 10px 16px; background: #1e293b; font-size: 14px; font-weight: 700; color: #60a5fa; }
+    .header small { display:block; color:#94a3b8; font-weight:400; font-size:11px; margin-top:2px; }
+    #ZMap { position: absolute; top: 54px; bottom: 240px; left:0; right:0; }
+    .panel {
+      position: absolute; bottom: 0; left: 0; right: 0; height: 240px;
+      background: #1e293b; padding: 10px 14px; border-top: 1px solid #334155;
+      display:flex; flex-direction:column; gap:8px;
+    }
+    .controls { display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
+    .toggle { display:flex; align-items:center; gap:8px; font-size:14px; font-weight:700; }
+    .toggle input { width:20px; height:20px; }
+    .warn { font-size:11px; color:#fbbf24; }
+    .result-label { font-size: 11px; color: #94a3b8; }
+    .result-box {
+      background: #0f172a; border-radius: 6px; padding: 8px 12px;
+      font-size: 12px; line-height:1.5; flex:1; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, monospace;
+    }
+    .ok { color:#86efac; } .ng { color:#fca5a5; } .info { color:#93c5fd; }
+  </style>
+
+  <!-- ZENRIN Maps JavaScript API ローダー：既存(admin/index)と完全に同一のキー・auth方式 -->
+  <script src="https://test-js.zmaps-api.com/zma_loader.js?key=2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW&auth=referer"></script>
+</head>
+<body>
+
+<div class="header">
+  🧪 ブルーマップ＋用途地域 重畳 契約検証（検証環境キー / 本番ファイル非影響）
+  <small>瑞穂区豊岡通 付近・ズーム19｜トグルON=GetMap 1回／用途地域ONで地図クリック=GetFeatureInfo 1回</small>
+</div>
+<div id="ZMap"></div>
+<div class="panel">
+  <div class="controls">
+    <label class="toggle">
+      <input type="checkbox" id="bluemap" disabled>
+      <span>ブルーマップ（青=地番/公図）</span>
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="youto" disabled>
+      <span>用途地域（色分け＋クリックで属性）</span>
+    </label>
+    <span class="warn">※トグルON=WMS GetMapを1回／用途地域ON中の地図クリック=GetFeatureInfoを1回（課金対象の可能性）</span>
+  </div>
+  <div class="result-label">診断ログ</div>
+  <div class="result-box info" id="log">地図を初期化中…</div>
+</div>
+
+<script>
+  // ===== 認証・エンドポイント =====
+  // ZENRIN Web API のリファラ認証はヘッダ認証が必須（公式 process_web.html 準拠）:
+  //   x-api-key:<APIキー> / Authorization: referer / Referer:遷移元URL(ブラウザ自動付与)
+  // ※?key= クエリ方式は WMS では 401「Header missing」(実測)。
+  // ※カスタムヘッダのためブラウザは CORSプリフライト(OPTIONS)を行う。WMS側がCORS許可を返さない場合は
+  //   契約が有効でもブラウザfetchはCORSで失敗しうる（Networkタブの実ステータスで判断）。
+  const API_KEY       = "2xYL6LK8wxaJGUxZ8rwdD9rv4sHGXXX51pD8tLUW";
+  const BLUEMAP_BASE  = "https://test-web.zmaps-api.com/map/wms/bluemap";
+  const YOUTO_BASE    = "https://test-web.zmaps-api.com/map/wms/youto";
+  const BLUEMAP_LAYERS= "lp1,ll1,lc1,lw1"; // 地番界面/公図界線/地番注記/地番枠
+  const YOUTO_LAYERS  = "lp1,ll1";         // 用途地域ポリゴン/都市計画道路（bluemapのlp1とは別物）
+
+  // 瑞穂区豊岡通あたり（既知の調査エリア）
+  const CENTER_LAT = 35.1227, CENTER_LNG = 136.9385, START_ZOOM = 19;
+
+  let map = null;
+  const widgets = { bluemap:null, youto:null }; // 各レイヤの重畳ウィジェット
+  let redrawing = false, redrawQueued = false;
+
+  const logEl = document.getElementById("log");
+  function log(msg, cls){ logEl.className = "result-box " + (cls||"info"); logEl.textContent = msg; }
+  function append(msg){ logEl.textContent += "\n" + msg; }
+  function authHeaders(){
+    return { "Content-Type":"application/x-www-form-urlencoded", "x-api-key":API_KEY, "Authorization":"referer" };
+  }
+
+  ZMALoader.setOnLoad(function (mapOptions, error) {
+    if (error) { log("❌ ZENRINローダー初期化エラー:\n" + JSON.stringify(error, null, 2), "ng"); return; }
+
+    mapOptions.center = new ZDC.LatLng(CENTER_LAT, CENTER_LNG);
+    mapOptions.zoom = START_ZOOM;
+    mapOptions.mouseWheelZoom = true;
+    mapOptions.touchPinchZoom = true;
+    // 下地＝標準住宅地図デザイン（検証キーで利用可を実証済み。ID未許可なら初期化エラーになる）
+    mapOptions.zipsMapType = 'Ai3Y2Jwp';
+
+    map = new ZDC.Map(
+      document.getElementById("ZMap"),
+      mapOptions,
+      function () { // 成功
+        map.addControl(new ZDC.ZoomButton("top-right"));
+        map.addControl(new ZDC.ScaleBar("bottom-left"));
+
+        const cbBlue  = document.getElementById("bluemap");
+        const cbYouto = document.getElementById("youto");
+        cbBlue.disabled = false; cbYouto.disabled = false;
+        log("✅ 地図の読み込み成功（瑞穂区豊岡通・ズーム19）。\n" +
+            "トグルONで重畳（用途地域は色分け面・下、ブルーマップは地番線/数字・上）。\n" +
+            "用途地域ON中に地図をクリックすると、その地点の用途地域属性を取得します。", "ok");
+
+        cbBlue.addEventListener("change", redrawActive);
+        cbYouto.addEventListener("change", redrawActive);
+        // 地図移動/ズーム後はBBOXが変わるので、ON中のレイヤを再描画
+        map.addEventListener("scrollend", redrawActive);
+        map.addEventListener("zoom_changed", redrawActive);
+        // 用途地域ON時のみ、クリックで GetFeatureInfo
+        map.addEventListener("click", function(e){
+          if (cbYouto.checked && e && e.latlng) queryYouto(e.latlng);
+        });
+      },
+      function (err) { log("❌ 地図初期化エラー: " + JSON.stringify(err, null, 2), "ng"); }
+    );
+  });
+
+  // 現在表示範囲を EPSG:3857 の [minx,miny,maxx,maxy] 配列で
+  function bboxArray() {
+    const b = map.getLatLngBounds();
+    const sw = map.latlngToWebMercator(b.getSouthWest());
+    const ne = map.latlngToWebMercator(b.getNorthEast());
+    return [sw[0], sw[1], ne[0], ne[1]];
+  }
+
+  function removeLayer(slot){
+    if (widgets[slot]) { try { map.removeWidget(widgets[slot]); } catch(e){} widgets[slot] = null; }
+  }
+
+  // ON中のレイヤを順序固定で再描画（用途地域=下 → ブルーマップ=上）。多重発火はコアレス。
+  async function redrawActive(){
+    if (redrawing) { redrawQueued = true; return; }
+    redrawing = true;
+    try {
+      removeLayer('youto'); removeLayer('bluemap');
+      if (document.getElementById('youto').checked)   await drawLayer('youto');
+      if (document.getElementById('bluemap').checked) await drawLayer('bluemap');
+    } finally {
+      redrawing = false;
+      if (redrawQueued) { redrawQueued = false; redrawActive(); }
+    }
+  }
+
+  async function drawLayer(slot){
+    const conf = (slot === 'youto')
+      ? { base:YOUTO_BASE,   layers:YOUTO_LAYERS,   name:'用途地域' }
+      : { base:BLUEMAP_BASE, layers:BLUEMAP_LAYERS, name:'ブルーマップ' };
+    const size = map.getMapSize();
+    const bbox = bboxArray().join(",");
+    const params = {
+      VERSION:"1.3.0", REQUEST:"GetMap", LAYERS:conf.layers, CRS:"EPSG:3857",
+      BBOX:bbox, WIDTH:size.width, HEIGHT:size.height, FORMAT:"image/png"
+    };
+    log("📡 " + conf.name + " GetMap 送信中…（1リクエスト）", "info");
+    append("POST " + conf.base + "  LAYERS=" + conf.layers);
+    try {
+      const res = await fetch(conf.base, { method:"POST", headers:authHeaders(), body:new URLSearchParams(params) });
+      const ctype = res.headers.get("content-type") || "";
+      if (res.ok && ctype.indexOf("image") !== -1) {
+        const blob = await res.blob();
+        const imgUrl = (window.URL || window.webkitURL).createObjectURL(blob);
+        const id = slot + "_img_" + Date.now();
+        const w = new ZDC.UserWidget(
+          map.getLatLngBounds().getNorthWest(),
+          { htmlSource: '<img id="' + id + '" src="" style="pointer-events:none">', propagation: true }
+        );
+        map.addWidget(w); widgets[slot] = w;
+        document.getElementById(id).src = imgUrl;
+        if (blob.size < 1000) {
+          log("⚠️ " + conf.name + " はHTTP200だが極小画像(" + blob.size + "B)＝ほぼ空。縮尺/エリア提供を要確認。", "ng");
+        } else {
+          log("✅ " + conf.name + " 重畳OK（" + blob.size + "B）。" +
+              (slot === 'youto' ? "地図クリックでその地点の用途地域属性を取得できます。" : ""), "ok");
+        }
+      } else {
+        const body = await res.text().catch(()=> "");
+        log("❌ " + conf.name + " GetMap エラー HTTP " + res.status + " " + res.statusText +
+            "\ncontent-type=" + ctype + "\n" + body.slice(0,1500), "ng");
+      }
+    } catch (e) {
+      log("❌ " + conf.name + " 通信例外（CORS/ネットワーク/referer）: " + e.name + ": " + e.message, "ng");
+    }
+  }
+
+  // クリック地点の用途地域属性（GetFeatureInfo）
+  async function queryYouto(latlng){
+    const size = map.getMapSize();
+    const [minx,miny,maxx,maxy] = bboxArray();
+    const p = map.latlngToWebMercator(latlng);
+    const I = Math.round((p[0]-minx)/(maxx-minx)*size.width);
+    const J = Math.round((maxy-p[1])/(maxy-miny)*size.height);
+    const params = {
+      VERSION:"1.3.0", REQUEST:"GetFeatureInfo", LAYERS:YOUTO_LAYERS, QUERY_LAYERS:"lp1",
+      CRS:"EPSG:3857", BBOX:[minx,miny,maxx,maxy].join(","), WIDTH:size.width, HEIGHT:size.height,
+      FORMAT:"image/png", INFO_FORMAT:"application/json", I:I, J:J
+    };
+    log("📡 用途地域 GetFeatureInfo 送信中…（クリック地点・1リクエスト）", "info");
+    try {
+      const res = await fetch(YOUTO_BASE, { method:"POST", headers:authHeaders(), body:new URLSearchParams(params) });
+      const ctype = res.headers.get("content-type") || "";
+      const txt = await res.text();
+      if (res.ok && ctype.indexOf("json") !== -1) {
+        let obj; try { obj = JSON.parse(txt); } catch(e){ log("用途地域 属性パース失敗:\n" + txt.slice(0,1500), "ng"); return; }
+        const f = (obj.features && obj.features[0] && obj.features[0].properties) || null;
+        if (!f) { log("ℹ️ この地点に用途地域データなし（区域外/調整区域の可能性）。\n" + txt.slice(0,800), "info"); return; }
+        log("🏷️ 用途地域 属性（クリック地点）\n" +
+            "種別ラベル: " + (f.map || "-") + "\n" +
+            "youto(コード): " + f.youto + " ／ 建ぺい率: " + f.kenpei + "% ／ 容積率: " + f.yoseki + "%\n" +
+            "防火(bouka): " + f.bouka + " ／ 高度(koudo): " + f.koudo + " ／ 都計区分(tokei): " + f.tokei + "\n" +
+            "（読みやすい種別名は map ラベル参照。例 1住=第一種住居 / 近商=近隣商業）", "ok");
+      } else {
+        log("❌ 用途地域 GetFeatureInfo エラー HTTP " + res.status + " " + res.statusText + "\n" + txt.slice(0,1500), "ng");
+      }
+    } catch (e) {
+      log("❌ 用途地域 GetFeatureInfo 通信例外（CORS等）: " + e.name + ": " + e.message, "ng");
+    }
+  }
+</script>
+</body>
+</html>
