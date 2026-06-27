@@ -446,13 +446,19 @@
     }
 
     // ON中は用途地域を再描画し、グリッド→ピンを最前面へ積み直す。多重発火はコアレス。
+    // 静止中のidle連発（addWidget/onSnapshot由来）で再描画ループ＝チラつきが起きるため、
+    // 同一BBOX(＋ON状態)で既に描画済みなら何もしない（実際の移動時のみ再描画）。
+    let lastYoutoKey = "";
     async function redrawActiveLayers(){
       if(!map) return;
       if(youtoRedrawing){ youtoRedrawQueued=true; return; }
+      const key = youtoOn ? layerBBoxArr().map(n=>Math.round(n)).join(",") : "off";
+      if(key===lastYoutoKey && (youtoOn ? !!youtoWidget : true)) return;
       youtoRedrawing=true;
       try{
         removeYouto();
         if(youtoOn){ await drawYouto(); if(gridMode) redrawGrid(); renderAllMarkers(); }
+        lastYoutoKey = key;
       } finally {
         youtoRedrawing=false;
         if(youtoRedrawQueued){ youtoRedrawQueued=false; redrawActiveLayers(); }

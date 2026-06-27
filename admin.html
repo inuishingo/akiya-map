@@ -330,16 +330,24 @@
       }catch(e){ showToast(conf.name+"の重畳に失敗（通信/CORS）","error"); console.error(conf.name+" WMS exception",e); }
     }
 
-    // ON中のレイヤを順序固定で再描画（用途地域=下→地番=上）し、グリッド・ピンを最前面へ積み直す。多重発火はコアレス。
+    // ON中のレイヤを順序固定で再描画。多重発火はコアレス。
+    // 静止中のidle連発で再描画ループ（チラつき）が起きるため、同一BBOX＋同一トグル状態で
+    // 既に描画済みなら何もしない（実際の移動/トグル変更時のみ再描画）。
+    let lastLayerKey = "";
     async function redrawActiveLayers(){
       if(!map) return;
       if(layerRedrawing){ layerRedrawQueued=true; return; }
+      const active = (youtoOn || chibanOn);
+      const key = active ? `${youtoOn?1:0}${chibanOn?1:0}:`+layerBBoxArr().map(n=>Math.round(n)).join(",") : "off";
+      const widgetsOk = (!youtoOn || layerWidgets.youto) && (!chibanOn || layerWidgets.bluemap);
+      if(key===lastLayerKey && widgetsOk) return;
       layerRedrawing=true;
       try{
         removeLayerWidget('youto'); removeLayerWidget('bluemap');
         if(youtoOn)  await drawWmsLayer('youto');
         if(chibanOn) await drawWmsLayer('bluemap');
         if(youtoOn || chibanOn){ if(gridMode) redrawGrid(); renderMapMarkers(); } // 画像の上にグリッド→ピンを戻す
+        lastLayerKey = key;
       } finally {
         layerRedrawing=false;
         if(layerRedrawQueued){ layerRedrawQueued=false; redrawActiveLayers(); }
