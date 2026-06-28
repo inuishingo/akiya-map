@@ -109,6 +109,20 @@
       return staffColorMap[email] || STAFF_DEFAULT_COLOR;
     }
 
+    // ===== 要確認(赤)判定 — 単一真実。admin.html と同一定義（色基準を統一）=====
+    // 赤＝住所が要確認 or 地番が未取得。admin で住所/地番を手補正すると onSnapshot 経由で
+    // この計算値が変わり、調査員側のピン色も通常色へ自動追従する。
+    function isAddrUnknown(p) {
+      const a = (p.address || "").trim();
+      return !a || a === "住所不明" || a === "（オフライン）" || a === "取得中…" || a === "住所取得中…";
+    }
+    function isChibanMissing(p) {
+      return !(p.chiban && String(p.chiban).trim());
+    }
+    function needsReviewNow(p) {
+      return isAddrUnknown(p) || isChibanMissing(p);
+    }
+
     // メール→表示名マップ。displayNames コレクション（doc ID=メール, field name）を全件読む。
     // 未登録メールはメールのままフォールバック（落とさない）。手動でdoc追加すれば即反映。
     let staffNameMap = {};
@@ -544,10 +558,9 @@
       // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
       if (data.seqNo != null) {
         const label = "#" + String(data.seqNo).padStart(3, "0");
-        // 背景は担当者カラー（文字は白固定）。ただし地番取得に失敗（needsReview or 地番未取得）
-        // のピンは赤背景で目立たせ、事務所での要確認を促す。
-        const chibanFailed = data.needsReview === true || !(data.chiban && String(data.chiban).trim());
-        const labelBg = chibanFailed ? "#EF4444" : staffColor(data.email);
+        // 背景は担当者カラー（文字は白固定）。ただし要確認（住所不明 or 地番未取得）の
+        // ピンは赤背景で目立たせ、事務所での要確認を促す。色基準は admin.html と統一。
+        const labelBg = needsReviewNow(data) ? "#EF4444" : staffColor(data.email);
         const seqLabel = new ZDC.UserWidget(
           new ZDC.LatLng(data.lat, data.lng),
           {

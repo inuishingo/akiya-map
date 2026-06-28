@@ -39,8 +39,27 @@
     let activeStatusFilter = "all";
     let activeStaffFilter = "all";
     let activeDateFilter = "all";
+    let searchQuery = "";       // 左リスト検索（No/住所/地番の部分一致）
     let checkedIds = new Set();
     let selectedPinId = null;
+
+    // ===== 要確認(赤)判定 — 単一真実 =====
+    // 赤＝住所が要確認 or 地番が未取得。index.html と同一定義（色基準を統一）。
+    // 表示はこの計算値を真実とし、手補正時に needsReview フラグへ同値を書いて整合させる。
+    function isAddrUnknown(p) {
+      const a = (p.address || "").trim();
+      return !a || a === "住所不明" || a === "（オフライン）" || a === "取得中…" || a === "住所取得中…";
+    }
+    function isChibanMissing(p) {
+      return !(p.chiban && String(p.chiban).trim());
+    }
+    function needsReviewNow(p) {
+      return isAddrUnknown(p) || isChibanMissing(p);
+    }
+    // input value="" 属性に安全に埋めるための最小エスケープ
+    function escAttr(s) {
+      return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    }
 
     // ===== 調査グリッド(MVP) 状態 — 管理画面は表示専用（俯瞰のみ・タップ編集なし） =====
     let gridMode = false;       // グリッド進捗オーバーレイの表示ON/OFF（初期OFF）
@@ -459,14 +478,44 @@
       renderMapMarkers();
     };
 
+    // 検索ヒット判定：タグNo(#1444/1444)・住所・地番を1文字列に連結して部分一致。
+    // "#1444" でも "1444" でも同じ干し草に含まれるので両方ヒットする。
+    function matchesSearch(p, q) {
+      if (!q) return true;
+      const seq = p.seqNo != null ? fmtSeq(p.seqNo) : "";           // "#1444"
+      const seqRaw = p.seqNo != null ? String(p.seqNo) : "";        // "1444"
+      const hay = [seq, seqRaw, p.address || "", p.chiban || ""].join(" ").toLowerCase();
+      return hay.includes(q);
+    }
+
     function filtered() {
+      const q = searchQuery.trim().toLowerCase();
       return allPins.filter(p => {
         const statusOk = activeStatusFilter === "all" || p.status === activeStatusFilter;
         const staffOk  = activeStaffFilter  === "all" || p.email === activeStaffFilter;
         const dateOk   = activeDateFilter   === "all" || jstYmd(p.createdAt) === activeDateFilter;
-        return statusOk && staffOk && dateOk;
+        const searchOk = matchesSearch(p, q);   // 既存フィルタの最後に重ねがけ（AND）
+        return statusOk && staffOk && dateOk && searchOk;
       });
     }
+
+    // ===== SEARCH（インクリメンタル）=====
+    window.setSearch = (val) => {
+      searchQuery = val;
+      const clr = document.getElementById("searchClear");
+      if (clr) clr.style.display = val ? "block" : "none";
+      renderList();
+      renderMapMarkers();   // 地図ピンもリストと同じ表示集合に揃える
+    };
+    window.clearSearch = () => {
+      searchQuery = "";
+      const inp = document.getElementById("searchInput");
+      if (inp) inp.value = "";
+      const clr = document.getElementById("searchClear");
+      if (clr) clr.style.display = "none";
+      renderList();
+      renderMapMarkers();
+    };
 
     // ===== LIST =====
     // 固定連番の表示用フォーマット：3桁ゼロ埋め(#001)。1000件超は自然に4桁へ拡張。
@@ -500,9 +549,9 @@
         // 未定義ステータスでも崩れないようガード
         const s = STATUS[p.status];
         const sLabel = s ? s.label : (p.status || "不明");
-        // 地番エラー（needsReview or 地番未取得）はバッジを赤にして要確認を示す
-        const chibanFailed = p.needsReview === true || !(p.chiban && p.chiban.trim());
-        const sColor = chibanFailed ? "#EF4444" : (s ? s.color : FALLBACK_COLOR);
+        // 要確認（住所不明 or 地番未取得）はバッジを赤にして示す。色基準は needsReviewNow に統一。
+        const review = needsReviewNow(p);
+        const sColor = review ? "#EF4444" : (s ? s.color : FALLBACK_COLOR);
         const date = jstYmd(p.createdAt) || "–";
         const isChecked = checkedIds.has(p.id);
         const isSelected = selectedPinId === p.id;
@@ -512,7 +561,10 @@
         const exportedByName = p.exportedBy ? staffName(p.exportedBy) : "";
         const exportedMD = p.exportedAt
           ? `${Number(p.exportedAt.slice(5,7))}/${Number(p.exportedAt.slice(8,10))}` : "";
-        const svUrl = `https://maps.google.com/maps?q=&layer=c&cbll=${p.lat},${p.lng}`;
+        // Googleマップの通常マップ表示で開く。座標があれば座標(ズレない)、無ければ住所でフォールバック。
+        const gmapUrl = (p.lat != null && p.lng != null)
+          ? `https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lng}`
+          : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(p.address || "")}`;
         return `
         <div class="pin-card ${exported ? "exported" : ""} ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
           <div class="pin-card-top">
@@ -524,16 +576,21 @@
             <span class="pin-staff">${staffName(p.email)}</span>
             <button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>
           </div>
-          <div class="pin-address">${p.address || "住所なし"}</div>
+          <div class="pin-detail-row">
+            <span class="detail-label">所在</span>
+            <input class="detail-input addr-input ${p.addressManual ? "manual" : ""}" value="${escAttr(p.address)}" placeholder="住所不明"
+              onchange="saveAddress('${p.id}',this.value)" onclick="event.stopPropagation()">
+            ${p.addressManual ? `<span class="manual-badge" title="手修正済み">✎手修正</span>` : ""}
+          </div>
           ${p.memo ? `<div class="pin-memo">📝 ${p.memo}</div>` : ""}
           <div class="pin-detail-row">
             <span class="detail-label">地番</span>
-            <input class="detail-input ${p.chibanManual ? "manual" : ""}" value="${p.chiban || ""}" placeholder="未入力"
+            <input class="detail-input ${p.chibanManual ? "manual" : ""}" value="${escAttr(p.chiban)}" placeholder="未入力"
               onchange="saveChiban('${p.id}',this.value)" onclick="event.stopPropagation()">
             ${p.chibanManual ? `<span class="manual-badge" title="手修正済み">✎手修正</span>` : ""}
           </div>
           <div class="pin-actions">
-            <a class="sv-btn" href="${svUrl}" target="_blank" onclick="event.stopPropagation()">📷 ストリートビュー</a>
+            <a class="sv-btn" href="${gmapUrl}" target="_blank" onclick="event.stopPropagation()">🗺 地図で開く</a>
             <select class="status-sel" onchange="updateStatus('${p.id}',this.value)" onclick="event.stopPropagation()">
               ${statusOptionsHTML(p.status)}
             </select>
@@ -603,9 +660,8 @@
         // ピン番号ラベル(#001形式)をマーカーの上にHTMLオーバーレイ表示。
         // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
         if (p.seqNo != null) {
-          // 地番取得失敗（needsReview or 地番未取得）は赤背景で要確認を示す。現地画面(index.html)と色基準を統一。
-          const chibanFailed = p.needsReview === true || !(p.chiban && String(p.chiban).trim());
-          const labelBg = chibanFailed ? "#EF4444" : staffColor(p.email);
+          // 要確認（住所不明 or 地番未取得）は赤背景で示す。現地画面(index.html)と色基準を統一。
+          const labelBg = needsReviewNow(p) ? "#EF4444" : staffColor(p.email);
           const seqLabel = new ZDC.UserWidget(
             new ZDC.LatLng(p.lat, p.lng),
             {
@@ -656,16 +712,40 @@
     };
 
     // ===== SAVE 地番（手修正）=====
-    // 手修正は自動再取得より優先。chibanManual を立て、要確認フラグを解除する。
+    // 手修正は自動再取得より優先。値があれば chibanManual を立て、空なら解除（自動再取得に委ねる）。
+    // needsReview は住所・地番を合わせた最新状態で再計算（埋まればfalse／空に戻せばtrue）。
     window.saveChiban = async (id, value) => {
+      const p = allPins.find(x => x.id === id) || {};
+      const chiban = value.trim();
+      const review = needsReviewNow({ ...p, chiban });
       try {
-        await updateDoc(doc(db, "pins", id), {
-          chiban: value.trim(),
-          chibanManual: true,
-          needsReview: false,
-          reviewReason: deleteField(),
-        });
+        const update = {
+          chiban,
+          chibanManual: chiban ? true : deleteField(),
+          needsReview: review,
+        };
+        if (!review) update.reviewReason = deleteField();
+        await updateDoc(doc(db, "pins", id), update);
         showToast("地番を保存しました");
+      } catch(e) { showToast("保存に失敗しました", "error"); }
+    };
+
+    // ===== SAVE 住所（手修正）=====
+    // 住所と地番は別管理。値があれば addressManual を立て、空なら解除。
+    // needsReview は住所・地番を合わせた最新状態で再計算する。
+    window.saveAddress = async (id, value) => {
+      const p = allPins.find(x => x.id === id) || {};
+      const address = value.trim();
+      const review = needsReviewNow({ ...p, address });
+      try {
+        const update = {
+          address,
+          addressManual: address ? true : deleteField(),
+          needsReview: review,
+        };
+        if (!review) update.reviewReason = deleteField();
+        await updateDoc(doc(db, "pins", id), update);
+        showToast("住所を保存しました");
       } catch(e) { showToast("保存に失敗しました", "error"); }
     };
 
@@ -853,6 +933,26 @@
     }
     .status-filter-sel:focus { border-color: #3b82f6; }
 
+    /* 検索バー：種別セレクトの直下。インクリメンタル＋×クリア。 */
+    .search-bar {
+      display: flex; align-items: center; gap: 6px;
+      margin: 0 10px 4px; padding: 6px 10px;
+      border-radius: 8px; border: 1px solid #e2e8f0; background: #fff;
+    }
+    .search-bar:focus-within { border-color: #3b82f6; }
+    .search-icon { font-size: 12px; color: #94a3b8; flex-shrink: 0; }
+    .search-input {
+      flex: 1; border: none; outline: none; background: transparent;
+      font-size: 13px; font-family: inherit; color: #1e293b; min-width: 0;
+    }
+    .search-input::-webkit-search-cancel-button { display: none; }
+    .search-clear {
+      border: none; background: #f1f5f9; color: #64748b; cursor: pointer;
+      width: 20px; height: 20px; border-radius: 999px; font-size: 11px;
+      line-height: 1; flex-shrink: 0;
+    }
+    .search-clear:hover { background: #e2e8f0; }
+
     .select-all-bar {
       display: flex; align-items: center; justify-content: space-between;
       margin: 6px 8px 0; padding: 6px 10px;
@@ -1013,6 +1113,14 @@
       <select id="statusFilter" class="status-filter-sel" onchange="setFilter(this.value)">
         <option value="all">種別：すべて</option>
       </select>
+    </div>
+
+    <!-- 検索：No(#1444/1444)・住所・地番の部分一致。既存フィルタにANDで重ねがけ。 -->
+    <div class="search-bar">
+      <span class="search-icon">🔍</span>
+      <input id="searchInput" class="search-input" type="search" placeholder="No・住所・地番で検索"
+        oninput="setSearch(this.value)" autocomplete="off">
+      <button id="searchClear" class="search-clear" onclick="clearSearch()" title="クリア" style="display:none">✕</button>
     </div>
 
     <div class="select-all-bar">
