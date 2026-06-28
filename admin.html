@@ -772,9 +772,11 @@
       return [a, ""];
     }
     window.exportExcel = async () => {
-      // 選択中（チェック済み）のピンのみ出力
-      const pins = allPins.filter(p => checkedIds.has(p.id));
-      if (pins.length === 0) { showToast("選択中のピンがありません", "error"); return; }
+      // 画面の絞り込み（日付＋担当者＋種別＋検索）で表示中の集合をそのまま出力。
+      // ＝「今画面に出ている集合 = 出力される集合」。チェックボックスは一括削除専用で出力には関与しない
+      // （checkedIds はフィルタ変更後も残り、表示と食い違うため出力基準に使わない）。
+      const pins = filtered();
+      if (pins.length === 0) { showToast("表示中のピンがありません", "error"); return; }
       if (typeof XLSX === "undefined") { showToast("Excelライブラリの読込に失敗しました", "error"); return; }
       // 列順: No/所在地/住居表記/地番/レ/ステータス/メモ/発見日/担当者/緯度/経度/拠点
       // （発見日・担当者はメモの右へ移動。レ＝REINS確認用の空白列は維持）
