@@ -429,17 +429,23 @@
     }
 
     // ===== STAFF FILTER =====
+    // 担当者リストは「現在の日付フィルタに出勤した人」だけに絞る（日付↔担当者の双方向連動）。
+    // 構成基準は activeDateFilter のみ（自分=担当者では絞らない）＝ updateDateFilter と非再帰で対称。
+    // 無限ループ防止：update系は互いを呼ばない。set系ハンドラだけが両update系を呼ぶ。
     function updateStaffFilter() {
-      const emails = [...new Set(allPins.map(p => p.email).filter(Boolean))].sort();
+      const base = allPins.filter(p => activeDateFilter === "all" || jstYmd(p.createdAt) === activeDateFilter);
+      const emails = [...new Set(base.map(p => p.email).filter(Boolean))].sort();
+      // 現在の担当者が新候補に無ければ「すべて」に戻す（無効な担当者を選んだままの0件破綻を防止）。
+      if (activeStaffFilter !== "all" && !emails.includes(activeStaffFilter)) activeStaffFilter = "all";
       const sel = document.getElementById("staffFilter");
-      const current = sel.value;
       sel.innerHTML = `<option value="all">担当者：すべて</option>` +
-        emails.map(e => `<option value="${e}" ${e===current?"selected":""}>${staffName(e)}</option>`).join("");
+        emails.map(e => `<option value="${e}" ${e===activeStaffFilter?"selected":""}>${staffName(e)}</option>`).join("");
     }
 
     window.setStaffFilter = (val) => {
       activeStaffFilter = val;
-      updateDateFilter();   // 担当者連動：日付リスト再生成＋無効日付は「すべて」にリセット
+      updateDateFilter();    // 担当者→日付リストを連動（無効日付は「すべて」にリセット）
+      updateStaffFilter();   // 日付がリセットされ得るので担当者リスト/選択も整え直す
       renderList();
       renderMapMarkers();
     };
@@ -465,6 +471,8 @@
 
     window.setDateFilter = (val) => {
       activeDateFilter = val;
+      updateStaffFilter();   // 日付→担当者リストを連動（その日の出勤者だけ＋無効担当者はリセット）
+      updateDateFilter();    // 担当者がリセットされ得るので日付リスト/選択も整え直す
       renderList();
       renderMapMarkers();
     };
@@ -497,6 +505,15 @@
         const searchOk = matchesSearch(p, q);   // 既存フィルタの最後に重ねがけ（AND）
         return statusOk && staffOk && dateOk && searchOk;
       });
+    }
+
+    // ===== 操作対象の共通判定（チェック基点）=====
+    // Excel出力・出力取消が共有する。チェックが1件以上→チェックした案件、0件→表示中(filtered)全体。
+    // ※削除だけはこの「0件→全件」を使わない（誤爆防止のためチェック必須・bulkDelete参照）。
+    function selectionTargets() {
+      return checkedIds.size > 0
+        ? allPins.filter(p => checkedIds.has(p.id))
+        : filtered();
     }
 
     // ===== SEARCH（インクリメンタル）=====
@@ -772,11 +789,10 @@
       return [a, ""];
     }
     window.exportExcel = async () => {
-      // 画面の絞り込み（日付＋担当者＋種別＋検索）で表示中の集合をそのまま出力。
-      // ＝「今画面に出ている集合 = 出力される集合」。チェックボックスは一括削除専用で出力には関与しない
-      // （checkedIds はフィルタ変更後も残り、表示と食い違うため出力基準に使わない）。
-      const pins = filtered();
-      if (pins.length === 0) { showToast("表示中のピンがありません", "error"); return; }
+      // 対象判定はチェック基点（出力・取消・削除で共通の考え方）。
+      //  チェックあり → チェックした案件のみ出力／チェックなし → 表示中(filtered)全体を出力（普段の運用）。
+      const pins = selectionTargets();
+      if (pins.length === 0) { showToast("出力対象のピンがありません", "error"); return; }
       if (typeof XLSX === "undefined") { showToast("Excelライブラリの読込に失敗しました", "error"); return; }
       // 列順: No/所在地/住居表記/地番/レ/ステータス/メモ/発見日/担当者/緯度/経度/拠点
       // （発見日・担当者はメモの右へ移動。レ＝REINS確認用の空白列は維持）
@@ -825,6 +841,30 @@
         pins.map(p => updateDoc(doc(db, "pins", p.id), { exportedAt, exportedBy }).catch(()=>{}))
       );
       showToast(`Excelを出力しました（${pins.length}件・出力済みに記録）`);
+    };
+
+    // ===== EXCEL出力済みの取消（未出力に戻す）=====
+    // 出力済み記録は exportedAt(ISO文字列)＋exportedBy(メール)の2フィールド。両方 deleteField で除去。
+    // 対象判定はチェック基点（selectionTargets）＝出力と同じ。そのうち「出力済み」だけを取り消す。
+    //  - チェックあり → チェックした案件のうち出力済みのみ／チェックなし → 表示中(filtered)の出力済み全部。
+    //  - 確認ダイアログは出力済みのみカウントし、チェック有無で文言を出し分け。
+    window.unexportAll = async () => {
+      const hasChecked = checkedIds.size > 0;
+      const targets = selectionTargets().filter(p => !!p.exportedAt);
+      if (targets.length === 0) {
+        showToast(hasChecked ? "選択中に出力済みの物件はありません" : "表示中に出力済みの物件はありません", "error");
+        return;
+      }
+      const msg = hasChecked
+        ? `選択した ${targets.length}件 を未出力に戻します。よろしいですか？`
+        : `表示中の出力済み ${targets.length}件 を未出力に戻します。よろしいですか？`;
+      if (!confirm(msg)) return;
+      try {
+        await Promise.all(
+          targets.map(p => updateDoc(doc(db, "pins", p.id), { exportedAt: deleteField(), exportedBy: deleteField() }))
+        );
+        showToast(`${targets.length}件を未出力に戻しました`);
+      } catch(e) { showToast("取消に失敗しました", "error"); }
     };
 
     // ===== TOAST =====
@@ -885,6 +925,9 @@
       padding: 7px 16px; border-radius: 6px; background: #10b981; color: #fff;
       font-size: 13px; font-weight: 700; border: none; cursor: pointer;
     }
+    /* 出力取消＝グレー（出力＝緑と区別） */
+    .csv-btn.undo-btn { background: #6b7280; }
+    .csv-btn.undo-btn:hover { background: #4b5563; }
     /* 調査グリッド進捗の表示トグル。OFF=グレー枠 / ON=青塗りで状態を明示 */
     .grid-btn {
       padding: 7px 14px; border-radius: 6px; background: transparent;
@@ -1086,6 +1129,7 @@
     <button class="layer-btn youto" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋クリックで属性">用途地域</button>
     <button class="layer-btn" id="chibanBtn" onclick="toggleChiban()" title="地番（ブルーマップ）重畳">地番</button>
     <button class="csv-btn" onclick="exportExcel()">📥 Excel出力</button>
+    <button class="csv-btn undo-btn" onclick="unexportAll()" title="チェックがあれば選択分／無ければ表示中の出力済みを未出力に戻す">↩ 出力取消</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
   </div>
 
