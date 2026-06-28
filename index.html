@@ -123,6 +123,86 @@
       return isAddrUnknown(p) || isChibanMissing(p);
     }
 
+    // ===== 市区「続きへ」ジャンプ =====
+    // 住所から市区キーを抽出（政令市＝区粒度／非政令市＝市・町・村まで・都道府県と郡は除去）。
+    // メンテ不要：全ピンの住所から自動抽出する。
+    function cityWardKey(address) {
+      let a = (address || "").normalize("NFKC").trim();
+      if (!a) return "";
+      // 都道府県を除去（「京都」の"都"等で誤切断しないよう府県を限定列挙）
+      a = a.replace(/^(東京都|北海道|京都府|大阪府|.{2,3}県)/, "");
+      // 郡を除去（町村の前置き。例: 海部郡蟹江町 → 蟹江町）
+      a = a.replace(/^.{1,4}郡/, "");
+      let m;
+      if ((m = a.match(/^(.+?市.+?区)/))) return m[1];   // 政令市の区（例 名古屋市瑞穂区）
+      if ((m = a.match(/^(.+?市市?)/)))   return m[1];   // 市（四日市市等の二重市に対応）
+      if ((m = a.match(/^(.+?区)/)))      return m[1];   // 東京特別区など市無しの区
+      if ((m = a.match(/^(.+?[町村])/)))  return m[1];   // 郡除去後の町・村
+      return "";
+    }
+    // 市区プレフィックスを除いた住所末尾（町名+番地）。一覧の3列目に表示。
+    function addrTail(address, key) {
+      let a = (address || "").normalize("NFKC").trim();
+      a = a.replace(/^(東京都|北海道|京都府|大阪府|.{2,3}県)/, "");
+      a = a.replace(/^.{1,4}郡/, "");
+      if (key && a.startsWith(key)) a = a.slice(key.length);
+      return a.trim();
+    }
+    // createdAt(ISO/UTC) を JST(+9h) の M/D に。
+    function jstMD(iso) {
+      const t = Date.parse(iso || "");
+      if (Number.isNaN(t)) return "";
+      const d = new Date(t + 9 * 3600 * 1000);
+      return (d.getUTCMonth() + 1) + "/" + d.getUTCDate();
+    }
+    function escHtml(s) {
+      return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    // 市区ごとに「最終ピン(createdAt最大)」を1件保持し、最終ピンの新しい順に並べる。
+    function buildJumpList() {
+      const byKey = {};   // key -> { id, t, lat, lng, address, createdAt }
+      lastPinDocs.forEach(({ id, data }) => {
+        if (data.lat == null || data.lng == null) return;   // ジャンプ先が定まらない
+        const key = cityWardKey(data.address);
+        if (!key) return;
+        const t = Date.parse(data.createdAt || "") || 0;
+        if (!byKey[key] || t > byKey[key].t) {
+          byKey[key] = { id, t, lat: data.lat, lng: data.lng, address: data.address, createdAt: data.createdAt };
+        }
+      });
+      return Object.entries(byKey)
+        .map(([key, v]) => ({ key, ...v }))
+        .sort((a, b) => b.t - a.t);   // 直近に回った市区が上
+    }
+
+    // ドロップダウンを再構築（ピン更新のたび呼ぶ）。選択値は毎回ラベルへ戻す。
+    function renderJumpList() {
+      const sel = document.getElementById("jumpSelect");
+      if (!sel) return;
+      const list = buildJumpList();
+      const opts = ['<option value="">📍 続きへ ▼</option>'];
+      list.forEach(item => {
+        // 表示順：日付（M/D・左端固定）　市区名　住所末尾。日付先頭で桁ズレを解消。
+        const text = `${jstMD(item.createdAt)}　${item.key}　${addrTail(item.address, item.key)}`;
+        opts.push(`<option value="${item.id}">${escHtml(text)}</option>`);
+      });
+      sel.innerHTML = opts.join("");
+      sel.value = "";
+    }
+
+    // 選択した市区の最終ピン（＝続きの起点）へ移動。追従はOFFにして現在地に引き戻されないようにする。
+    window.jumpToCity = (id) => {
+      const sel = document.getElementById("jumpSelect");
+      if (sel) sel.value = "";   // 同じ市区を続けて選べるようラベルへ戻す
+      if (!id || !map) return;
+      const doc = lastPinDocs.find(d => d.id === id);
+      if (!doc) return;
+      setFollow(false);
+      map.setCenter(new ZDC.LatLng(doc.data.lat, doc.data.lng));
+      map.setZoom(17);   // エリア把握しやすい倍率
+    };
+
     // メール→表示名マップ。displayNames コレクション（doc ID=メール, field name）を全件読む。
     // 未登録メールはメールのままフォールバック（落とさない）。手動でdoc追加すれば即反映。
     let staffNameMap = {};
@@ -526,6 +606,8 @@
         await buildStaffNames();
         lastPinDocs = snap.docs.map(d => ({ id:d.id, data:d.data() }));
         renderAllMarkers();   // docID基準で全件再描画＝重複なし（重畳後の再スタックにも再利用）
+        renderJumpList();     // 「続きへ」ドロップダウンを最新ピンで再構築
+
       }, e => { /* オフライン/権限エラーは無視（再オンライン・再ログインで復帰） */ });
     }
 
@@ -937,8 +1019,17 @@
       padding: 10px 14px; background: #111827; border-bottom: 1px solid #1f2937;
       flex-shrink: 0; z-index: 10;
     }
+    .header-left { min-width: 0; flex-shrink: 0; }
     .header-title { font-size: 14px; font-weight: 700; color: #f9fafb; }
     #userLabel { font-size: 11px; color: #6b7280; margin-top: 1px; }
+    /* 市区ジャンプのドロップダウン。スマホで詰まりすぎないよう中央で可変＋上限幅。 */
+    .jump-select {
+      flex: 1; min-width: 0; max-width: 220px; margin: 0 8px;
+      padding: 6px 8px; border-radius: 6px; border: 1px solid #374151;
+      background: #1f2937; color: #e5e7eb; font-size: 12px; font-family: inherit;
+      outline: none; cursor: pointer;
+    }
+    .jump-select:focus { border-color: #2563eb; }
     .logout-btn {
       padding: 6px 12px; border-radius: 6px; background: transparent;
       border: 1px solid #374151; color: #9ca3af; font-size: 12px; cursor: pointer;
@@ -1064,10 +1155,14 @@
 
 <div id="mapScreen">
   <div class="header">
-    <div>
+    <div class="header-left">
       <div class="header-title">🏚 空家マップ</div>
       <div id="userLabel"></div>
     </div>
+    <!-- 市区ごとの「前回の続き」へ飛ぶ。各行＝市区名 最終調査日 最終ピン住所。直近に回った市区が上。 -->
+    <select id="jumpSelect" class="jump-select" onchange="jumpToCity(this.value)">
+      <option value="">📍 続きへ ▼</option>
+    </select>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
   </div>
   <div id="map"></div>
