@@ -599,10 +599,11 @@
               onchange="saveChiban('${p.id}',this.value)" onclick="event.stopPropagation()">
             ${p.chibanManual ? `<span class="manual-badge" title="手修正済み">✎手修正</span>` : ""}
           </div>
+          ${p.memo ? `<div class="surveyor-memo">📝 調査員メモ：${escAttr(p.memo)}</div>` : ""}
           <div class="pin-detail-row memo-row">
-            <span class="detail-label">メモ</span>
-            <textarea class="detail-input memo-input" rows="2" placeholder="メモ（任意）"
-              onchange="saveMemo('${p.id}',this.value)" onclick="event.stopPropagation()">${escAttr(p.memo)}</textarea>
+            <span class="detail-label">事務員<br>メモ</span>
+            <textarea class="detail-input memo-input" rows="2" placeholder="事務員メモ（任意）"
+              onchange="saveAdminMemo('${p.id}',this.value)" onclick="event.stopPropagation()">${escAttr(p.adminMemo)}</textarea>
           </div>
           <div class="pin-actions">
             <a class="sv-btn" href="${gmapUrl}" target="_blank" onclick="event.stopPropagation()">🗺 地図で開く</a>
@@ -764,14 +765,15 @@
       } catch(e) { showToast("保存に失敗しました", "error"); }
     };
 
-    // ===== SAVE メモ =====
-    // メモは住所/地番とは独立。needsReview（赤判定）・要調査フィルタには一切関与させない。
-    // 値フィールドなので空欄は空文字で保存（住所/地番の値・index.html の memo 書込みと同方針）。
-    window.saveMemo = async (id, value) => {
-      const memo = value.trim();
+    // ===== SAVE 事務員メモ（adminMemo）=====
+    // 調査員メモ(memo)とは別フィールド。adminMemo だけを更新し、memo には絶対に触れない
+    // （調査員の現地メモを事務員編集で潰さないための分離）。
+    // needsReview（赤判定）・要調査フィルタには一切関与させない。空欄は空文字で保存。
+    window.saveAdminMemo = async (id, value) => {
+      const adminMemo = value.trim();
       try {
-        await updateDoc(doc(db, "pins", id), { memo });
-        showToast("メモを保存しました");
+        await updateDoc(doc(db, "pins", id), { adminMemo });
+        showToast("事務員メモを保存しました");
       } catch(e) { showToast("保存に失敗しました", "error"); }
     };
 
@@ -803,9 +805,9 @@
       const pins = selectionTargets();
       if (pins.length === 0) { showToast("出力対象のピンがありません", "error"); return; }
       if (typeof XLSX === "undefined") { showToast("Excelライブラリの読込に失敗しました", "error"); return; }
-      // 列順: No/所在地/住居表記/地番/レ/ステータス/メモ/発見日/担当者/緯度/経度/拠点
-      // （発見日・担当者はメモの右へ移動。レ＝REINS確認用の空白列は維持）
-      const header = ["No","所在地","住居表記","地番","レ","ステータス","メモ","発見日","担当者","緯度","経度","拠点"];
+      // 列順: No/所在地/住居表記/地番/レ/ステータス/調査員メモ/事務員メモ/発見日/担当者/緯度/経度/拠点
+      // （メモは2系統：調査員memo=現地メモ／事務員adminMemo。レ＝REINS確認用の空白列は維持）
+      const header = ["No","所在地","住居表記","地番","レ","ステータス","調査員メモ","事務員メモ","発見日","担当者","緯度","経度","拠点"];
       const aoa = [header];
       pins.forEach((p) => {
         const [town, banchi] = splitAddress(p.address);
@@ -816,7 +818,8 @@
           p.chiban || "",      // 地番：型は下で文字列に固定
           "",                  // レ：REINS確認用の空白列（事務員が手入力。維持）
           STATUS[p.status]?.label || p.status, // ステータス
-          p.memo || "",        // メモ
+          p.memo || "",        // 調査員メモ（現地memo）：型は下で文字列に固定
+          p.adminMemo || "",   // 事務員メモ（adminMemo）：型は下で文字列に固定
           jstYmd(p.createdAt), // 発見日：JST固定（表示・フィルタと一致）
           staffName(p.email),  // 担当者
           p.lat ?? "",         // 緯度
@@ -825,9 +828,9 @@
         ]);
       });
       const ws = XLSX.utils.aoa_to_sheet(aoa);
-      // No(列A=0)・住居表記(列C=2)・地番(列D=3)は "71-1"/"#313" 等をExcelが日付/数値化しないよう
-      // 文字列型(t:'s')で固定。xlsxはセル型を保持するので、CSV時代の ="..." 式ハックは不要。
-      const STR_COLS = [0, 2, 3];
+      // No(0)・住居表記(2)・地番(3)・調査員メモ(6)・事務員メモ(7)は "71-1"/"#313"/数字だけのメモ等を
+      // Excelが日付/数値化しないよう文字列型(t:'s')で固定。xlsxはセル型を保持するので ="..." ハック不要。
+      const STR_COLS = [0, 2, 3, 6, 7];
       for (let r = 1; r < aoa.length; r++) {
         STR_COLS.forEach(c => {
           const cell = ws[XLSX.utils.encode_cell({ r, c })];
@@ -837,7 +840,7 @@
       // 列幅（実務で見やすい既定）
       ws["!cols"] = [
         { wch: 6 }, { wch: 28 }, { wch: 12 }, { wch: 12 }, { wch: 4 }, { wch: 8 },
-        { wch: 24 }, { wch: 12 }, { wch: 10 }, { wch: 11 }, { wch: 11 }, { wch: 8 },
+        { wch: 24 }, { wch: 24 }, { wch: 12 }, { wch: 10 }, { wch: 11 }, { wch: 11 }, { wch: 8 },
       ];
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "空家マップ");
@@ -1072,6 +1075,12 @@
     .del-btn:hover { background: #fef2f2; }
 
     .pin-address { font-size: 13px; font-weight: 500; color: #1e293b; margin-bottom: 4px; line-height: 1.4; }
+    /* 調査員メモ：admin では表示専用（編集不可）。現地メモの参照用。 */
+    .surveyor-memo {
+      font-size: 12px; color: #475569; background: #f8fafc; border: 1px solid #e2e8f0;
+      border-radius: 6px; padding: 5px 8px; margin-bottom: 8px; line-height: 1.4;
+      white-space: pre-wrap; word-break: break-word;
+    }
 
     .pin-detail-row {
       display: grid; grid-template-columns: 32px 1fr auto; gap: 4px; align-items: center;
