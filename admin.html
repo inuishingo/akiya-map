@@ -36,7 +36,7 @@
     let map = null;
     let allPins = [];
     let markers = [];
-    let activeStatusFilter = "all";
+    let reviewOnly = false;     // 「⚠️ 要調査のみ」フィルタ（赤ラベル＝住所不明 or 地番未取得 だけ表示）
     let activeStaffFilter = "all";
     let activeDateFilter = "all";
     let searchQuery = "";       // 左リスト検索（No/住所/地番の部分一致）
@@ -146,21 +146,6 @@
         ? `<option value="${selected}" selected>${selected}（旧）</option>` : "";
       return legacy + known;
     }
-
-    // 種別フィルタのドロップダウン（すべて＋グループ見出し付き）を描画
-    function renderStatusFilter() {
-      const sel = document.getElementById("statusFilter");
-      if (!sel) return;
-      sel.innerHTML =
-        `<option value="all">種別：すべて</option>` +
-        STATUS_GROUPS.map(g =>
-          `<optgroup label="${g.label}">` +
-          g.keys.map(k => `<option value="${k}">${STATUS[k].label}</option>`).join("") +
-          `</optgroup>`
-        ).join("");
-      sel.value = activeStatusFilter;
-    }
-    renderStatusFilter();
 
     function makeSvgUrl(color, text) {
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="40" viewBox="0 0 32 40">
@@ -477,11 +462,20 @@
       renderMapMarkers();
     };
 
-    // ===== STATUS FILTER =====
-    window.setFilter = (f) => {
-      activeStatusFilter = f;
-      const sel = document.getElementById("statusFilter");
-      if (sel && sel.value !== f) sel.value = f;
+    // ===== 要調査フィルタ =====
+    // ON → needsReviewNow(p)（赤＝住所不明 or 地番未取得）だけ表示／OFF → 全件。
+    // 日付・担当者・検索と filtered() 内で AND 結合。地図ピンも filtered() 経由で連動。
+    window.setReviewOnly = (on) => {
+      reviewOnly = !!on;
+      renderList();
+      renderMapMarkers();
+    };
+
+    // 総件数クリック → 全件表示に戻す（要調査トグルをOFFへ）。
+    window.showAll = () => {
+      reviewOnly = false;
+      const cb = document.getElementById("reviewOnlyToggle");
+      if (cb) cb.checked = false;
       renderList();
       renderMapMarkers();
     };
@@ -499,11 +493,11 @@
     function filtered() {
       const q = searchQuery.trim().toLowerCase();
       return allPins.filter(p => {
-        const statusOk = activeStatusFilter === "all" || p.status === activeStatusFilter;
+        const reviewOk = !reviewOnly || needsReviewNow(p);   // 要調査のみON時は赤ラベルだけ
         const staffOk  = activeStaffFilter  === "all" || p.email === activeStaffFilter;
         const dateOk   = activeDateFilter   === "all" || jstYmd(p.createdAt) === activeDateFilter;
         const searchOk = matchesSearch(p, q);   // 既存フィルタの最後に重ねがけ（AND）
-        return statusOk && staffOk && dateOk && searchOk;
+        return reviewOk && staffOk && dateOk && searchOk;
       });
     }
 
@@ -971,14 +965,17 @@
       border-bottom: 1px solid #f1f5f9; flex-shrink: 0;
     }
     .filter-bar::-webkit-scrollbar { display: none; }
-    .status-filter-sel {
-      flex: 1; padding: 6px 10px; border-radius: 8px; border: 1px solid #e2e8f0;
-      font-size: 12px; font-weight: 500; color: #1e293b; background: #fff;
-      cursor: pointer; font-family: inherit; outline: none;
+    /* 要調査のみトグル（旧・種別ドロップダウンの位置）。赤ラベル案件だけ絞り込む。 */
+    .review-toggle {
+      flex: 1; display: flex; align-items: center; gap: 8px;
+      padding: 6px 10px; border-radius: 8px; border: 1px solid #e2e8f0;
+      font-size: 12px; font-weight: 600; color: #1e293b; background: #fff;
+      cursor: pointer; user-select: none;
     }
-    .status-filter-sel:focus { border-color: #3b82f6; }
+    .review-toggle:hover { border-color: #ef4444; }
+    .review-toggle input { width: 15px; height: 15px; cursor: pointer; accent-color: #ef4444; }
 
-    /* 検索バー：種別セレクトの直下。インクリメンタル＋×クリア。 */
+    /* 検索バー：要調査トグルの直下。インクリメンタル＋×クリア。 */
     .search-bar {
       display: flex; align-items: center; gap: 6px;
       margin: 0 10px 4px; padding: 6px 10px;
@@ -1137,7 +1134,7 @@
     <!-- 集計カウンタ：総件数＋グループ小計（建物系/土地系/NG系）の4枚。表示専用。
          数字は updateStats() が stat-total / stat-group-* に反映。絞り込みは下のドロップダウンで。 -->
     <div class="stats-bar">
-      <div class="stat-item" onclick="setFilter('all')">
+      <div class="stat-item" onclick="showAll()">
         <div class="stat-num" id="stat-total">0</div>
         <div class="stat-label">総件数</div>
       </div>
@@ -1156,9 +1153,10 @@
     </div>
 
     <div class="filter-bar">
-      <select id="statusFilter" class="status-filter-sel" onchange="setFilter(this.value)">
-        <option value="all">種別：すべて</option>
-      </select>
+      <label class="review-toggle">
+        <input type="checkbox" id="reviewOnlyToggle" onchange="setReviewOnly(this.checked)">
+        <span>⚠️ 要調査のみ（住所不明・地番未取得）</span>
+      </label>
     </div>
 
     <!-- 検索：No(#1444/1444)・住所・地番の部分一致。既存フィルタにANDで重ねがけ。 -->
