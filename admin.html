@@ -601,8 +601,8 @@
           </div>
           ${p.memo ? `<div class="surveyor-memo">📝 調査員メモ：${escAttr(p.memo)}</div>` : ""}
           <div class="pin-detail-row memo-row">
-            <span class="detail-label">事務員<br>メモ</span>
-            <textarea class="detail-input memo-input" rows="2" placeholder="事務員メモ（任意）"
+            <span class="detail-label">メモ</span>
+            <textarea class="detail-input memo-input" rows="2" placeholder="メモ（任意）"
               onchange="saveAdminMemo('${p.id}',this.value)" onclick="event.stopPropagation()">${escAttr(p.adminMemo)}</textarea>
           </div>
           <div class="pin-actions">
@@ -1088,7 +1088,7 @@
     }
     /* メモ行：複数行textareaなのでラベルを上端揃えに */
     .pin-detail-row.memo-row { align-items: start; }
-    .detail-label { font-size: 11px; color: #94a3b8; font-weight: 500; }
+    .detail-label { font-size: 11px; color: #94a3b8; font-weight: 500; white-space: nowrap; }
     .detail-input {
       padding: 5px 8px; border-radius: 5px; border: 1px solid #e2e8f0;
       font-size: 12px; font-family: inherit; outline: none; color: #1e293b; width: 100%;
