@@ -593,12 +593,16 @@
               onchange="saveAddress('${p.id}',this.value)" onclick="event.stopPropagation()">
             ${p.addressManual ? `<span class="manual-badge" title="手修正済み">✎手修正</span>` : ""}
           </div>
-          ${p.memo ? `<div class="pin-memo">📝 ${p.memo}</div>` : ""}
           <div class="pin-detail-row">
             <span class="detail-label">地番</span>
             <input class="detail-input ${p.chibanManual ? "manual" : ""}" value="${escAttr(p.chiban)}" placeholder="未入力"
               onchange="saveChiban('${p.id}',this.value)" onclick="event.stopPropagation()">
             ${p.chibanManual ? `<span class="manual-badge" title="手修正済み">✎手修正</span>` : ""}
+          </div>
+          <div class="pin-detail-row memo-row">
+            <span class="detail-label">メモ</span>
+            <textarea class="detail-input memo-input" rows="2" placeholder="メモ（任意）"
+              onchange="saveMemo('${p.id}',this.value)" onclick="event.stopPropagation()">${escAttr(p.memo)}</textarea>
           </div>
           <div class="pin-actions">
             <a class="sv-btn" href="${gmapUrl}" target="_blank" onclick="event.stopPropagation()">🗺 地図で開く</a>
@@ -757,6 +761,17 @@
         if (!review) update.reviewReason = deleteField();
         await updateDoc(doc(db, "pins", id), update);
         showToast("住所を保存しました");
+      } catch(e) { showToast("保存に失敗しました", "error"); }
+    };
+
+    // ===== SAVE メモ =====
+    // メモは住所/地番とは独立。needsReview（赤判定）・要調査フィルタには一切関与させない。
+    // 値フィールドなので空欄は空文字で保存（住所/地番の値・index.html の memo 書込みと同方針）。
+    window.saveMemo = async (id, value) => {
+      const memo = value.trim();
+      try {
+        await updateDoc(doc(db, "pins", id), { memo });
+        showToast("メモを保存しました");
       } catch(e) { showToast("保存に失敗しました", "error"); }
     };
 
@@ -1057,17 +1072,21 @@
     .del-btn:hover { background: #fef2f2; }
 
     .pin-address { font-size: 13px; font-weight: 500; color: #1e293b; margin-bottom: 4px; line-height: 1.4; }
-    .pin-memo { font-size: 12px; color: #64748b; margin-bottom: 8px; }
 
     .pin-detail-row {
       display: grid; grid-template-columns: 32px 1fr auto; gap: 4px; align-items: center;
       margin-bottom: 8px;
     }
+    /* メモ行：複数行textareaなのでラベルを上端揃えに */
+    .pin-detail-row.memo-row { align-items: start; }
     .detail-label { font-size: 11px; color: #94a3b8; font-weight: 500; }
     .detail-input {
       padding: 5px 8px; border-radius: 5px; border: 1px solid #e2e8f0;
       font-size: 12px; font-family: inherit; outline: none; color: #1e293b; width: 100%;
     }
+    /* メモ入力：高さ可変（最低2行相当）。縦だけ伸ばせる */
+    .memo-input { resize: vertical; min-height: 40px; line-height: 1.4; box-sizing: border-box; }
+    .memo-row .detail-label { padding-top: 5px; }
     .detail-input:focus { border-color: #3b82f6; }
     .detail-input.manual { border-color: #16a34a; background: #f0fdf4; }
     .manual-badge {
