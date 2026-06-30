@@ -250,8 +250,28 @@
           gridCellCorners(cell.row, cell.col),
           { fill: fillCol, fillOpacity: 0.30, stroke: fillCol, strokeWidth: 1 }
         );
-        map.addWidget(poly); gridWidgets.push(poly);   // 表示専用：clickは付けない
+        // 色付きマス（doc存在）のみクリックで色リセット。無色マスはポリゴン自体が無い＝無反応。
+        poly.addEventListener("click", () => resetGridCell(cell));
+        map.addWidget(poly); gridWidgets.push(poly);
       });
+    }
+
+    // ===== グリッド色リセット（admin専用・1マス）=====
+    // 色付き＝調査済みマスの survey_grids doc を削除＝色を未調査に戻す。
+    // 枠は GRID から計算描画なので doc 削除でも残る。現場 index 側も onSnapshot で色が追従消去。
+    // admin は塗る側ではないので「消す」専用（無色マスにはハンドラを付けていない）。
+    async function resetGridCell(cell) {
+      const gid = "G_" + cell.row + "_" + cell.col;   // doc ID は row/col から再構成（surveyedDoc の id と一致）
+      const who = staffName(cell.surveyedBy) || "不明";
+      const when = cell.surveyedDate || "日付不明";
+      if (!confirm(`このマスの調査済みをリセットしますか？\n担当：${who}／調査日：${when}\n（枠は残り、色だけ未調査に戻ります）`)) return;
+      try {
+        await deleteDoc(doc(db, "survey_grids", gid));
+        showToast("グリッドの色をリセットしました");
+        // surveyedCells の更新・再描画は listenSurveyGrids の onSnapshot が担う（楽観更新は不要）
+      } catch (e) {
+        showToast("リセットに失敗しました（権限/通信）", "error");
+      }
     }
 
     // グリッド進捗オーバーレイの表示ON/OFF。ボタン色で状態を明示。
