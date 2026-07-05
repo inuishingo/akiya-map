@@ -164,6 +164,7 @@
     function buildJumpList() {
       const byKey = {};   // key -> { id, t, lat, lng, address, createdAt }
       lastPinDocs.forEach(({ id, data }) => {
+        if (pinBranch(data) !== myBranch) return;   // 「続きへ」は自店の履歴だけ（地図のピン表示は全店共有のまま）
         if (data.lat == null || data.lng == null) return;   // ジャンプ先が定まらない
         const key = cityWardKey(data.address);
         if (!key) return;
@@ -229,6 +230,10 @@
         const b = snap.exists() ? snap.data().branch : null;
         if (b && String(b).trim()) myBranch = b;
       } catch (e) { /* 読取NGは名古屋フォールバック */ }
+    }
+    // ピンの所属店。branch空/欠落は "名古屋" とみなす（admin.html と同一判定）。
+    function pinBranch(p) {
+      return (p.branch && String(p.branch).trim()) ? p.branch : "名古屋";
     }
 
     // ===== ステータス選択UI（グループ見出し付き2列グリッド）=====
