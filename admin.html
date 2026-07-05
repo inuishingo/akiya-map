@@ -17,7 +17,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, getDocs, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy }
+    import { getFirestore, collection, getDocs, getDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -42,6 +42,7 @@
     let searchQuery = "";       // 左リスト検索（No/住所/地番の部分一致）
     let checkedIds = new Set();
     let selectedPinId = null;
+    let myBranch = "名古屋";     // ログイン管理者の所属店(displayNames[email].branch)。読取前は名古屋を既定に。
 
     // ===== 要確認(赤)判定 — 単一真実 =====
     // 赤＝住所が要確認 or 地番が未取得。index.html と同一定義（色基準を統一）。
@@ -134,6 +135,20 @@
       return staffNameMap[email] || email || "–";
     }
 
+    // ログイン管理者自身の所属店を displayNames から取得。読取NG/未設定は "名古屋" フォールバック。
+    async function loadMyBranch(email) {
+      myBranch = "名古屋";
+      try {
+        const snap = await getDoc(doc(db, "displayNames", email));
+        const b = snap.exists() ? snap.data().branch : null;
+        if (b && String(b).trim()) myBranch = b;
+      } catch (e) { /* 読取NGは名古屋フォールバック */ }
+    }
+    // ピンの所属店。branch空/欠落は "名古屋" とみなす（移行期の二重防御。棚卸しでは欠落0件）。
+    function pinBranch(p) {
+      return (p.branch && String(p.branch).trim()) ? p.branch : "名古屋";
+    }
+
     // グループ見出し付き <optgroup> を生成（selected 指定で現在値を選択）。
     function statusOptionsHTML(selected) {
       const known = STATUS_GROUPS.map(g =>
@@ -165,6 +180,7 @@
         // 表示名・担当者色マップ（どちらも displayNames 由来）を先に構築してから購読開始
         await buildStaffNames();
         await buildStaffColors();
+        await loadMyBranch(user.email);   // 自店を確定してから購読（listenPins の絞り込みに使う）
         listenPins();
         listenSurveyGrids();   // 調査グリッドの進捗をリアルタイム購読（表示はトグルON時のみ）
       } else {
@@ -410,7 +426,9 @@
     function listenPins() {
       const q = query(collection(db, "pins"), orderBy("createdAt", "desc"));
       onSnapshot(q, snap => {
-        allPins = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        // 自店フィルタ：allPins段階で自店ピンだけに絞る（stats/ドロップダウン/地図/Excel が全て自店スコープになる）。
+        allPins = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+          .filter(p => pinBranch(p) === myBranch);
         updateStats();
         updateStaffFilter();
         updateDateFilter();
