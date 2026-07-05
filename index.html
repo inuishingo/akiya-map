@@ -18,7 +18,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, addDoc, query, where, getDocs, onSnapshot, updateDoc, deleteDoc, doc, setDoc, deleteField, serverTimestamp, runTransaction }
+    import { getFirestore, collection, addDoc, query, where, getDocs, getDoc, onSnapshot, updateDoc, deleteDoc, doc, setDoc, deleteField, serverTimestamp, runTransaction }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -37,6 +37,7 @@
     // ===== STATE =====
     let map = null;
     let currentUser = null;
+    let myBranch = "名古屋";   // ログイン調査員の所属店(displayNames[email].branch)。読取前は名古屋を既定に。
     let markers = [];
     let pinsUnsub = null;   // pins onSnapshot の解除関数（多重購読防止）
     let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（listenPinsで消さない）
@@ -219,6 +220,16 @@
     function staffName(email) {
       return staffNameMap[email] || email || "–";
     }
+    // ログイン調査員自身の所属店を displayNames から取得。ピン/グリッド作成の branch に使う。
+    // 読取NG/未設定は "名古屋" フォールバック（二重防御）。名古屋員は branch="名古屋" のまま＝挙動不変。
+    async function loadMyBranch(email) {
+      myBranch = "名古屋";
+      try {
+        const snap = await getDoc(doc(db, "displayNames", email));
+        const b = snap.exists() ? snap.data().branch : null;
+        if (b && String(b).trim()) myBranch = b;
+      } catch (e) { /* 読取NGは名古屋フォールバック */ }
+    }
 
     // ===== ステータス選択UI（グループ見出し付き2列グリッド）=====
     function renderStatusOptions() {
@@ -262,12 +273,13 @@
     window.addEventListener("online", syncOfflineQueue);
 
     // ===== AUTH =====
-    onAuthStateChanged(auth, user => {
+    onAuthStateChanged(auth, async user => {
       currentUser = user;
       if (user) {
         document.getElementById("loginScreen").style.display = "none";
         document.getElementById("mapScreen").style.display = "flex";
         document.getElementById("userLabel").textContent = user.email;
+        await loadMyBranch(user.email);   // 自店を確定してからピン/グリッド作成に入る（branch に使う）
         initMap();
         // 再ログイン時は initMap が早期returnするため、map既存ならここで購読を張り直す
         // （初回ログインは map 生成後の ready コールバック内で listenPins する）
@@ -406,7 +418,7 @@
           surveyedDate: new Date().toISOString().slice(0, 10), // 調査日
           surveyedBy: currentUser.email || "",                  // 調査担当者
           recordedAt: new Date().toISOString(),                 // 記録日時
-          branch: "名古屋",
+          branch: myBranch,                                     // ログイン調査員の所属店（loadMyBranchで確定）
           gridVersion: GRID.version,
         };
         surveyedCells[cell.id] = data;
@@ -836,7 +848,7 @@
           chibanManual: chiban !== (pendingChiban || ""),
           status,
           memo,
-          branch: "名古屋",
+          branch: myBranch,   // ログイン調査員の所属店（loadMyBranchで確定。名古屋員は"名古屋"のまま）
           createdAt: new Date().toISOString(),
         };
         if (navigator.onLine) {
