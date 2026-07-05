@@ -173,6 +173,16 @@
     // ===== AUTH =====
     onAuthStateChanged(auth, async user => {
       if (user) {
+        // ===== 管理者権限チェック =====
+        // admins コレクション(doc ID=uid)に存在しなければ調査員とみなし、admin画面を出さず index へ誘導。
+        // 判定は doc存在のみ（ドメイン判定はしない＝ルールの isAdmin と統一）。読取NG時は安全側で拒否。
+        let isAdmin = false;
+        try { isAdmin = (await getDoc(doc(db, "admins", user.uid))).exists(); } catch (e) { isAdmin = false; }
+        if (!isAdmin) {
+          alert("この画面は管理者専用です。調査アプリ（index）に移動します。");
+          location.href = "index.html";   // セッションは維持＝indexはそのまま使える
+          return;
+        }
         document.getElementById("loginScreen").style.display = "none";
         document.getElementById("adminScreen").style.display = "grid";
         document.getElementById("userLabel").textContent = user.email;
