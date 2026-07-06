@@ -118,7 +118,11 @@
       const a = (p.address || "").trim();
       return !a || a === "住所不明" || a === "（オフライン）" || a === "取得中…" || a === "住所取得中…";
     }
+    // 永久ピン（反社/NG）：周回・日付フィルタ例外／削除不可／専用色。status キーで判定。
+    const PERMANENT_COLOR = "#374151";
+    function isPermanentPin(p) { return p.status === "hansha" || p.status === "ng"; }
     function isChibanMissing(p) {
+      if (isPermanentPin(p)) return false;   // 反社/NGは地番レビュー対象外＝地番未取得でも赤にしない
       return !(p.chiban && String(p.chiban).trim());
     }
     function needsReviewNow(p) {
@@ -643,7 +647,7 @@
       const marker = new ZDC.Marker(
         new ZDC.LatLng(data.lat, data.lng),
         {
-          color: s ? s.color : FALLBACK_COLOR,
+          color: isPermanentPin(data) ? PERMANENT_COLOR : (s ? s.color : FALLBACK_COLOR),
           text: s ? s.label[0] : "?",
         }
       );
@@ -665,7 +669,8 @@
         const label = "#" + String(data.seqNo).padStart(3, "0");
         // 背景は担当者カラー（文字は白固定）。ただし要確認（住所不明 or 地番未取得）の
         // ピンは赤背景で目立たせ、事務所での要確認を促す。色基準は admin.html と統一。
-        const labelBg = isReviewFlagged(data) ? "#EF4444" : staffColor(data.email);
+        const labelBg = isReviewFlagged(data) ? "#EF4444"
+          : (isPermanentPin(data) ? PERMANENT_COLOR : staffColor(data.email));
         const seqLabel = new ZDC.UserWidget(
           new ZDC.LatLng(data.lat, data.lng),
           {
@@ -715,7 +720,8 @@
       document.getElementById("chibanInput").value = data.chiban || "";
       document.getElementById("chibanInput").placeholder = "地番";
       document.getElementById("chibanRefNote").style.display = "none";
-      document.getElementById("deleteBtn").style.display = "block";
+      // 反社/NGは永久ピン＝削除不可。編集モーダルでも削除ボタンを出さない。
+      document.getElementById("deleteBtn").style.display = isPermanentPin(data) ? "none" : "block";
       document.getElementById("pinModal").style.display = "flex";
     }
 
@@ -929,6 +935,8 @@
     // ===== DELETE PIN =====
     window.deletePin = async () => {
       if (!editingPinId) return;
+      // 二重ガード：反社/NG（永久ピン）は削除させない。
+      if (editingPinData && isPermanentPin(editingPinData)) { showToast("反社/NGピンは削除できません", "warn"); return; }
       if (!confirm("このピンを削除しますか？")) return;
       try {
         await deleteDoc(doc(db, "pins", editingPinId));

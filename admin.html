@@ -17,7 +17,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, getDocs, getDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy }
+    import { getFirestore, collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy, runTransaction }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -43,6 +43,11 @@
     let checkedIds = new Set();
     let selectedPinId = null;
     let myBranch = "名古屋";     // ログイン管理者の所属店(displayNames[email].branch)。読取前は名古屋を既定に。
+    // 反社/NG登録（管理画面専用）
+    let regMode = false;        // 地図クリックで反社/NG登録するモード
+    let regStatus = "hansha";   // 登録ステータス（hansha/ng）
+    let lastGeoLatLng = null;   // 直近ジオコード座標（住所からの登録用）
+    let regTempMarker = null;   // 一時マーカー（登録前の仮位置）
 
     // ===== 要確認(赤)判定 — 単一真実 =====
     // 赤＝住所が要確認 or 地番が未取得。index.html と同一定義（色基準を統一）。
@@ -51,7 +56,11 @@
       const a = (p.address || "").trim();
       return !a || a === "住所不明" || a === "（オフライン）" || a === "取得中…" || a === "住所取得中…";
     }
+    // 永久ピン（反社/NG）：周回・日付フィルタ例外／削除不可／専用色。status キーで判定。
+    const PERMANENT_COLOR = "#374151";
+    function isPermanentPin(p) { return p.status === "hansha" || p.status === "ng"; }
     function isChibanMissing(p) {
+      if (isPermanentPin(p)) return false;   // 反社/NGは地番レビュー対象外＝地番未取得でも赤にしない
       return !(p.chiban && String(p.chiban).trim());
     }
     function needsReviewNow(p) {
@@ -341,7 +350,11 @@
             map.addEventListener("idle", function() { if (gridMode) redrawGrid(); });
             // 用途地域/地番レイヤ：移動・ズーム後に再描画／用途地域ON時はクリックで属性取得
             map.addEventListener("idle", function(){ redrawActiveLayers(); });
-            map.addEventListener("click", function(e){ if (youtoOn && e && e.latlng) queryYouto(e.latlng); });
+            map.addEventListener("click", function(e){
+              if (!e || !e.latlng) return;
+              if (regMode) { registerFromClick(e.latlng); return; }   // 反社/NG登録モード優先
+              if (youtoOn) queryYouto(e.latlng);
+            });
             renderMapMarkers();
           },
           function() { console.error("地図初期化失敗"); }
@@ -615,7 +628,7 @@
         const sLabel = s ? s.label : (p.status || "不明");
         // 要確認（住所不明 or 地番未取得）はバッジを赤にして示す。色基準は needsReviewNow に統一。
         const review = isReviewFlagged(p);
-        const sColor = review ? "#EF4444" : (s ? s.color : FALLBACK_COLOR);
+        const sColor = review ? "#EF4444" : (isPermanentPin(p) ? PERMANENT_COLOR : (s ? s.color : FALLBACK_COLOR));
         const date = jstYmd(p.createdAt) || "–";
         const isChecked = checkedIds.has(p.id);
         const isSelected = selectedPinId === p.id;
@@ -638,7 +651,9 @@
             <span class="status-badge" style="background:${sColor};color:#fff">${sLabel}</span>
             <span class="pin-date">${date}</span>
             <span class="pin-staff">${staffName(p.email)}</span>
-            <button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>
+            ${isPermanentPin(p)
+              ? `<span class="lock-badge" title="反社/NGは永久ピン（削除不可）">🔒</span>`
+              : `<button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>`}
           </div>
           <div class="pin-detail-row">
             <span class="detail-label">所在</span>
@@ -692,6 +707,8 @@
     // ===== DELETE 1件 =====
     window.deletePin = async (id, e) => {
       e.stopPropagation();
+      const p = allPins.find(x => x.id === id);
+      if (p && isPermanentPin(p)) { showToast("反社/NGピンは削除できません", "warn"); return; }   // 二重ガード
       if (!confirm("このピンを削除しますか？")) return;
       try {
         await deleteDoc(doc(db, "pins", id));
@@ -703,10 +720,14 @@
     // ===== DELETE まとめて =====
     window.bulkDelete = async () => {
       if (checkedIds.size === 0) return;
-      if (!confirm(`${checkedIds.size}件を削除しますか？`)) return;
+      // 反社/NG（永久ピン）は一括削除からも除外（二重ガード）。
+      const ids = [...checkedIds].filter(id => { const p = allPins.find(x => x.id === id); return !(p && isPermanentPin(p)); });
+      const skipped = checkedIds.size - ids.length;
+      if (ids.length === 0) { showToast("反社/NGピンは削除できません", "warn"); return; }
+      if (!confirm(`${ids.length}件を削除しますか？${skipped ? `（反社/NG ${skipped}件は保護のため除外）` : ""}`)) return;
       try {
-        await Promise.all([...checkedIds].map(id => deleteDoc(doc(db, "pins", id))));
-        checkedIds.clear();
+        await Promise.all(ids.map(id => deleteDoc(doc(db, "pins", id))));
+        ids.forEach(id => checkedIds.delete(id));
         showToast("削除しました");
       } catch(e) { showToast("削除に失敗しました", "error"); }
     };
@@ -723,7 +744,7 @@
         // 固定連番(seqNo)はマーカー上のHTMLオーバーレイ(#001形式)で表示する（下の UserWidget）。
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
-          { color: staffColor(p.email), text: s ? s.label[0] : "?" }
+          { color: isPermanentPin(p) ? PERMANENT_COLOR : staffColor(p.email), text: s ? s.label[0] : "?" }
         );
         marker.pinId = p.id;
         marker.addEventListener("click", function() { selectPin(p.id); });
@@ -734,7 +755,8 @@
         // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
         if (p.seqNo != null) {
           // 要確認（住所不明 or 地番未取得）は赤背景で示す。現地画面(index.html)と色基準を統一。
-          const labelBg = isReviewFlagged(p) ? "#EF4444" : staffColor(p.email);
+          const labelBg = isReviewFlagged(p) ? "#EF4444"
+            : (isPermanentPin(p) ? PERMANENT_COLOR : staffColor(p.email));
           const seqLabel = new ZDC.UserWidget(
             new ZDC.LatLng(p.lat, p.lng),
             {
@@ -840,6 +862,99 @@
         showToast("住所を保存しました");
       } catch(e) { showToast("保存に失敗しました", "error"); }
     };
+
+    // ===== 住所ジオコーディング＋反社/NG登録（管理画面専用） =====
+    // 住所→座標は ZENRIN Web API forward（admin既存WMSと同じ3ヘッダ認証。word=住所→position=[lon,lat]）。
+    async function geocodeAddress(word) {
+      const url = "https://test-web.zmaps-api.com/search/address?word=" + encodeURIComponent(word);
+      const res = await fetch(url, { headers: { "x-api-key": WMS_KEY, "Authorization": "referer" } });
+      const it = (await res.json()).result?.item?.[0];
+      if (!it || !Array.isArray(it.position)) return null;
+      return { lng: it.position[0], lat: it.position[1], address: it.address || word };
+    }
+
+    // 入力住所へ地図移動＋一時マーカー（req1・汎用の地図移動機能）。
+    window.geocodeJump = async () => {
+      const el = document.getElementById("geoInput");
+      const word = (el?.value || "").trim();
+      if (!word) return;
+      showToast("住所を検索中…");
+      let g = null;
+      try { g = await geocodeAddress(word); } catch(e) { g = null; }
+      if (!g) { showToast("住所が見つかりません", "error"); return; }
+      lastGeoLatLng = { lat: g.lat, lng: g.lng, address: g.address };
+      if (map) {
+        map.setCenter(new ZDC.LatLng(g.lat, g.lng));
+        map.setZoom(Math.max(map.getZoom(), 17));
+        if (regTempMarker) { try { map.removeWidget(regTempMarker); } catch(e){} }
+        regTempMarker = new ZDC.Marker(new ZDC.LatLng(g.lat, g.lng), { color: "#F59E0B", text: "★" });
+        map.addWidget(regTempMarker);
+      }
+      showToast("移動：" + g.address);
+    };
+
+    window.setRegStatus = (v) => { if (v === "hansha" || v === "ng") regStatus = v; };
+
+    // 反社/NGピンの採番（index.html と同じ meta/counter 方式・欠番あり運用）。
+    async function nextSeqNo() {
+      const counterRef = doc(db, "meta", "counter");
+      let seq;
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(counterRef);
+        const next = snap.exists() ? (Number(snap.data().next) || 1) : 1;
+        seq = next;
+        tx.set(counterRef, { next: next + 1 }, { merge: true });
+      });
+      return seq;
+    }
+
+    // 反社/NG永久ピンを作成（住所登録・クリック登録の共通処理）。座標が最優先・住所はおまけ。
+    async function createPermanentPin(lat, lng, address) {
+      if (regStatus !== "hansha" && regStatus !== "ng") return;
+      const label = STATUS[regStatus]?.label || regStatus;
+      if (!confirm(`この位置に「${label}」ピンを登録しますか？（永久ピン・削除不可）\n${address || "（住所なし）"}`)) return;
+      try {
+        const pinData = {
+          uid: auth.currentUser?.uid || "",
+          email: auth.currentUser?.email || "",
+          lat, lng,
+          address: address || "",
+          chiban: "",
+          status: regStatus,
+          memo: "",
+          branch: myBranch,
+          needsReview: false,
+          createdAt: new Date().toISOString(),
+          seqNo: await nextSeqNo(),
+        };
+        await addDoc(collection(db, "pins"), pinData);   // onSnapshot が拾って自動再描画
+        showToast(`「${label}」ピンを登録しました`);
+      } catch(e) { showToast("登録に失敗しました", "error"); console.error("createPermanentPin", e); }
+    }
+
+    // 方法A：住所ジオコード座標に登録
+    window.registerFromAddress = async () => {
+      if (!lastGeoLatLng) { showToast("先に住所で地図へ移動してください", "warn"); return; }
+      await createPermanentPin(lastGeoLatLng.lat, lastGeoLatLng.lng, lastGeoLatLng.address);
+    };
+
+    // 方法B：地図クリック登録モード ON/OFF
+    window.toggleRegMode = (on) => {
+      regMode = !!on;
+      const btn = document.getElementById("regModeBtn");
+      if (btn) { btn.classList.toggle("active", regMode); btn.textContent = regMode ? "📍クリック登録：ON" : "📍クリック登録：OFF"; }
+      const mapEl = document.getElementById("map"); if (mapEl) mapEl.style.cursor = regMode ? "crosshair" : "";
+    };
+
+    // 方法Bのクリック時：reverseで住所補完（失敗しても座標優先で登録は継続）。
+    async function registerFromClick(latlng) {
+      let address = "";
+      try {
+        const r = await fetch(`https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`);
+        address = (await r.json()).result?.item?.[0]?.address || "";
+      } catch(e) { address = ""; }   // reverse失敗は無視（座標が最優先・住所はおまけ）
+      await createPermanentPin(latlng.lat, latlng.lng, address);
+    }
 
     // ===== SAVE 事務員メモ（adminMemo）=====
     // 調査員メモ(memo)とは別フィールド。adminMemo だけを更新し、memo には絶対に触れない
@@ -1199,6 +1314,17 @@
 
     .right-panel { display: flex; flex-direction: column; position: relative; }
     #map { flex: 1; width: 100%; }
+    /* 反社/NG登録ツールバー（管理画面専用） */
+    .admin-reg-bar { padding: 8px 10px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; flex-direction: column; gap: 6px; }
+    .reg-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .geo-input { flex: 1; min-width: 180px; padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; font-family: inherit; outline: none; }
+    .geo-input:focus { border-color: #3b82f6; }
+    .reg-label { font-size: 12px; font-weight: 600; color: #374151; white-space: nowrap; }
+    .reg-radio { font-size: 13px; color: #1e293b; display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
+    .reg-btn { padding: 6px 11px; border-radius: 6px; background: #374151; color: #fff; border: 1px solid #1f2937; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; font-family: inherit; }
+    .reg-btn:hover { background: #1f2937; }
+    .reg-toggle.active { background: #ef4444; border-color: #dc2626; }
+    .lock-badge { font-size: 13px; line-height: 1; padding: 2px 4px; cursor: default; }
 
     .toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -1291,6 +1417,21 @@
   </div>
 
   <div class="right-panel">
+    <!-- 反社/NG登録＋住所ジャンプ（管理画面専用。調査員側index.htmlには出さない） -->
+    <div class="admin-reg-bar">
+      <div class="reg-row">
+        <input id="geoInput" class="geo-input" type="search" placeholder="住所を入力して地図へ移動（管理者用）"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();geocodeJump();}" autocomplete="off">
+        <button class="reg-btn" onclick="geocodeJump()">🔎 移動</button>
+      </div>
+      <div class="reg-row">
+        <span class="reg-label">反社/NG登録</span>
+        <label class="reg-radio"><input type="radio" name="regStatus" value="hansha" checked onchange="setRegStatus('hansha')"> 反社</label>
+        <label class="reg-radio"><input type="radio" name="regStatus" value="ng" onchange="setRegStatus('ng')"> NG</label>
+        <button class="reg-btn" onclick="registerFromAddress()">この住所位置に登録</button>
+        <button id="regModeBtn" class="reg-btn reg-toggle" onclick="toggleRegMode(!regMode)">📍クリック登録：OFF</button>
+      </div>
+    </div>
     <div id="map"></div>
     <div id="youtoInfo" class="youto-info" style="display:none"></div>
   </div>
