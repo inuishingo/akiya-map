@@ -17,8 +17,7 @@ service cloud.firestore {
       allow update: if isSignedIn()
                     && (resource.data.uid == request.auth.uid || isAdmin());
       allow delete: if isSignedIn()
-                    && (resource.data.uid == request.auth.uid || isAdmin())
-                    && !(resource.data.get('status', '') in ['hansha', 'ng']);   // 反社/NGは永久ピン＝アプリから削除不可（訂正はコンソールでAdminがバイパス削除）。status欠落docは既定''で従来どおり削除可
+                    && (resource.data.uid == request.auth.uid || isAdmin());
     }
 
     match /meta/{docId} {

@@ -720,8 +720,7 @@
       document.getElementById("chibanInput").value = data.chiban || "";
       document.getElementById("chibanInput").placeholder = "地番";
       document.getElementById("chibanRefNote").style.display = "none";
-      // 反社/NGは永久ピン＝削除不可。編集モーダルでも削除ボタンを出さない。
-      document.getElementById("deleteBtn").style.display = isPermanentPin(data) ? "none" : "block";
+      document.getElementById("deleteBtn").style.display = "block";
       document.getElementById("pinModal").style.display = "flex";
     }
 
@@ -935,8 +934,6 @@
     // ===== DELETE PIN =====
     window.deletePin = async () => {
       if (!editingPinId) return;
-      // 二重ガード：反社/NG（永久ピン）は削除させない。
-      if (editingPinData && isPermanentPin(editingPinData)) { showToast("反社/NGピンは削除できません", "warn"); return; }
       if (!confirm("このピンを削除しますか？")) return;
       try {
         await deleteDoc(doc(db, "pins", editingPinId));

@@ -651,9 +651,7 @@
             <span class="status-badge" style="background:${sColor};color:#fff">${sLabel}</span>
             <span class="pin-date">${date}</span>
             <span class="pin-staff">${staffName(p.email)}</span>
-            ${isPermanentPin(p)
-              ? `<span class="lock-badge" title="反社/NGは永久ピン（削除不可）">🔒</span>`
-              : `<button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>`}
+            <button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>
           </div>
           <div class="pin-detail-row">
             <span class="detail-label">所在</span>
@@ -707,8 +705,6 @@
     // ===== DELETE 1件 =====
     window.deletePin = async (id, e) => {
       e.stopPropagation();
-      const p = allPins.find(x => x.id === id);
-      if (p && isPermanentPin(p)) { showToast("反社/NGピンは削除できません", "warn"); return; }   // 二重ガード
       if (!confirm("このピンを削除しますか？")) return;
       try {
         await deleteDoc(doc(db, "pins", id));
@@ -723,8 +719,8 @@
       // 反社/NG（永久ピン）は一括削除からも除外（二重ガード）。
       const ids = [...checkedIds].filter(id => { const p = allPins.find(x => x.id === id); return !(p && isPermanentPin(p)); });
       const skipped = checkedIds.size - ids.length;
-      if (ids.length === 0) { showToast("反社/NGピンは削除できません", "warn"); return; }
-      if (!confirm(`${ids.length}件を削除しますか？${skipped ? `（反社/NG ${skipped}件は保護のため除外）` : ""}`)) return;
+      if (ids.length === 0) { showToast("反社/NGは一括削除の対象外です（個別に🗑で削除してください）", "warn"); return; }
+      if (!confirm(`${ids.length}件を削除しますか？${skipped ? `（反社/NG ${skipped}件は一括対象外・個別削除は可）` : ""}`)) return;
       try {
         await Promise.all(ids.map(id => deleteDoc(doc(db, "pins", id))));
         ids.forEach(id => checkedIds.delete(id));
@@ -873,6 +869,11 @@
       return { lng: it.position[0], lat: it.position[1], address: it.address || word };
     }
 
+    // 一時マーカー(登録前の仮位置★)を消す。登録成功/キャンセル/モードOFF/住所未ヒットで呼ぶ。
+    function clearRegTempMarker() {
+      if (regTempMarker) { try { map.removeWidget(regTempMarker); } catch(e){} regTempMarker = null; }
+    }
+
     // 入力住所へ地図移動＋一時マーカー（req1・汎用の地図移動機能）。
     window.geocodeJump = async () => {
       const el = document.getElementById("geoInput");
@@ -881,12 +882,12 @@
       showToast("住所を検索中…");
       let g = null;
       try { g = await geocodeAddress(word); } catch(e) { g = null; }
-      if (!g) { showToast("住所が見つかりません", "error"); return; }
+      if (!g) { clearRegTempMarker(); showToast("住所が見つかりません", "error"); return; }
       lastGeoLatLng = { lat: g.lat, lng: g.lng, address: g.address };
       if (map) {
         map.setCenter(new ZDC.LatLng(g.lat, g.lng));
         map.setZoom(Math.max(map.getZoom(), 17));
-        if (regTempMarker) { try { map.removeWidget(regTempMarker); } catch(e){} }
+        clearRegTempMarker();
         regTempMarker = new ZDC.Marker(new ZDC.LatLng(g.lat, g.lng), { color: "#F59E0B", text: "★" });
         map.addWidget(regTempMarker);
       }
@@ -912,7 +913,7 @@
     async function createPermanentPin(lat, lng, address) {
       if (regStatus !== "hansha" && regStatus !== "ng") return;
       const label = STATUS[regStatus]?.label || regStatus;
-      if (!confirm(`この位置に「${label}」ピンを登録しますか？（永久ピン・削除不可）\n${address || "（住所なし）"}`)) return;
+      if (!confirm(`この位置に「${label}」ピンを登録しますか？\n${address || "（住所なし）"}`)) { clearRegTempMarker(); return; }
       try {
         const pinData = {
           uid: auth.currentUser?.uid || "",
@@ -928,6 +929,7 @@
           seqNo: await nextSeqNo(),
         };
         await addDoc(collection(db, "pins"), pinData);   // onSnapshot が拾って自動再描画
+        clearRegTempMarker();
         showToast(`「${label}」ピンを登録しました`);
       } catch(e) { showToast("登録に失敗しました", "error"); console.error("createPermanentPin", e); }
     }
@@ -944,6 +946,7 @@
       const btn = document.getElementById("regModeBtn");
       if (btn) { btn.classList.toggle("active", regMode); btn.textContent = regMode ? "📍クリック登録：ON" : "📍クリック登録：OFF"; }
       const mapEl = document.getElementById("map"); if (mapEl) mapEl.style.cursor = regMode ? "crosshair" : "";
+      if (!regMode) clearRegTempMarker();   // モードOFFで仮位置★を残さない
     };
 
     // 方法Bのクリック時：reverseで住所補完（失敗しても座標優先で登録は継続）。
@@ -1324,7 +1327,6 @@
     .reg-btn { padding: 6px 11px; border-radius: 6px; background: #374151; color: #fff; border: 1px solid #1f2937; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; font-family: inherit; }
     .reg-btn:hover { background: #1f2937; }
     .reg-toggle.active { background: #ef4444; border-color: #dc2626; }
-    .lock-badge { font-size: 13px; line-height: 1; padding: 2px 4px; cursor: default; }
 
     .toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
