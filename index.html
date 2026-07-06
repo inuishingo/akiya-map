@@ -45,6 +45,7 @@
     let watchId = null;          // watchPosition のID（二重起動防止）
     let pendingLatLng = null;
     let pendingChiban = "";
+    let pendingChibanRef = false;   // 直近の自動地番が「参考地番(近傍筆)・要確認」か
     let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue") || "[]");
     let editingPinId = null;
     let editingPinData = null;
@@ -122,6 +123,11 @@
     }
     function needsReviewNow(p) {
       return isAddrUnknown(p) || isChibanMissing(p);
+    }
+    // 表示専用: 計算上の要確認(住所不明/地番未取得)に加え、保存済 needsReview(参考地番等)も赤に。
+    // ※再計算・書き戻し(手補正)は needsReviewNow のまま。表示・フィルタだけがこの拡張を使う。
+    function isReviewFlagged(p) {
+      return needsReviewNow(p) || p.needsReview === true;
     }
 
     // ===== 市区「続きへ」ジャンプ =====
@@ -659,7 +665,7 @@
         const label = "#" + String(data.seqNo).padStart(3, "0");
         // 背景は担当者カラー（文字は白固定）。ただし要確認（住所不明 or 地番未取得）の
         // ピンは赤背景で目立たせ、事務所での要確認を促す。色基準は admin.html と統一。
-        const labelBg = needsReviewNow(data) ? "#EF4444" : staffColor(data.email);
+        const labelBg = isReviewFlagged(data) ? "#EF4444" : staffColor(data.email);
         const seqLabel = new ZDC.UserWidget(
           new ZDC.LatLng(data.lat, data.lng),
           {
@@ -690,6 +696,7 @@
       document.getElementById("memo").value = "";
       document.getElementById("chibanInput").value = "";
       document.getElementById("chibanInput").placeholder = "地番取得中…";
+      document.getElementById("chibanRefNote").style.display = "none";
       document.getElementById("deleteBtn").style.display = "none";
       document.getElementById("pinModal").style.display = "flex";
       reverseGeocode(pendingLatLng);
@@ -707,6 +714,7 @@
       document.getElementById("addressLabel").textContent = data.address || "取得中…";
       document.getElementById("chibanInput").value = data.chiban || "";
       document.getElementById("chibanInput").placeholder = "地番";
+      document.getElementById("chibanRefNote").style.display = "none";
       document.getElementById("deleteBtn").style.display = "block";
       document.getElementById("pinModal").style.display = "flex";
     }
@@ -715,6 +723,8 @@
       document.getElementById("pinModal").style.display = "none";
       pendingLatLng = null;
       pendingChiban = "";
+      pendingChibanRef = false;
+      document.getElementById("chibanRefNote").style.display = "none";
       editingPinId = null;
       editingPinData = null;
     };
@@ -737,15 +747,39 @@
     // ===== 地番取得（ZENRIN reverse + bm）=====
     // 親番は reverse(point-in-polygon)を信頼し detail2 から採用（reverseが付ける枝番は誤り得るので捨てる）。
     // 枝番は bm の「同一親番の候補(bare親番＋枝番)」から最近傍で確定（点に最も近い筆＝196/59-2等）。
-    //   ① detail1(街区)が入る住居表示地区は detail2=号で地番にならないため空欄+要確認に倒す。
+    //   ① 住居表示地区/地番未確定点(reverseが親番を出せない)は【方針B】bm最近傍筆(≤15m)を
+    //      参考地番として採用し pendingChibanRef=true(要確認)。号は使わず筆自身の地番を使う。閾値超は空欄。
     //   ② 親番内に近接する複数枝番がある地点(例#609)は距離で割れ得る＝据置・要確認運用。
     // 数値は全角で返るため NFKC で半角化。取得結果は pendingChiban（自動値の基準）に
     // 保持しつつ、新規追加時は地番入力欄(#chibanInput)へ反映して現場で修正できるようにする。
     async function fetchChiban(latlng) {
       pendingChiban = "";
+      pendingChibanRef = false;
       let manualReason = "";   // 自動取得できない理由（UI表示用）
+      const REF_MAX_DIST = 15; // 参考地番(近傍筆)を採用する最大距離(m)。実ピン9点(最大13.4m)で確定。
       const norm = (s) => (typeof s === "string" ? s.normalize("NFKC").trim() : "");
       const input = document.getElementById("chibanInput");
+      const refNote = document.getElementById("chibanRefNote");
+      // 住居表示地区/地番未確定点用: bm最近傍筆の地番(detail2-branch2)を参考地番として返す。
+      // reverse検証なし・号は使わない(筆自身のdetail2を使う)ので号→地番の事故は起きない。
+      // 閾値内なら {chiban}、圏外/失敗はnull。
+      const refFromNearestParcel = async () => {
+        try {
+          const bmRes = await fetch(
+            `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`
+          );
+          const items = (await bmRes.json()).result?.item;
+          if (!Array.isArray(items) || !items.length) return null;
+          const best = items
+            .filter((x) => typeof x.distance === "number")
+            .sort((a, b) => a.distance - b.distance)[0];
+          if (!best || best.distance > REF_MAX_DIST) return null;
+          const ban = norm(best.address_detail2);
+          if (!ban) return null;
+          const eda = norm(best.address_branch2);
+          return { chiban: eda ? `${ban}-${eda}` : ban };
+        } catch { return null; }
+      };
       try {
         // --- 親番: reverse（地番レベル TBN のときのみ有効）---
         const revRes = await fetch(
@@ -753,10 +787,16 @@
         );
         const revJson = await revRes.json();
         const revItem = revJson.result?.item?.[0];
-        if (!revItem || revItem.address_level !== "TBN") return; // 地番が確定しない地点
-        // ①住居表示実施地区ガード：detail1(街区)が入る地点は detail2 が地番でなく住居番号(号)。
-        // 号を地番にしないため自動取得せず手入力に委ねる（例: 元町8-4 → detail2="4"）。
-        if (norm(revItem.address_detail1)) { manualReason = "住居表示地区"; return; }
+        // 方針B: reverseで親番が出せない点は近傍筆を参考地番(要確認)に倒す。
+        //   level!=TBN(GIK/AZC等)＝号/街区までしか出ない, TBN+detail1＝detail2は号で地番でない。
+        //   号は使わず bm最近傍筆自身の地番を採用(号→地番の事故なし)。閾値超は空欄(手入力)。
+        const noOyaban = !revItem || revItem.address_level !== "TBN" || norm(revItem.address_detail1);
+        if (noOyaban) {
+          manualReason = "住居表示地区";
+          const ref = await refFromNearestParcel();
+          if (ref) { pendingChiban = ref.chiban; pendingChibanRef = true; }
+          return;
+        }
         // 親番のみ採用：reverse が付ける枝番は誤り得る（例③ 196-2/213-2）ので "-" 以降を捨てる。
         const oyaban = norm(revItem.address_detail2).split("-")[0];
         if (!oyaban) return;
@@ -791,6 +831,7 @@
           input.value = pendingChiban;
           input.placeholder = pendingChiban ? "地番"
             : (manualReason ? `地番（${manualReason}・要手入力）` : "地番（自動取得できず・手入力）");
+          if (refNote) refNote.style.display = (pendingChiban && pendingChibanRef) ? "block" : "none";
         }
       }
     }
@@ -856,6 +897,12 @@
           branch: myBranch,   // ログイン調査員の所属店（loadMyBranchで確定。名古屋員は"名古屋"のまま）
           createdAt: new Date().toISOString(),
         };
+        // 参考地番(近傍筆・住居表示地区)を現場でそのまま採用＝要確認フラグを立てる。
+        // 手修正して確定した場合(chibanManual=true)は対象外＝確定扱い。
+        if (pendingChibanRef && chiban && chiban === pendingChiban) {
+          pinData.needsReview = true;
+          pinData.reviewReason = "参考地番・要確認";
+        }
         if (navigator.onLine) {
           try {
             // 固定連番を採番してから保存（オンライン時のみ。オフラインは同期時に採番）。
@@ -1200,6 +1247,7 @@
     <div class="field-label">地番（自動取得・表札を見て修正可）</div>
     <input id="chibanInput" type="text" placeholder="地番"
       style="width:100%;box-sizing:border-box;padding:12px;border:1px solid #d1d5db;border-radius:10px;font-size:16px;font-family:inherit;margin-bottom:4px;">
+    <div id="chibanRefNote" style="display:none;color:#EF4444;font-size:12px;font-weight:600;margin-bottom:4px;">参考地番（近傍筆）・要確認</div>
     <div class="field-label">ステータス</div>
     <div id="statusGroups"></div>
     <div class="field-label">メモ</div>

@@ -57,6 +57,11 @@
     function needsReviewNow(p) {
       return isAddrUnknown(p) || isChibanMissing(p);
     }
+    // 表示専用: 計算上の要確認に加え、保存済 needsReview(参考地番等)も赤に。
+    // ※再計算・書き戻し(手補正)は needsReviewNow のまま。表示・フィルタだけがこの拡張を使う。
+    function isReviewFlagged(p) {
+      return needsReviewNow(p) || p.needsReview === true;
+    }
     // input value="" 属性に安全に埋めるための最小エスケープ
     function escAttr(s) {
       return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
@@ -541,7 +546,7 @@
     function filtered() {
       const q = searchQuery.trim().toLowerCase();
       return allPins.filter(p => {
-        const reviewOk = !reviewOnly || needsReviewNow(p);   // 要調査のみON時は赤ラベルだけ
+        const reviewOk = !reviewOnly || isReviewFlagged(p);   // 要調査のみON時は赤ラベルだけ
         const staffOk  = activeStaffFilter  === "all" || p.email === activeStaffFilter;
         const dateOk   = activeDateFilter   === "all" || jstYmd(p.createdAt) === activeDateFilter;
         const searchOk = matchesSearch(p, q);   // 既存フィルタの最後に重ねがけ（AND）
@@ -609,7 +614,7 @@
         const s = STATUS[p.status];
         const sLabel = s ? s.label : (p.status || "不明");
         // 要確認（住所不明 or 地番未取得）はバッジを赤にして示す。色基準は needsReviewNow に統一。
-        const review = needsReviewNow(p);
+        const review = isReviewFlagged(p);
         const sColor = review ? "#EF4444" : (s ? s.color : FALLBACK_COLOR);
         const date = jstYmd(p.createdAt) || "–";
         const isChecked = checkedIds.has(p.id);
@@ -725,7 +730,7 @@
         // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
         if (p.seqNo != null) {
           // 要確認（住所不明 or 地番未取得）は赤背景で示す。現地画面(index.html)と色基準を統一。
-          const labelBg = needsReviewNow(p) ? "#EF4444" : staffColor(p.email);
+          const labelBg = isReviewFlagged(p) ? "#EF4444" : staffColor(p.email);
           const seqLabel = new ZDC.UserWidget(
             new ZDC.LatLng(p.lat, p.lng),
             {
@@ -800,7 +805,9 @@
     window.saveAddress = async (id, value) => {
       const p = allPins.find(x => x.id === id) || {};
       const address = value.trim();
-      const review = needsReviewNow({ ...p, address });
+      // 参考地番(要確認)は住所補正だけでは確定しない＝赤を維持。地番確定時のみ解除。
+      const isRefChiban = p.reviewReason === "参考地番・要確認" && p.chibanManual !== true;
+      const review = needsReviewNow({ ...p, address }) || isRefChiban;
       try {
         const update = {
           address,
