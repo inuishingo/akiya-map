@@ -59,7 +59,8 @@
     let surveyedCells = {};           // gridId -> Firestoreミラー（調査済みマス）
     const gridToggleLock = new Set(); // 同一マスの二重トグル防止（map/polygon両クリック対策）
 
-    // 全13種。グループ（建物系→土地系→その他）順。色は確定値。
+    // 全12種。グループ（建物系→土地系→その他）順。色は確定値。
+    // ※他社所有/媒介は「状態」でなく属性のため STATUS ではなく pin.otherCompany(boolean) で持つ。
     // color は地図ピンの色分けに使用（削除しない）。emoji はモーダルのボタン表示用。
     const STATUS = {
       // 建物系
@@ -74,15 +75,14 @@
       zasshu:  { label: "雑種地", color: "#84CC16", text: "#fff", emoji: "🌿" },
       parking: { label: "駐車場", color: "#14B8A6", text: "#fff", emoji: "🅿️" },
       tahata:  { label: "田・畑", color: "#65A30D", text: "#fff", emoji: "🌾" },
-      // その他（反社/NG=永久ピン ＋ 他社物件=非永久）
-      hansha:    { label: "反社",     color: "#1F2937", text: "#fff", emoji: "🚫" },
-      ng:        { label: "NG",       color: "#6B7280", text: "#fff", emoji: "⛔" },
-      gyoubutsu: { label: "他社物件", color: "#CA8A04", text: "#fff", emoji: "🏢" },
+      // その他（反社/NG=永久ピン）
+      hansha:  { label: "反社", color: "#1F2937", text: "#fff", emoji: "🚫" },
+      ng:      { label: "NG",   color: "#6B7280", text: "#fff", emoji: "⛔" },
     };
     const STATUS_GROUPS = [
       { label: "建物系", keys: ["akiya", "chikuko", "haikyo", "renpei", "shueki", "souko"] },
       { label: "土地系", keys: ["sarachi", "zasshu", "parking", "tahata"] },
-      { label: "その他", keys: ["hansha", "ng", "gyoubutsu"] },
+      { label: "その他", keys: ["hansha", "ng"] },
     ];
     // 未定義ステータス（旧データ等）のフォールバック色
     const FALLBACK_COLOR = "#9CA3AF";
@@ -672,6 +672,9 @@
         // ピンは赤背景で目立たせ、事務所での要確認を促す。色基準は admin.html と統一。
         const labelBg = isReviewFlagged(data) ? "#EF4444"
           : (isPermanentPin(data) ? PERMANENT_COLOR : staffColor(data.email));
+        // 他社物件フラグは背景色（＝色優先順位）を上書きせず、🏢＋黄土枠で重畳表示（状態と両方見える）。
+        const oc = data.otherCompany === true;
+        const labelBorder = oc ? "2px solid #CA8A04" : "1px solid rgba(255,255,255,.65)";
         const seqLabel = new ZDC.UserWidget(
           new ZDC.LatLng(data.lat, data.lng),
           {
@@ -680,9 +683,9 @@
               + 'padding:1px 6px;border-radius:9px;'
               + 'background:' + labelBg + ';color:#fff;'
               + 'font-size:11px;font-weight:700;line-height:1.6;'
-              + 'border:1px solid rgba(255,255,255,.65);'
+              + 'border:' + labelBorder + ';'
               + 'box-shadow:0 1px 3px rgba(0,0,0,.35);'
-              + 'pointer-events:none;">' + label + '</div>',
+              + 'pointer-events:none;">' + label + (oc ? ' 🏢' : '') + '</div>',
             offset: new ZDC.Point(0, -58),
             propagation: true,
           }
@@ -699,6 +702,7 @@
       editingPinData = null;
       document.getElementById("modalTitle").textContent = "ピンを追加";
       setStatusRadio("akiya");
+      document.getElementById("otherCompanyCheck").checked = false;
       document.getElementById("memo").value = "";
       document.getElementById("chibanInput").value = "";
       document.getElementById("chibanInput").placeholder = "地番取得中…";
@@ -716,6 +720,7 @@
       pendingLatLng = { lat: data.lat, lng: data.lng };
       document.getElementById("modalTitle").textContent = "ピンを編集";
       setStatusRadio(data.status);
+      document.getElementById("otherCompanyCheck").checked = data.otherCompany === true;
       document.getElementById("memo").value = data.memo || "";
       document.getElementById("addressLabel").textContent = data.address || "取得中…";
       document.getElementById("chibanInput").value = data.chiban || "";
@@ -865,6 +870,7 @@
       if (!status) { showToast("ステータスを選択してください", "warn"); return; }
       const memo   = document.getElementById("memo").value.trim();
       const address = document.getElementById("addressLabel").textContent;
+      const otherCompany = document.getElementById("otherCompanyCheck").checked;   // 状態と独立の属性
       const btn = document.getElementById("saveBtn");
       btn.disabled = true;
       btn.textContent = "保存中…";
@@ -873,7 +879,7 @@
 
       if (editingPinId) {
         try {
-          const update = { status, memo, address };
+          const update = { status, memo, address, otherCompany };
           // 地番を手修正したときだけ chiban を更新し、手修正フラグ(chibanManual)を
           // 立てて要確認フラグを解除する（手修正は自動再取得より優先）。
           if (chiban !== (editingPinData?.chiban || "")) {
@@ -900,6 +906,7 @@
           chibanManual: chiban !== (pendingChiban || ""),
           status,
           memo,
+          otherCompany,       // 他社所有/媒介の属性（状態とは独立・boolean）
           branch: myBranch,   // ログイン調査員の所属店（loadMyBranchで確定。名古屋員は"名古屋"のまま）
           createdAt: new Date().toISOString(),
         };
@@ -1174,6 +1181,11 @@
     }
     .field-label { font-size: 12px; color: #6b7280; font-weight: 500; margin-bottom: 6px; }
     .status-group-label { font-size: 12px; color: #6b7280; font-weight: 700; margin: 2px 0 6px; }
+    /* 他社物件チェック（ステータスとは独立の属性）。黄土色アクセントで識別。 */
+    .oc-check { display:flex; align-items:center; gap:8px; margin:4px 0 14px;
+      padding:10px 12px; border:1px solid #374151; border-radius:10px;
+      background:#111827; color:#e5e7eb; font-size:14px; font-weight:600; cursor:pointer; }
+    .oc-check input { width:18px; height:18px; accent-color:#CA8A04; cursor:pointer; }
     .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
     .status-option { display: none; }
     .status-label {
@@ -1256,6 +1268,11 @@
     <div id="chibanRefNote" style="display:none;color:#EF4444;font-size:12px;font-weight:600;margin-bottom:4px;">参考地番（近傍筆）・要確認</div>
     <div class="field-label">ステータス</div>
     <div id="statusGroups"></div>
+    <!-- 他社物件はステータス（排他）と独立の属性。状態(空家/更地等)に重ねてチェックする。 -->
+    <label class="oc-check">
+      <input type="checkbox" id="otherCompanyCheck">
+      <span>🏢 他社物件（他社所有・媒介中）</span>
+    </label>
     <div class="field-label">メモ</div>
     <textarea id="memo" placeholder="気づいたことを入力（任意）"></textarea>
     <div class="modal-actions">
