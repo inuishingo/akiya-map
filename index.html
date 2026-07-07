@@ -59,7 +59,7 @@
     let surveyedCells = {};           // gridId -> Firestoreミラー（調査済みマス）
     const gridToggleLock = new Set(); // 同一マスの二重トグル防止（map/polygon両クリック対策）
 
-    // 全12種。グループ（建物系→土地系→その他）順。色は確定値。
+    // 全12種。グループ（建物系→土地系→NG系）順。色は確定値。
     // ※他社所有/媒介は「状態」でなく属性のため STATUS ではなく pin.otherCompany(boolean) で持つ。
     // color は地図ピンの色分けに使用（削除しない）。emoji はモーダルのボタン表示用。
     const STATUS = {
@@ -75,14 +75,14 @@
       zasshu:  { label: "雑種地", color: "#84CC16", text: "#fff", emoji: "🌿" },
       parking: { label: "駐車場", color: "#14B8A6", text: "#fff", emoji: "🅿️" },
       tahata:  { label: "田・畑", color: "#65A30D", text: "#fff", emoji: "🌾" },
-      // その他（反社/NG=永久ピン）
+      // NG系（反社/NG=永久ピン）
       hansha:  { label: "反社", color: "#1F2937", text: "#fff", emoji: "🚫" },
       ng:      { label: "NG",   color: "#6B7280", text: "#fff", emoji: "⛔" },
     };
     const STATUS_GROUPS = [
       { label: "建物系", keys: ["akiya", "chikuko", "haikyo", "renpei", "shueki", "souko"] },
       { label: "土地系", keys: ["sarachi", "zasshu", "parking", "tahata"] },
-      { label: "その他", keys: ["hansha", "ng"] },
+      { label: "NG系", keys: ["hansha", "ng"] },
     ];
     // 未定義ステータス（旧データ等）のフォールバック色
     const FALLBACK_COLOR = "#9CA3AF";
@@ -248,8 +248,16 @@
     }
 
     // ===== ステータス選択UI（グループ見出し付き2列グリッド）=====
+    // 他社物件チェックは「状態と独立の属性」。土地系とNG系の間（＝反社/NGを含むグループの直前）に挟む。
     function renderStatusOptions() {
-      const html = STATUS_GROUPS.map(g => `
+      const ocHtml = `
+        <label class="oc-check">
+          <input type="checkbox" id="otherCompanyCheck">
+          <span>🏢 他社物件（他社看板）</span>
+        </label>`;
+      const html = STATUS_GROUPS.map(g => {
+        const isNgGroup = g.keys.includes("hansha") || g.keys.includes("ng");   // 反社/NGを含むグループ
+        const groupHtml = `
         <div class="status-group-label">${g.label}</div>
         <div class="status-grid">
           ${g.keys.map(k => {
@@ -257,7 +265,9 @@
             return `<div><input class="status-option" type="radio" name="status" id="s-${k}" value="${k}">
               <label class="status-label" for="s-${k}" style="--c:${s.color}"><span class="emoji">${s.emoji}</span>${s.label}</label></div>`;
           }).join("")}
-        </div>`).join("");
+        </div>`;
+        return (isNgGroup ? ocHtml : "") + groupHtml;
+      }).join("");
       document.getElementById("statusGroups").innerHTML = html;
     }
     function setStatusRadio(key) {
@@ -1268,11 +1278,6 @@
     <div id="chibanRefNote" style="display:none;color:#EF4444;font-size:12px;font-weight:600;margin-bottom:4px;">参考地番（近傍筆）・要確認</div>
     <div class="field-label">ステータス</div>
     <div id="statusGroups"></div>
-    <!-- 他社物件はステータス（排他）と独立の属性。状態(空家/更地等)に重ねてチェックする。 -->
-    <label class="oc-check">
-      <input type="checkbox" id="otherCompanyCheck">
-      <span>🏢 他社物件（他社所有・媒介中）</span>
-    </label>
     <div class="field-label">メモ</div>
     <textarea id="memo" placeholder="気づいたことを入力（任意）"></textarea>
     <div class="modal-actions">

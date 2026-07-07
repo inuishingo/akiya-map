@@ -99,14 +99,14 @@
       zasshu:  { label: "雑種地", color: "#84CC16" },
       parking: { label: "駐車場", color: "#14B8A6" },
       tahata:  { label: "田・畑", color: "#65A30D" },
-      // その他（反社/NG=永久ピン）
+      // NG系（反社/NG=永久ピン）
       hansha:  { label: "反社", color: "#1F2937" },
       ng:      { label: "NG",   color: "#6B7280" },
     };
     const STATUS_GROUPS = [
       { key: "building", label: "建物系", keys: ["akiya", "chikuko", "haikyo", "renpei", "shueki", "souko"] },
       { key: "land",     label: "土地系", keys: ["sarachi", "zasshu", "parking", "tahata"] },
-      { key: "ng",       label: "その他", keys: ["hansha", "ng"] },  // key="ng"は互換維持（DOM id/フィルタ）
+      { key: "ng",       label: "NG系", keys: ["hansha", "ng"] },  // key="ng"は互換維持（DOM id/フィルタ）
     ];
     // 未定義ステータス（旧データ等）のフォールバック色
     const FALLBACK_COLOR = "#9CA3AF";
@@ -477,7 +477,7 @@
       Object.keys(STATUS).forEach(k => counts[k] = 0);
       allPins.forEach(p => { if (counts[p.status] !== undefined) counts[p.status]++; });
       document.getElementById("stat-total").textContent = allPins.length;
-      // グループ小計（建物系・土地系・その他）。カードが存在すれば反映。
+      // グループ小計（建物系・土地系・NG系）。カードが存在すれば反映。
       STATUS_GROUPS.forEach(g => {
         const sub = g.keys.reduce((n, k) => n + counts[k], 0);
         const el = document.getElementById("stat-group-" + g.key);
@@ -717,7 +717,7 @@
               onclick="toggleCheck('${p.id}',event)">
             ${p.seqNo != null ? `<span class="pin-seq">${fmtSeq(p.seqNo)}</span>` : ""}
             <span class="status-badge" style="background:${sColor};color:#fff">${sLabel}</span>
-            ${p.otherCompany ? `<span class="oc-badge" title="他社所有・媒介中">🏢 他社物件</span>` : ""}
+            ${p.otherCompany ? `<span class="oc-badge" title="他社看板">🏢 他社物件</span>` : ""}
             <span class="pin-date">${date}</span>
             <span class="pin-staff">${staffName(p.email)}</span>
             <button class="del-btn" onclick="deletePin('${p.id}',event)">🗑</button>
@@ -751,7 +751,7 @@
             </select>
           </div>
           <label class="oc-toggle" onclick="event.stopPropagation()">
-            <input type="checkbox" ${p.otherCompany ? "checked" : ""} onchange="toggleOtherCompany('${p.id}',this.checked)"> 🏢 他社物件（他社所有・媒介中）
+            <input type="checkbox" ${p.otherCompany ? "checked" : ""} onchange="toggleOtherCompany('${p.id}',this.checked)"> 🏢 他社物件（他社看板）
           </label>
           ${exported ? `<div class="export-line">✓ Excel出力済 ${exportedMD}${exportedByName ? ` ・ ${exportedByName}` : ""}</div>` : ""}
         </div>`;
@@ -1479,7 +1479,7 @@
   </div>
 
   <div class="left-panel">
-    <!-- 集計カウンタ：総件数＋グループ小計（建物系/土地系/その他）の4枚。表示専用。
+    <!-- 集計カウンタ：総件数＋グループ小計（建物系/土地系/NG系）の4枚。表示専用。
          数字は updateStats() が stat-total / stat-group-* に反映。絞り込みは下のドロップダウンで。 -->
     <div class="stats-bar">
       <div class="stat-item" id="stat-item-all" onclick="showAll()" title="全グループ表示に戻す">
@@ -1494,9 +1494,9 @@
         <div class="stat-num" style="color:#10B981" id="stat-group-land">0</div>
         <div class="stat-label">土地系</div>
       </div>
-      <div class="stat-item" id="stat-item-ng" onclick="setGroupFilter('ng')" title="その他だけ表示">
+      <div class="stat-item" id="stat-item-ng" onclick="setGroupFilter('ng')" title="NG系だけ表示">
         <div class="stat-num" style="color:#1F2937" id="stat-group-ng">0</div>
-        <div class="stat-label">その他</div>
+        <div class="stat-label">NG系</div>
       </div>
     </div>
 
