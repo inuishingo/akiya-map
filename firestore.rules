@@ -37,21 +37,20 @@ service cloud.firestore {
     }
 
     // ───────────────────────────────────────────────────────────────
-    // 【未適用・案】調査グリッド進捗ルール。本番コンソールでは現状コメントアウト＝未適用
-    //   （＝該当パスはデフォルトdeny。グリッド保存失敗の原因である可能性あり）。
-    //   別タスクで「survey_grids の実書き込み構造(コレクション/フィールド)」と本案
-    //   (surveyedBy == request.auth.token.email 前提) の一致を検証し、修正後に単独deployする。
-    //   反社deployにこの有効化を巻き込まないため、本番実態(未適用)に合わせて据え置き。
-    // match /survey_grids/{gridId} {
-    //   allow read:   if isSignedIn();
-    //   allow create: if isSignedIn()
-    //                 && request.resource.data.surveyedBy == request.auth.token.email;
-    //   allow update: if isSignedIn()
-    //                 && (resource.data.surveyedBy == request.auth.token.email || isAdmin())
-    //                 && request.resource.data.surveyedBy == resource.data.surveyedBy;
-    //   allow delete: if isSignedIn()
-    //                 && (resource.data.surveyedBy == request.auth.token.email || isAdmin());
-    // }
+    // 調査グリッド進捗（survey_grids）。doc ID = "G_{row}_{col}"（index.html toggleGridCell）。
+    //   書込構造と一致を検証済み：create時 surveyedBy = currentUser.email（= token.email）。
+    //   解除(delete)は本人 or admin 限定。update は所有者/admin かつ surveyedBy 不変（なりすまし防止）。
+    //   ※コメントアウト時は該当パスがデフォルトdeny＝グリッド保存失敗の原因。単独deployで有効化。
+    match /survey_grids/{gridId} {
+      allow read:   if isSignedIn();
+      allow create: if isSignedIn()
+                    && request.resource.data.surveyedBy == request.auth.token.email;
+      allow update: if isSignedIn()
+                    && (resource.data.surveyedBy == request.auth.token.email || isAdmin())
+                    && request.resource.data.surveyedBy == resource.data.surveyedBy;
+      allow delete: if isSignedIn()
+                    && (resource.data.surveyedBy == request.auth.token.email || isAdmin());
+    }
     // ───────────────────────────────────────────────────────────────
   }
 }
