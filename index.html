@@ -59,7 +59,7 @@
     let surveyedCells = {};           // gridId -> Firestoreミラー（調査済みマス）
     const gridToggleLock = new Set(); // 同一マスの二重トグル防止（map/polygon両クリック対策）
 
-    // 全12種。グループ（建物系→土地系→NG系）順。色は確定値。
+    // 全13種。グループ（建物系→土地系→その他）順。色は確定値。
     // color は地図ピンの色分けに使用（削除しない）。emoji はモーダルのボタン表示用。
     const STATUS = {
       // 建物系
@@ -74,14 +74,15 @@
       zasshu:  { label: "雑種地", color: "#84CC16", text: "#fff", emoji: "🌿" },
       parking: { label: "駐車場", color: "#14B8A6", text: "#fff", emoji: "🅿️" },
       tahata:  { label: "田・畑", color: "#65A30D", text: "#fff", emoji: "🌾" },
-      // NG系
-      hansha:  { label: "反社",   color: "#1F2937", text: "#fff", emoji: "🚫" },
-      ng:      { label: "NG",     color: "#6B7280", text: "#fff", emoji: "⛔" },
+      // その他（反社/NG=永久ピン ＋ 他社物件=非永久）
+      hansha:    { label: "反社",     color: "#1F2937", text: "#fff", emoji: "🚫" },
+      ng:        { label: "NG",       color: "#6B7280", text: "#fff", emoji: "⛔" },
+      gyoubutsu: { label: "他社物件", color: "#CA8A04", text: "#fff", emoji: "🏢" },
     };
     const STATUS_GROUPS = [
       { label: "建物系", keys: ["akiya", "chikuko", "haikyo", "renpei", "shueki", "souko"] },
       { label: "土地系", keys: ["sarachi", "zasshu", "parking", "tahata"] },
-      { label: "NG系",   keys: ["hansha", "ng"] },
+      { label: "その他", keys: ["hansha", "ng", "gyoubutsu"] },
     ];
     // 未定義ステータス（旧データ等）のフォールバック色
     const FALLBACK_COLOR = "#9CA3AF";

@@ -83,7 +83,7 @@
     let gridWidgets = [];       // グリッド線＋塗りのZDCウィジェット（markersとは別管理）
     let surveyedCells = {};     // gridId -> Firestoreミラー（調査済みマス）
 
-    // 全12種。index.html と同一のキー・ラベル・色で統一。
+    // 全13種。index.html と同一のキー・ラベル・色で統一。
     const STATUS = {
       // 建物系
       akiya:   { label: "空家",   color: "#3B82F6" },
@@ -97,14 +97,15 @@
       zasshu:  { label: "雑種地", color: "#84CC16" },
       parking: { label: "駐車場", color: "#14B8A6" },
       tahata:  { label: "田・畑", color: "#65A30D" },
-      // NG系
-      hansha:  { label: "反社",   color: "#1F2937" },
-      ng:      { label: "NG",     color: "#6B7280" },
+      // その他（反社/NG=永久ピン ＋ 他社物件=非永久）
+      hansha:    { label: "反社",     color: "#1F2937" },
+      ng:        { label: "NG",       color: "#6B7280" },
+      gyoubutsu: { label: "他社物件", color: "#CA8A04" },
     };
     const STATUS_GROUPS = [
       { key: "building", label: "建物系", keys: ["akiya", "chikuko", "haikyo", "renpei", "shueki", "souko"] },
       { key: "land",     label: "土地系", keys: ["sarachi", "zasshu", "parking", "tahata"] },
-      { key: "ng",       label: "NG系",   keys: ["hansha", "ng"] },
+      { key: "ng",       label: "その他", keys: ["hansha", "ng", "gyoubutsu"] },  // 表示名のみ変更。key="ng"は互換維持（DOM id/フィルタ）
     ];
     // 未定義ステータス（旧データ等）のフォールバック色
     const FALLBACK_COLOR = "#9CA3AF";
@@ -475,7 +476,7 @@
       Object.keys(STATUS).forEach(k => counts[k] = 0);
       allPins.forEach(p => { if (counts[p.status] !== undefined) counts[p.status]++; });
       document.getElementById("stat-total").textContent = allPins.length;
-      // グループ小計（建物系・土地系・NG系）。カードが存在すれば反映。
+      // グループ小計（建物系・土地系・その他）。カードが存在すれば反映。
       STATUS_GROUPS.forEach(g => {
         const sub = g.keys.reduce((n, k) => n + counts[k], 0);
         const el = document.getElementById("stat-group-" + g.key);
@@ -1439,7 +1440,7 @@
   </div>
 
   <div class="left-panel">
-    <!-- 集計カウンタ：総件数＋グループ小計（建物系/土地系/NG系）の4枚。表示専用。
+    <!-- 集計カウンタ：総件数＋グループ小計（建物系/土地系/その他）の4枚。表示専用。
          数字は updateStats() が stat-total / stat-group-* に反映。絞り込みは下のドロップダウンで。 -->
     <div class="stats-bar">
       <div class="stat-item" id="stat-item-all" onclick="showAll()" title="全グループ表示に戻す">
@@ -1454,9 +1455,9 @@
         <div class="stat-num" style="color:#10B981" id="stat-group-land">0</div>
         <div class="stat-label">土地系</div>
       </div>
-      <div class="stat-item" id="stat-item-ng" onclick="setGroupFilter('ng')" title="NG系だけ表示">
+      <div class="stat-item" id="stat-item-ng" onclick="setGroupFilter('ng')" title="その他だけ表示">
         <div class="stat-num" style="color:#1F2937" id="stat-group-ng">0</div>
-        <div class="stat-label">NG系</div>
+        <div class="stat-label">その他</div>
       </div>
     </div>
 
