@@ -39,6 +39,8 @@
     let reviewOnly = false;     // 「⚠️ 要調査のみ」フィルタ（赤ラベル＝住所不明 or 地番未取得 だけ表示）
     let activeStaffFilter = "all";
     let activeDateFilter = "all";
+    let activeGroupFilter = "all";   // 上部カウンターのグループ絞り（all|building|land|ng）。ハイライトにも使用
+    let activeStatusFilter = "all";  // ステータスDDの個別分類絞り（all|STATUSキー）。カウンターとAND併用
     let searchQuery = "";       // 左リスト検索（No/住所/地番の部分一致）
     let checkedIds = new Set();
     let selectedPinId = null;
@@ -200,6 +202,8 @@
         document.getElementById("loginScreen").style.display = "none";
         document.getElementById("adminScreen").style.display = "grid";
         document.getElementById("userLabel").textContent = user.email;
+        initStatusFilter();       // ステータスDDの選択肢を構築（1回）
+        updateStatsHighlight();   // カウンター初期ハイライト（総件数=全表示）
         initMap();
         // 表示名・担当者色マップ（どちらも displayNames 由来）を先に構築してから購読開始
         await buildStaffNames();
@@ -537,14 +541,53 @@
       renderMapMarkers();
     };
 
-    // 総件数クリック → 全件表示に戻す（要調査トグルをOFFへ）。
+    // 総件数クリック → グループ絞りを解除して全グループ表示（＋要調査トグルもOFFへ）。
+    // DD/担当者/日付/検索は独立ANDなので触らない（各自の「すべて」で解除）。
     window.showAll = () => {
+      activeGroupFilter = "all";
       reviewOnly = false;
       const cb = document.getElementById("reviewOnlyToggle");
       if (cb) cb.checked = false;
+      updateStatsHighlight();
       renderList();
       renderMapMarkers();
     };
+
+    // グループ絞り（カウンターのショートカット）。同じグループ再クリックで解除＝全表示へ。
+    window.setGroupFilter = (groupKey) => {
+      activeGroupFilter = (activeGroupFilter === groupKey) ? "all" : groupKey;
+      updateStatsHighlight();
+      renderList();
+      renderMapMarkers();
+    };
+
+    // ステータスDD（個別分類）。カウンターとは独立し filtered() 内でANDに合流。
+    window.setStatusFilter = (val) => {
+      activeStatusFilter = val;
+      renderList();
+      renderMapMarkers();
+    };
+
+    // カウンターのハイライト。activeGroupFilter に対応する1枚だけ .active。
+    // 総件数は「グループ絞りなし(all)」時にハイライト＝現在“全グループ表示”を示す。
+    function updateStatsHighlight() {
+      ["all", "building", "land", "ng"].forEach(k => {
+        const el = document.getElementById("stat-item-" + k);
+        if (el) el.classList.toggle("active", activeGroupFilter === k);
+      });
+    }
+
+    // ステータスDDの選択肢を STATUS_GROUPS から生成（見出し=optgroupは選択不可）。1回だけ構築。
+    function initStatusFilter() {
+      const sel = document.getElementById("statusFilter");
+      if (!sel) return;
+      sel.innerHTML = `<option value="all">ステータス：すべて</option>` +
+        STATUS_GROUPS.map(g =>
+          `<optgroup label="${g.label}">` +
+          g.keys.map(k => `<option value="${k}">${STATUS[k].label}</option>`).join("") +
+          `</optgroup>`
+        ).join("");
+    }
 
     // 検索ヒット判定：タグNo(#1444/1444)・住所・地番を1文字列に連結して部分一致。
     // "#1444" でも "1444" でも同じ干し草に含まれるので両方ヒットする。
@@ -556,6 +599,18 @@
       return hay.includes(q);
     }
 
+    // カウンター(グループ)とDD(個別)を一本化した status 判定。判定元は STATUS_GROUPS のみ（二重定義しない）。
+    // カウンター＝「そのグループの全分類を一括選択」/ DD＝単一分類。両者はANDで併用。
+    // 矛盾組合せ(建物系×反社)は積集合が空→0件で正しく空表示。
+    function statusAllowed(p) {
+      if (activeGroupFilter !== "all") {
+        const g = STATUS_GROUPS.find(x => x.key === activeGroupFilter);
+        if (!g || !g.keys.includes(p.status)) return false;
+      }
+      if (activeStatusFilter !== "all" && p.status !== activeStatusFilter) return false;
+      return true;
+    }
+
     function filtered() {
       const q = searchQuery.trim().toLowerCase();
       return allPins.filter(p => {
@@ -563,7 +618,8 @@
         const staffOk  = activeStaffFilter  === "all" || p.email === activeStaffFilter;
         const dateOk   = activeDateFilter   === "all" || jstYmd(p.createdAt) === activeDateFilter;
         const searchOk = matchesSearch(p, q);   // 既存フィルタの最後に重ねがけ（AND）
-        return reviewOk && staffOk && dateOk && searchOk;
+        const statusOk = statusAllowed(p);       // カウンター(グループ)＋DD(個別)をANDで併用
+        return reviewOk && staffOk && dateOk && searchOk && statusOk;
       });
     }
 
@@ -911,9 +967,9 @@
 
     // 反社/NG永久ピンを作成（住所登録・クリック登録の共通処理）。座標が最優先・住所はおまけ。
     async function createPermanentPin(lat, lng, address) {
-      if (regStatus !== "hansha" && regStatus !== "ng") return;
+      if (regStatus !== "hansha" && regStatus !== "ng") return false;
       const label = STATUS[regStatus]?.label || regStatus;
-      if (!confirm(`この位置に「${label}」ピンを登録しますか？\n${address || "（住所なし）"}`)) { clearRegTempMarker(); return; }
+      if (!confirm(`この位置に「${label}」ピンを登録しますか？\n${address || "（住所なし）"}`)) { clearRegTempMarker(); return false; }
       try {
         const pinData = {
           uid: auth.currentUser?.uid || "",
@@ -931,7 +987,8 @@
         await addDoc(collection(db, "pins"), pinData);   // onSnapshot が拾って自動再描画
         clearRegTempMarker();
         showToast(`「${label}」ピンを登録しました`);
-      } catch(e) { showToast("登録に失敗しました", "error"); console.error("createPermanentPin", e); }
+        return true;
+      } catch(e) { showToast("登録に失敗しました", "error"); console.error("createPermanentPin", e); return false; }
     }
 
     // 方法A：住所ジオコード座標に登録
@@ -941,13 +998,19 @@
     };
 
     // 方法B：地図クリック登録モード ON/OFF
-    window.toggleRegMode = (on) => {
-      regMode = !!on;
+    // ボタン表示・カーソル・仮マーカー掃除を一括反映（トグルと自動OFFで共通利用）。
+    function applyRegModeUI() {
       const btn = document.getElementById("regModeBtn");
       if (btn) { btn.classList.toggle("active", regMode); btn.textContent = regMode ? "📍クリック登録：ON" : "📍クリック登録：OFF"; }
       const mapEl = document.getElementById("map"); if (mapEl) mapEl.style.cursor = regMode ? "crosshair" : "";
       if (!regMode) clearRegTempMarker();   // モードOFFで仮位置★を残さない
-    };
+    }
+    // 内部状態を真実として反映（ON/OFFを明示指定）。オートOFF等から呼ぶ。
+    function setRegMode(on) { regMode = !!on; applyRegModeUI(); }
+    // ボタンから呼ぶトグル。旧: onclick="toggleRegMode(!regMode)" は regMode が module スコープ変数のため
+    // インラインhandler(グローバル評価)から参照不可でReferenceError→ハンドラが落ちてON化しなかった。
+    // 引数を取らず内部状態を反転するだけに修正。
+    window.toggleRegMode = () => setRegMode(!regMode);
 
     // 方法Bのクリック時：reverseで住所補完（失敗しても座標優先で登録は継続）。
     async function registerFromClick(latlng) {
@@ -956,7 +1019,8 @@
         const r = await fetch(`https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`);
         address = (await r.json()).result?.item?.[0]?.address || "";
       } catch(e) { address = ""; }   // reverse失敗は無視（座標が最優先・住所はおまけ）
-      await createPermanentPin(latlng.lat, latlng.lng, address);
+      const ok = await createPermanentPin(latlng.lat, latlng.lng, address);
+      if (ok) setRegMode(false);   // 登録成功後は自動OFF（誤ピン防止）。失敗/キャンセルはON維持で再クリック可
     }
 
     // ===== SAVE 事務員メモ（adminMemo）=====
@@ -1123,7 +1187,7 @@
     .header-title { font-size: 15px; font-weight: 700; color: #f8fafc; margin-right: 4px; }
     #userLabel { font-size: 12px; color: #64748b; }
     .header-spacer { flex: 1; }
-    #staffFilter, #dateFilter {
+    #staffFilter, #dateFilter, #statusFilter {
       padding: 6px 10px; border-radius: 6px; border: 1px solid #334155;
       background: #1e293b; color: #94a3b8; font-size: 12px; font-family: inherit; outline: none; cursor: pointer;
     }
@@ -1171,6 +1235,9 @@
     }
     .stat-num { font-size: 18px; font-weight: 700; color: #1e293b; line-height: 1; }
     .stat-label { font-size: 10px; color: #94a3b8; margin-top: 2px; }
+    /* カウンターのグループ絞り選択中ハイライト */
+    .stat-item.active { background: #eff6ff; box-shadow: inset 0 -2px 0 #3b82f6; }
+    .stat-item.active .stat-label { color: #3b82f6; font-weight: 700; }
 
     .filter-bar {
       display: flex; gap: 6px; padding: 8px 10px; overflow-x: auto;
@@ -1360,6 +1427,9 @@
     <select id="staffFilter" onchange="setStaffFilter(this.value)">
       <option value="all">担当者：すべて</option>
     </select>
+    <select id="statusFilter" onchange="setStatusFilter(this.value)">
+      <option value="all">ステータス：すべて</option>
+    </select>
     <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
     <button class="layer-btn youto" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋クリックで属性">用途地域</button>
     <button class="layer-btn" id="chibanBtn" onclick="toggleChiban()" title="地番（ブルーマップ）重畳">地番</button>
@@ -1372,19 +1442,19 @@
     <!-- 集計カウンタ：総件数＋グループ小計（建物系/土地系/NG系）の4枚。表示専用。
          数字は updateStats() が stat-total / stat-group-* に反映。絞り込みは下のドロップダウンで。 -->
     <div class="stats-bar">
-      <div class="stat-item" onclick="showAll()">
+      <div class="stat-item" id="stat-item-all" onclick="showAll()" title="全グループ表示に戻す">
         <div class="stat-num" id="stat-total">0</div>
         <div class="stat-label">総件数</div>
       </div>
-      <div class="stat-item">
+      <div class="stat-item" id="stat-item-building" onclick="setGroupFilter('building')" title="建物系だけ表示">
         <div class="stat-num" style="color:#3B82F6" id="stat-group-building">0</div>
         <div class="stat-label">建物系</div>
       </div>
-      <div class="stat-item">
+      <div class="stat-item" id="stat-item-land" onclick="setGroupFilter('land')" title="土地系だけ表示">
         <div class="stat-num" style="color:#10B981" id="stat-group-land">0</div>
         <div class="stat-label">土地系</div>
       </div>
-      <div class="stat-item">
+      <div class="stat-item" id="stat-item-ng" onclick="setGroupFilter('ng')" title="NG系だけ表示">
         <div class="stat-num" style="color:#1F2937" id="stat-group-ng">0</div>
         <div class="stat-label">NG系</div>
       </div>
@@ -1431,7 +1501,7 @@
         <label class="reg-radio"><input type="radio" name="regStatus" value="hansha" checked onchange="setRegStatus('hansha')"> 反社</label>
         <label class="reg-radio"><input type="radio" name="regStatus" value="ng" onchange="setRegStatus('ng')"> NG</label>
         <button class="reg-btn" onclick="registerFromAddress()">この住所位置に登録</button>
-        <button id="regModeBtn" class="reg-btn reg-toggle" onclick="toggleRegMode(!regMode)">📍クリック登録：OFF</button>
+        <button id="regModeBtn" class="reg-btn reg-toggle" onclick="toggleRegMode()">📍クリック登録：OFF</button>
       </div>
     </div>
     <div id="map"></div>
