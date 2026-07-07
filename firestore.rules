@@ -36,6 +36,14 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // 調査周回マスタ（survey_rounds）。doc ID=`${branch}__${areaKey}`（例 "名古屋__津島市"）。
+    //   read=ログイン全員（現場/管理が現在周回を参照）。write=管理者のみ（周回開始・リセット＝管理操作・C-2で使用）。
+    //   マスタ無エリアは currentRound=1 扱い（クライアント側フォールバック）。
+    match /survey_rounds/{roundId} {
+      allow read:  if isSignedIn();
+      allow write: if isAdmin();
+    }
+
     // ───────────────────────────────────────────────────────────────
     // 調査グリッド進捗（survey_grids）。doc ID = "G_{row}_{col}"（index.html toggleGridCell）。
     //   書込構造と一致を検証済み：create時 surveyedBy = currentUser.email（= token.email）。

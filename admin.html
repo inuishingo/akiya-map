@@ -42,6 +42,8 @@
     let activeGroupFilter = "all";   // 上部カウンターのグループ絞り（all|building|land|ng）。ハイライトにも使用
     let activeStatusFilter = "all";  // ステータスDDの個別分類絞り（all|STATUSキー）。カウンターとAND併用
     let otherCompanyFilter = "all";  // 他社物件フィルタ（all|exclude|only）。既存フィルタと全てAND併用
+    let activeAreaFilter = "all";    // エリア（市区町村）絞り（all|areaKey）。既存フィルタとAND併用
+    let activeRoundFilter = "all";   // 周回絞り（all|数値）。NG系(永久)は周回で消えない
     let searchQuery = "";       // 左リスト検索（No/住所/地番の部分一致）
     let checkedIds = new Set();
     let selectedPinId = null;
@@ -136,6 +138,44 @@
       return staffColorMap[email] || STAFF_DEFAULT_COLOR;
     }
 
+    // ===== 調査周回（round）— C-1 基盤 =====
+    // areaKey：住所→市区（政令市=区／非政令市=市町村／県郡除去）。index.html cityWardKey と同一実装で
+    // キー文字列を一致させる（ピンの areaKey とグリッド由来 areaKey が同じ市区で一致する前提・C-3で使用）。
+    function cityWardKey(address) {
+      let a = (address || "").normalize("NFKC").trim();
+      if (!a) return "";
+      a = a.replace(/^(東京都|北海道|京都府|大阪府|.{2,3}県)/, "");
+      a = a.replace(/^.{1,4}郡/, "");
+      let m;
+      if ((m = a.match(/^(.+?市.+?区)/))) return m[1];   // 政令市の区
+      if ((m = a.match(/^(.+?市市?)/)))   return m[1];   // 市（四日市市等の二重市に対応）
+      if ((m = a.match(/^(.+?区)/)))      return m[1];   // 東京特別区など
+      if ((m = a.match(/^(.+?[町村])/)))  return m[1];   // 郡除去後の町・村
+      return "";
+    }
+    function areaKey(p){ return cityWardKey(p && p.address); }
+    let roundState = {};      // `${branch}__${areaKey}` -> {currentRound, rounds}
+    let roundsUnsub = null;   // survey_rounds 購読の解除関数（多重購読防止）
+    // survey_rounds を購読。現在周回の変化で色/薄色・周回フィルタ候補が変わるため再描画。マスタ無=1。
+    function listenRounds(){
+      if (roundsUnsub) roundsUnsub();
+      roundsUnsub = onSnapshot(collection(db, "survey_rounds"), snap => {
+        roundState = {}; snap.forEach(d => roundState[d.id] = d.data());
+        updateRoundFilter(); renderList(); renderMapMarkers();
+      }, e => {});
+    }
+    function currentRoundOf(p){ const s = roundState[`${pinBranch(p)}__${areaKey(p)}`]; return (s && Number(s.currentRound)) || 1; }
+    function roundOf(p){ return Number(p.surveyRound) || 1; }
+    function isPastRound(p){ return !isPermanentPin(p) && roundOf(p) < currentRoundOf(p); }   // 過去周回の通常ピン=薄色対象
+    // ラベル背景色（index/admin統一）：要確認赤 ＞ 永久黒 ＞ 周回色（1青/2緑/3橙/4紫→((r-1)%4)ローテ）。担当者色は廃止。
+    const ROUND_COLORS = ["#2563EB","#16A34A","#EA580C","#9333EA"];
+    function roundColor(r){ return ROUND_COLORS[(((r||1)-1)%4+4)%4]; }
+    function labelColor(p){
+      if (isReviewFlagged(p)) return "#EF4444";
+      if (isPermanentPin(p))  return PERMANENT_COLOR;
+      return roundColor(roundOf(p));
+    }
+
     // メール→表示名マップ。displayNames コレクション（doc ID=メール, field name）を全件読む。
     // 未登録メールはメールのままフォールバック（落とさない）。手動でdoc追加すれば即反映。
     let staffNameMap = {};
@@ -213,6 +253,7 @@
         await loadMyBranch(user.email);   // 自店を確定してから購読（listenPins の絞り込みに使う）
         listenPins();
         listenSurveyGrids();   // 調査グリッドの進捗をリアルタイム購読（表示はトグルON時のみ）
+        listenRounds();        // 周回マスタを購読（現在周回で色/薄色・周回フィルタ候補を判定）
       } else {
         document.getElementById("loginScreen").style.display = "flex";
         document.getElementById("adminScreen").style.display = "none";
@@ -466,6 +507,8 @@
         updateStats();
         updateStaffFilter();
         updateDateFilter();
+        updateAreaFilter();
+        updateRoundFilter();
         renderList();
         renderMapMarkers();
       });
@@ -578,6 +621,31 @@
       renderMapMarkers();
     };
 
+    // ===== エリア/周回フィルタ（C-1）=====
+    // エリア＝自branchピンの areaKey 一覧を自動生成。周回＝1..最大周回。どちらも filtered() でAND合流。
+    function updateAreaFilter(){
+      const areas = [...new Set(allPins.map(p => areaKey(p)).filter(Boolean))].sort();
+      if (activeAreaFilter !== "all" && !areas.includes(activeAreaFilter)) activeAreaFilter = "all";
+      const sel = document.getElementById("areaFilter");
+      if (!sel) return;
+      sel.innerHTML = `<option value="all">エリア：すべて</option>` +
+        areas.map(a => `<option value="${a}" ${a===activeAreaFilter?"selected":""}>${a}</option>`).join("");
+    }
+    function updateRoundFilter(){
+      // 周回番号の最大＝マスタ currentRound と ピン surveyRound の最大（マスタ未作成でもピンから拾う）
+      let maxR = 1;
+      Object.values(roundState).forEach(s => { const r = Number(s.currentRound)||1; if (r>maxR) maxR=r; });
+      allPins.forEach(p => { const r = roundOf(p); if (r>maxR) maxR=r; });
+      if (activeRoundFilter !== "all" && Number(activeRoundFilter) > maxR) activeRoundFilter = "all";
+      const sel = document.getElementById("roundFilter");
+      if (!sel) return;
+      let opts = `<option value="all">周回：すべて</option>`;
+      for (let r=1; r<=maxR; r++) opts += `<option value="${r}" ${String(r)===activeRoundFilter?"selected":""}>第${r}周</option>`;
+      sel.innerHTML = opts;
+    }
+    window.setAreaFilter  = (val) => { activeAreaFilter = val; renderList(); renderMapMarkers(); };
+    window.setRoundFilter = (val) => { activeRoundFilter = val; renderList(); renderMapMarkers(); };
+
     // カウンターのハイライト。activeGroupFilter に対応する1枚だけ .active。
     // 総件数は「グループ絞りなし(all)」時にハイライト＝現在“全グループ表示”を示す。
     function updateStatsHighlight() {
@@ -631,7 +699,10 @@
         const statusOk = statusAllowed(p);       // カウンター(グループ)＋DD(個別)をANDで併用
         const oc = p.otherCompany === true;
         const ocOk = otherCompanyFilter === "all" || (otherCompanyFilter === "exclude" ? !oc : oc);
-        return reviewOk && staffOk && dateOk && searchOk && statusOk && ocOk;
+        const areaOk  = activeAreaFilter === "all" || areaKey(p) === activeAreaFilter;
+        // 周回絞り：NG系(永久ピン)は周回に無関係で常時通過。それ以外は指定周回に一致するもののみ。
+        const roundOk = isPermanentPin(p) || activeRoundFilter === "all" || roundOf(p) === Number(activeRoundFilter);
+        return reviewOk && staffOk && dateOk && searchOk && statusOk && ocOk && areaOk && roundOk;
       });
     }
 
@@ -711,7 +782,7 @@
           ? `https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lng}`
           : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(p.address || "")}`;
         return `
-        <div class="pin-card ${exported ? "exported" : ""} ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
+        <div class="pin-card ${exported ? "exported" : ""} ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""} ${isPastRound(p) ? "past" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
           <div class="pin-card-top">
             <input type="checkbox" class="pin-check" ${isChecked ? "checked" : ""}
               onclick="toggleCheck('${p.id}',event)">
@@ -812,7 +883,7 @@
         // 固定連番(seqNo)はマーカー上のHTMLオーバーレイ(#001形式)で表示する（下の UserWidget）。
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
-          { color: isPermanentPin(p) ? PERMANENT_COLOR : staffColor(p.email), text: s ? s.label[0] : "?" }
+          { color: isPermanentPin(p) ? PERMANENT_COLOR : roundColor(roundOf(p)), text: s ? s.label[0] : "?" }
         );
         marker.pinId = p.id;
         marker.addEventListener("click", function() { selectPin(p.id); });
@@ -823,8 +894,9 @@
         // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
         if (p.seqNo != null) {
           // 要確認（住所不明 or 地番未取得）は赤背景で示す。現地画面(index.html)と色基準を統一。
-          const labelBg = isReviewFlagged(p) ? "#EF4444"
-            : (isPermanentPin(p) ? PERMANENT_COLOR : staffColor(p.email));
+          // ラベル背景色：要確認赤 ＞ 永久黒 ＞ 周回色（担当者色は廃止）。過去周回の通常ピンは薄色。
+          const labelBg = labelColor(p);
+          const labelOpacity = isPastRound(p) ? ".45" : "1";
           // 他社物件フラグは背景色（色優先順位）を上書きせず、🏢＋黄土枠で重畳表示。
           const oc = p.otherCompany === true;
           const labelBorder = oc ? "2px solid #CA8A04" : "1px solid rgba(255,255,255,.65)";
@@ -838,6 +910,7 @@
                 + 'font-size:11px;font-weight:700;line-height:1.6;'
                 + 'border:' + labelBorder + ';'
                 + 'box-shadow:0 1px 3px rgba(0,0,0,.35);'
+                + 'opacity:' + labelOpacity + ';'
                 + 'pointer-events:none;">' + fmtSeq(p.seqNo) + (oc ? ' 🏢' : '') + '</div>',
               offset: new ZDC.Point(0, -58),
               propagation: true,
@@ -1215,7 +1288,7 @@
     .header-title { font-size: 15px; font-weight: 700; color: #f8fafc; margin-right: 4px; }
     #userLabel { font-size: 12px; color: #64748b; }
     .header-spacer { flex: 1; }
-    #staffFilter, #dateFilter, #statusFilter, #otherCompanyFilter {
+    #staffFilter, #dateFilter, #statusFilter, #otherCompanyFilter, #areaFilter, #roundFilter {
       padding: 6px 10px; border-radius: 6px; border: 1px solid #334155;
       background: #1e293b; color: #94a3b8; font-size: 12px; font-family: inherit; outline: none; cursor: pointer;
     }
@@ -1337,6 +1410,9 @@
     .pin-card.checked.selected { background: #fef9c3; border-color: #3b82f6; }
     /* Excel出力済みピン：グレーアウトで未出力と区別 */
     .pin-card.exported { opacity: 0.55; }
+    /* 過去周回のピン：薄色で「前周回の記録」を示す（現周回と区別） */
+    .pin-card.past { opacity: 0.55; }
+    .pin-card.past.selected, .pin-card.past.checked { opacity: 1; }  /* 選択/チェック時は見やすく戻す */
     .pin-card.exported.selected,
     .pin-card.exported.checked { opacity: 1; }  /* 選択/チェック時は見やすく戻す */
     .export-line {
@@ -1469,6 +1545,12 @@
       <option value="all">他社物件：すべて</option>
       <option value="exclude">他社物件：除外</option>
       <option value="only">他社物件：だけ</option>
+    </select>
+    <select id="areaFilter" onchange="setAreaFilter(this.value)" title="市区町村で絞り込み">
+      <option value="all">エリア：すべて</option>
+    </select>
+    <select id="roundFilter" onchange="setRoundFilter(this.value)" title="周回で絞り込み（NG系は常時表示）">
+      <option value="all">周回：すべて</option>
     </select>
     <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
     <button class="layer-btn youto" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋クリックで属性">用途地域</button>
