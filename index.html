@@ -93,7 +93,7 @@
     // 担当者色は displayNames レジストリの order（0始まりの固定index）で決まる（admin.html と同一方式）。
     // 並び順・在席に依存しないので各人の色は不変。order を持つ doc だけが色付け対象（＝調査員）。
     // order 無し/範囲外/未登録（事務員等）は STAFF_DEFAULT_COLOR。既存6色は順序ごと固定・末尾4色は7〜10人目用。
-    const STAFF_PALETTE = ["#2563EB","#0891B2","#059669","#D97706","#7C3AED","#DB2777","#DC2626","#A21CAF","#B45309","#475569"];
+    const STAFF_PALETTE = ["#2563EB","#0891B2","#059669","#D97706","#7C3AED","#DB2777","#4D7C0F","#A21CAF","#B45309","#475569"];
     const STAFF_DEFAULT_COLOR = "#65A30D";
     let staffColorMap = {};
     async function buildStaffColors() {
@@ -782,24 +782,30 @@
     };
 
     // ===== GEOCODE（ZENRIN）=====
+    // reverse プロキシから点/セルの item を取得（ピン・グリッド共通）。失敗時は例外。
+    async function fetchReverseItem(lat, lng) {
+      const res = await fetch(`https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${lat}&lon=${lng}`);
+      const json = await res.json();
+      return (json.result && json.result.item && json.result.item[0]) || null;
+    }
+    // reverse item → {areaCode, areaName}。areaName の郡除去正規化はこの1箇所に集約（ピン/グリッド共用）。
+    // areaCode = 都道府県コード(2桁)+市区町村コード(3桁) = JIS5桁（政令市は区まで分離）。欠落時 null（推測しない）。
+    // 「◯◯郡△△町/村」は郡名を除去。「郡」始まりの市名(郡上市/郡山市)や 市・区は対象外（末尾が町/村の時だけ除去）。
+    function areaFromReverseItem(item) {
+      if (!item || !item.address_code2 || !item.address_code3) return { areaCode: null, areaName: null };
+      const areaCode = String(item.address_code2).padStart(2, "0") + String(item.address_code3).padStart(3, "0");
+      const a3 = item.address3 || "";
+      const gm = a3.match(/^.+?郡(.+[町村])$/);
+      return { areaCode: areaCode, areaName: gm ? gm[1] : (a3 || null) };
+    }
     async function reverseGeocode(latlng) {
       document.getElementById("addressLabel").textContent = "住所取得中…";
+      pendingAreaCode = null; pendingAreaName = null;   // 新規タップごとにリセット（失敗時はnullのまま保存）
       try {
-        const res = await fetch(
-          `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`
-        );
-        const json = await res.json();
-        const item = json.result?.item?.[0];
+        const item = await fetchReverseItem(latlng.lat, latlng.lng);
         document.getElementById("addressLabel").textContent = (item && item.address) || "住所不明";
-        // areaCode = 都道府県コード(2桁)+市区町村コード(3桁) = JIS5桁（政令市は区まで分離）。欠落時はnull（推測しない）。
-        if (item && item.address_code2 && item.address_code3) {
-          pendingAreaCode = String(item.address_code2).padStart(2, "0") + String(item.address_code3).padStart(3, "0");
-          // areaName は既存バックフィル(総務省マスタ形式)に表記を合わせる。「◯◯郡△△町/村」は郡名を除去して「△△町/村」に。
-          // 末尾が町/村のときだけ除去するので、「郡」で始まる市名(郡上市/郡山市)や 市・区(四日市市/名古屋市東区)は対象外。
-          const a3 = item.address3 || "";
-          const gm = a3.match(/^.+?郡(.+[町村])$/);
-          pendingAreaName = gm ? gm[1] : (a3 || null);
-        }
+        const a = areaFromReverseItem(item);
+        pendingAreaCode = a.areaCode; pendingAreaName = a.areaName;
       } catch {
         document.getElementById("addressLabel").textContent = "（オフライン）";
       }

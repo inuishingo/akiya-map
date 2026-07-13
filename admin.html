@@ -117,7 +117,7 @@
     // 担当者色は displayNames レジストリの order（0始まりの固定index）で決まる（index.html と同一方式）。
     // 並び順・在席に依存しないので各人の色は不変。order を持つ doc だけが色付け対象（＝調査員）。
     // order 無し/範囲外/未登録（事務員等）は STAFF_DEFAULT_COLOR。STAFF_PALETTE は両ファイル同一定義。
-    const STAFF_PALETTE = ["#2563EB","#0891B2","#059669","#D97706","#7C3AED","#DB2777","#DC2626","#A21CAF","#B45309","#475569"];
+    const STAFF_PALETTE = ["#2563EB","#0891B2","#059669","#D97706","#7C3AED","#DB2777","#4D7C0F","#A21CAF","#B45309","#475569"];
     const STAFF_DEFAULT_COLOR = "#65A30D";
     let staffColorMap = {};
     async function buildStaffColors() {
