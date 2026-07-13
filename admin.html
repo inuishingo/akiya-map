@@ -153,7 +153,7 @@
       if ((m = a.match(/^(.+?[町村])/)))  return m[1];   // 郡除去後の町・村
       return "";
     }
-    function areaKey(p){ return cityWardKey(p && p.address); }
+    function areaKey(p){ return (p && p.areaCode) || null; }   // areaCode(JIS5桁)ベース。旧cityWardKey(正規表現)は不使用
     let roundState = {};      // `${branch}__${areaKey}` -> {currentRound, rounds}
     let roundsUnsub = null;   // survey_rounds 購読の解除関数（多重購読防止）
     // survey_rounds を購読。現在周回の変化で色/薄色・周回フィルタ候補が変わるため再描画。マスタ無=1。
@@ -623,13 +623,27 @@
 
     // ===== エリア/周回フィルタ（C-1）=====
     // エリア＝自branchピンの areaKey 一覧を自動生成。周回＝1..最大周回。どちらも filtered() でAND合流。
+    // エリアDD＝pins.areaCode でグルーピング、表示は areaName（政令市は「名古屋市東区」形式）。
+    // 旧cityWardKey(正規表現)グルーピングは廃止。areaCode無し(=未判定)は末尾に
+    // 「エリア未判定（N件）」として別枠表示し、選ぶと未判定ピンだけに絞れる（住所修正の潰し込み導線）。
+    const AREA_NONE = "__none__";
     function updateAreaFilter(){
-      const areas = [...new Set(allPins.map(p => areaKey(p)).filter(Boolean))].sort();
-      if (activeAreaFilter !== "all" && !areas.includes(activeAreaFilter)) activeAreaFilter = "all";
+      const nameByCode = {};   // areaCode -> areaName（表示名）
+      let noneCount = 0;
+      allPins.forEach(p => {
+        const c = p.areaCode;
+        if (c) nameByCode[c] = p.areaName || c;
+        else noneCount++;
+      });
+      const codes = Object.keys(nameByCode).sort((a,b) => nameByCode[a].localeCompare(nameByCode[b], "ja"));
+      const valid = codes.concat(noneCount ? [AREA_NONE] : []);
+      if (activeAreaFilter !== "all" && !valid.includes(activeAreaFilter)) activeAreaFilter = "all";
       const sel = document.getElementById("areaFilter");
       if (!sel) return;
-      sel.innerHTML = `<option value="all">エリア：すべて</option>` +
-        areas.map(a => `<option value="${a}" ${a===activeAreaFilter?"selected":""}>${a}</option>`).join("");
+      let html = `<option value="all">エリア：すべて</option>` +
+        codes.map(c => `<option value="${c}" ${c===activeAreaFilter?"selected":""}>${nameByCode[c]}</option>`).join("");
+      if (noneCount) html += `<option value="${AREA_NONE}" ${AREA_NONE===activeAreaFilter?"selected":""}>エリア未判定（${noneCount}件）</option>`;
+      sel.innerHTML = html;
     }
     function updateRoundFilter(){
       // 周回番号の最大＝マスタ currentRound と ピン surveyRound の最大（マスタ未作成でもピンから拾う）
@@ -699,7 +713,8 @@
         const statusOk = statusAllowed(p);       // カウンター(グループ)＋DD(個別)をANDで併用
         const oc = p.otherCompany === true;
         const ocOk = otherCompanyFilter === "all" || (otherCompanyFilter === "exclude" ? !oc : oc);
-        const areaOk  = activeAreaFilter === "all" || areaKey(p) === activeAreaFilter;
+        const areaOk  = activeAreaFilter === "all"
+                      || (activeAreaFilter === AREA_NONE ? !p.areaCode : p.areaCode === activeAreaFilter);
         // 周回絞り：NG系(永久ピン)は周回に無関係で常時通過。それ以外は指定周回に一致するもののみ。
         const roundOk = isPermanentPin(p) || activeRoundFilter === "all" || roundOf(p) === Number(activeRoundFilter);
         return reviewOk && staffOk && dateOk && searchOk && statusOk && ocOk && areaOk && roundOk;
