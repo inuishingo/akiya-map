@@ -10,7 +10,7 @@ A mobile-first web app for field surveying of vacant houses (空家マップ) in
 
 - **拠点展開とSaaS化**: 名古屋店発のシステム。将来は京都・大阪・神戸を加えた**4拠点展開**、さらに**SaaS化**を見据えている。現状ハードコードされている `branch: "名古屋"` や単一の `pins` コレクション設計は、いずれ複数拠点・複数テナントを前提とした構造へ拡張する必要がある点を意識すること。
 - **ZENRIN Maps API の本契約移行中**: 現在ソース内で使っているのは**検証環境**のキー（`test-js.zmaps-api.com` / `test-web.zmaps-api.com`）。**本契約申請**へ移行中で、本番では**地番検索・住宅地図・用途地域**の利用を想定している。エンドポイントとキーは本番移行時に差し替わる前提で扱う。
-- **逆ジオコーディングのプロキシ**: `index.html` が叩く Cloud Run プロキシ（`zenrin-ptddjpvgeq-an.a.run.app`）は **Firebase Functions 経由**で運用している。このリポジトリには含まれない別管理のコードである。
+- **APIプロキシは `functions/` にある**: `index.html` が叩く `zenrin` プロキシ（`zenrin-ptddjpvgeq-an.a.run.app`）と、用途地域用の `youto` プロキシは、**このリポジトリの `functions/` で管理している**（2026-07-14 に別管理から移管）。APIキーは Secret Manager（`ZENRIN_KEY` / `REINFOLIB_KEY`）に置き、コードには絶対に書かない（**このリポジトリは Public**）。
 - **コード提示の形式**: ユーザーはコード編集を**メモ帳や GitHub の Edit 画面での全文差し替え**で反映することを好む。変更を提示する際は差分パッチ（一部のみ）ではなく、**ファイル全文（置換後の完成形）**で提示すること。
 
 ## Architecture
@@ -63,11 +63,13 @@ reviewReason        // string — short JP label for why needsReview was set; re
 
 ### Reverse geocoding
 
-`index.html` does not call ZENRIN directly for addresses — it hits a **Cloud Run proxy**: `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=..&lon=..`, reading `json.result.item[0].address`. The same proxy also serves **地番検索** via `?type=bm&lat=..&lon=..`, returning `result.item[]` where each candidate has `address`, `address_detail2` (親番/parent lot), `address_branch2` (枝番/branch, may be null), and `distance`. This proxy is external to this repo.
+`index.html` does not call ZENRIN directly for addresses — it hits the **`zenrin` proxy**: `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=..&lon=..`, reading `json.result.item[0].address`. The same proxy also serves **地番検索** via `?type=bm&lat=..&lon=..`, returning `result.item[]` where each candidate has `address`, `address_detail2` (親番/parent lot), `address_branch2` (枝番/branch, may be null), and `distance`. A third mode `?type=chiban&address=..` does forward geocoding (住所→座標).
+
+**このプロキシのソースは `functions/index.js` にある**（2026-07-14 に別リポジトリから移管）。
 
 **地番取得ロジック (`fetchChiban()`)**: 親番は **reverse を主ソース**にする（`address_level==="TBN"` のときの `address_detail2`）。bm の `distance` 最小だと**区画境界でひとつ隣の地番を拾う**（reverse は point-in-polygon で正しく当てる）ため。枝番は reverse が返さないので **bm の候補から親番一致のものを探して補完**し、`親番-枝番` の形に結合する。数値は ZENRIN が**全角**で返すので `normalize("NFKC")` で半角化してから保存する。
 
-**【次フェーズ課題】bm 候補のキャップ**: bm は `info.hit` が多くても `item[]` を**上位5件にキャップ**して返す（`count` パラメータは無効）。このため親番が5件圏外だと枝番が補完できず**親番止まり**になる（例: `23-2` → `23`）。枝番まで確実に取るには**プロキシ側（別リポジトリ）で件数上限の緩和**が必要。`type=bm` の `address`/`address_detail2`/`address_branch2` 等は ZENRIN が Shift-JIS の全角で返すが、現状プロキシは正しい UTF-8 全角で返せている（取り違えは無し。NFKC 正規化はアプリ側で実施済み）。
+**【解決済み】bm 候補のキャップ**: かつて bm は `item[]` を上位5件にキャップして返しており、親番が5件圏外だと枝番が補完できず**親番止まり**になっていた（例: `23-2` → `23`）。**2026-06-07 にプロキシ側で `limit=0,80` / `proximity` 半径50m に拡大して解決済み**（`functions/index.js` の `type=bm` 参照。実測 hit≈25 なので取りこぼさない）。距離による選定はクライアント側で行う。`type=bm` の `address`/`address_detail2`/`address_branch2` 等は ZENRIN が Shift-JIS の全角で返すが、現状プロキシは正しい UTF-8 全角で返せている（取り違えは無し。NFKC 正規化はアプリ側で実施済み）。
 
 ### Offline support (index.html only)
 
@@ -84,6 +86,28 @@ Writes fall back to a `localStorage` queue (`offlineQueue`) when `navigator.onLi
 No commands to build or run. Open the `.html` files directly in a browser, or serve the folder statically (e.g. `python -m http.server`) — a server is preferable so ZENRIN referer-auth and Firebase auth behave. Geolocation and the camera/StreetView links need HTTPS or `localhost`.
 
 Deployment is via the GitHub repo `inuishingo/akiya-map` (static hosting). Commits to `main` are the unit of change; there is no CI.
+
+### Cloud Functions（`functions/`）
+
+`zenrin`（ZENRIN プロキシ）と `youto`（用途地域プロキシ）が同居する。Firebase project は `housemarket-map`、region は `asia-northeast1`。
+
+**⚠️ `firebase deploy --only functions` は「ローカルのソースに存在しない関数」を削除する。**
+2026-07-14、`zenrin` を別リポジトリで管理していたためこれで実際に削除する事故が発生した（GCS のオブジェクトバージョニングからソースを回収して復旧）。
+再発防止として両関数を `functions/` に同居させてある。**`functions/` から関数を消さないこと。** 個別にデプロイしたい場合は必ず名指しする:
+
+```
+firebase deploy --only functions:youto     # 単体デプロイ（他を消さない）
+firebase deploy --only functions           # zenrin + youto の両方（削除確認が出たら止める）
+```
+
+**APIキーは Secret Manager に置く。コードに書かない**（このリポジトリは Public）:
+
+```
+firebase functions:secrets:set ZENRIN_KEY      # ZENRIN Web API
+firebase functions:secrets:set REINFOLIB_KEY   # 不動産情報ライブラリ（XKT002）
+```
+
+※ `functions:secrets:set` の入力プロンプトは**エコーバックしない**（打っても画面に出ない）。コマンド行にキーを続けて書かないこと。
 
 ## 【未実装・要件メモ】グリッド アーカイブ機能
 
