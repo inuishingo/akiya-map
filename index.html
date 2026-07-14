@@ -575,13 +575,14 @@
     //   取得は Cloud Functions の youto プロキシ経由（APIキーは Secret Manager。コードに持たない）。
     //   ※XKT002 は「用途地域名／建蔽率／容積率」のみ。防火地域・高度地区は取得できない（承知の上）。
     //
-    // 【要対応・鍵の共用】この移行で WMS_KEY の const は消えたが、ZENRIN の鍵は
-    //   14行目の zma_loader.js?key=... に残っている（地図描画用。JS API はブラウザに鍵を
-    //   置く前提の referer 認証なので、これ自体は仕様どおり）。
-    //   問題は **同じ鍵を Web API（reverse/bm/WMS）にも使っている** こと。JS API 鍵は公開前提
-    //   なのだから、Referer を偽装すれば第三者が Web API を叩ける＝従量課金を焼かれうる。
-    //   → 本契約時に「JS API 用（公開・referer制限）」と「Web API 用（サーバ専用・Secret管理）」で
-    //     **鍵を分けて発行してもらうこと**。分けない限り、プロキシに隠しても実質的な防御にならない。
+    // 【既知のリスク・鍵の共用】この移行で WMS_KEY の const は消えたが、ZENRIN の鍵は
+    //   14行目の zma_loader.js?key=... に残っており、実質的に公開されている。
+    //   ZENRIN は「1契約1キー・公開範囲は契約内容でZENRIN側が制御」という設計なので、
+    //   JS API 用と Web API 用で鍵を分けることはできない（＝プロキシに隠しても本質的な防御にならない）。
+    //   認証は Referer だが、Referer はサーバから容易に詐称できるため防御力は限定的。
+    //   → 打てる手は「防ぐ」ではなく「焼かれても青天井にしない」。ZENRIN に
+    //     ①従量課金の上限設定 ②使用量急増のアラート ③不正利用時の請求の扱い
+    //     を確認しておくこと。プロキシ化自体は Secret 管理・キャッシュの面で有効なので維持する。
     const YOUTO_API   = "https://youto-ptddjpvgeq-an.a.run.app";  // Cloud Functions youto プロキシ
     const YOUTO_MAX_TILES = 24;         // 1描画で取りに行くタイル数の上限（超えるならズームを1段引く）
     const youtoTileCache = new Map();   // "z/x/y" -> features[]（パン時の再取得を防ぐ）
