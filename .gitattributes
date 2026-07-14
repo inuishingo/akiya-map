@@ -1,0 +1,10 @@
+# リポジトリ内は LF 固定。作業ツリーの改行はチェックアウト時にOS依存で展開。
+# メモ帳やGitHubのEdit画面で CRLF 保存されても、コミット時にLFへ正規化されるため再発しない。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
