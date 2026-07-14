@@ -1,2 +1,13 @@
 # Claude Code local memory (not shared)
 memory/
+
+# 検証用の一時ファイル置き場（APIサンプル・回収したソース等。コミットしない）
+tmp/
+
+# Claude Code のローカル設定
+.claude/
+
+# Cloud Functions の依存パッケージ（deploy時に自動インストールされる）
+functions/node_modules/
+functions/.env
+firebase-debug.log
