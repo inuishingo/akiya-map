@@ -38,7 +38,7 @@
     let map = null;
     let currentUser = null;
     let myBranch = "名古屋";   // ログイン調査員の所属店(displayNames[email].branch)。読取前は名古屋を既定に。
-    let markers = [];
+    let pinWidgetMap = new Map();
     let pinsUnsub = null;   // pins onSnapshot の解除関数（多重購読防止）
     let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（listenPinsで消さない）
     let followMode = true;       // 追従モード（カーナビ式）。既定ON。手動パンでOFF、📍でON復帰
@@ -343,7 +343,11 @@
         // ログアウト：購読解除＋マーカー消去（再ログイン時の多重購読・残像を防ぐ）
         if (pinsUnsub) { pinsUnsub(); pinsUnsub = null; }
         if (roundsUnsub) { roundsUnsub(); roundsUnsub = null; }
-        if (map) { markers.forEach(m => { try { map.removeWidget(m); } catch(e){} }); markers = []; }
+        if (map) {
+          for (const id of Array.from(pinWidgetMap.keys())) {
+            removePinMarker(id);
+          }
+        }
         document.getElementById("loginScreen").style.display = "flex";
         document.getElementById("mapScreen").style.display = "none";
       }
@@ -606,8 +610,9 @@
     // 物件マーカーを直近データから全再描画（onSnapshot と共用。重畳画像の上へ戻すため）
     function renderAllMarkers(){
       if(!map) return;
-      markers.forEach(m => { try{ map.removeWidget(m); }catch(e){} });
-      markers = [];
+      for (const id of Array.from(pinWidgetMap.keys())) {
+        removePinMarker(id);
+      }
       lastPinDocs.forEach(p => renderMarker(p.id, p.data));
     }
 
@@ -784,13 +789,33 @@
         await buildStaffColors();
         await buildStaffNames();
         lastPinDocs = snap.docs.map(d => ({ id:d.id, data:d.data() }));
-        renderAllMarkers();   // docID基準で全件再描画＝重複なし（重畳後の再スタックにも再利用）
+        snap.docChanges().forEach(change => {
+          const id = change.doc.id;
+          const data = change.doc.data();
+          if (change.type === "added" || change.type === "modified") {
+            removePinMarker(id);
+            renderMarker(id, data);
+          } else if (change.type === "removed") {
+            removePinMarker(id);
+          }
+        });
         renderJumpList();     // 「続きへ」ドロップダウンを最新ピンで再構築
 
       }, e => { /* オフライン/権限エラーは無視（再オンライン・再ログインで復帰） */ });
     }
 
+    function removePinMarker(id) {
+      const entry = pinWidgetMap.get(id);
+      if (!entry) return;
+      if (map) {
+        if (entry.marker) { try { map.removeWidget(entry.marker); } catch (e) {} }
+        if (entry.labelWidget) { try { map.removeWidget(entry.labelWidget); } catch (e) {} }
+      }
+      pinWidgetMap.delete(id);
+    }
+
     function renderMarker(id, data) {
+      removePinMarker(id);
       // 未定義ステータスでも落ちない・透明にならないようガード。
       const s = STATUS[data.status];
       // マーカー本体は「カテゴリ色＋ステータス頭文字」。固定連番(seqNo)は
@@ -813,8 +838,8 @@
         openEditModal(id, data, marker);
       });
       map.addWidget(marker);
-      markers.push(marker);
 
+      let labelWidget = null;
       // ピン番号ラベル(#001形式)をマーカーの上にHTMLオーバーレイ表示。
       // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
       if (data.seqNo != null) {
@@ -844,9 +869,9 @@
           }
         );
         map.addWidget(seqLabel);
-        // markers 配列に入れておけば listenPins() の removeWidget ループで一緒に消える。
-        markers.push(seqLabel);
+        labelWidget = seqLabel;
       }
+      pinWidgetMap.set(id, { marker, labelWidget });
     }
 
     // ===== PIN MODAL（新規）=====
@@ -1136,7 +1161,7 @@
     // 物件ピン(renderMarker)は ZDC.Marker のティアドロップ型＋頭文字＋#001ラベル。
     // 現在地は同じ ZDC.UserWidget API（seqLabelと同じ作法）で、形の違う「青い丸ドット
     // ＋白縁＋パルス」を出して明確に区別する。更新は removeWidget→addWidget（既存と同じ作法）。
-    // markers配列には入れない＝listenPins()の消去ループで消えず、現在地は出しっぱなし。
+    // ピン用ウィジェット管理Mapには入れない＝listenPins()の消去ループで消えず、現在地は出しっぱなし。
     function showMyLocation(lat, lng) {
       if (!map) return;
       if (myLocationMarker) { map.removeWidget(myLocationMarker); myLocationMarker = null; }
