@@ -78,7 +78,7 @@
       parking: { label: "駐車場", color: "#14B8A6", text: "#fff", emoji: "🅿️" },
       tahata:  { label: "田・畑", color: "#65A30D", text: "#fff", emoji: "🌾" },
       // NG系（反社/NG=永久ピン）
-      hansha:  { label: "反社", color: "#1F2937", text: "#fff", emoji: "🚫" },
+      hansha:  { label: "反社", color: "#1F2937", text: "#fff", emoji: "🚨" },
       ng:      { label: "NG",   color: "#6B7280", text: "#fff", emoji: "⛔" },
     };
     const STATUS_GROUPS = [
@@ -86,8 +86,29 @@
       { label: "土地系", keys: ["sarachi", "zasshu", "parking", "tahata"] },
       { label: "NG系", keys: ["hansha", "ng"] },
     ];
+    // 除外候補用ステータス（EXCLUDE_STATUS）。通常STATUSと衝突しないキーを利用（ex_接頭辞）。
+    const EXCLUDE_STATUS = {
+      // 建物系の除外セット
+      ex_new:   { label: "新築中", color: "#FACC15", text: "新", group: "building" },
+      ex_demo:  { label: "解体中", color: "#FACC15", text: "解", group: "building" },
+      ex_live:  { label: "居住中", color: "#FACC15", text: "居", group: "building" },
+      ex_kouhogai_tate:   { label: "候補外(建物)", color: "#FACC15", text: "外", group: "building" },
+      // 土地系の除外セット
+      ex_sale:  { label: "分譲中", color: "#FACC15", text: "分", group: "land" },
+      ex_fill:  { label: "造成中", color: "#FACC15", text: "造", group: "land" },
+      ex_parking:{ label: "駐車場", color: "#FACC15", text: "P", group: "land" },
+      ex_kouhogai_tochi: { label: "候補外(土地)", color: "#FACC15", text: "外", group: "land" },
+    };
+    const EXCLUDE_STATUS_GROUPS = [
+      { label: "建物系（除外）", keys: ["ex_new","ex_demo","ex_live","ex_kouhogai_tate"] },
+      { label: "土地系（除外）", keys: ["ex_sale","ex_fill","ex_parking","ex_kouhogai_tochi"] },
+    ];
     // 未定義ステータス（旧データ等）のフォールバック色
     const FALLBACK_COLOR = "#9CA3AF";
+    // 除外描画色・ラベル枠
+    const EXCLUDE_COLOR = "#FACC15";
+    const EXCLUDE_BORDER = "#78350F";
+    let excludeCandidateMode = false; // UI表示モード（モーダル内のステータス群を切替）
 
     // ===== 担当者カラー（#001ラベル背景） =====
     // 担当者色は displayNames レジストリの order（0始まりの固定index）で決まる（admin.html と同一方式）。
@@ -277,25 +298,64 @@
     // ===== ステータス選択UI（グループ見出し付き2列グリッド）=====
     // 他社物件チェックは「状態と独立の属性」。土地系とNG系の間（＝反社/NGを含むグループの直前）に挟む。
     function renderStatusOptions() {
-      const ocHtml = `
-        <label class="oc-check">
-          <input type="checkbox" id="otherCompanyCheck">
-          <span>🏢 他社物件（他社看板）</span>
-        </label>`;
-      const html = STATUS_GROUPS.map(g => {
-        const isNgGroup = g.keys.includes("hansha") || g.keys.includes("ng");   // 反社/NGを含むグループ
+      // 上部に常時表示するトグル群（他社物件・除外候補）。除外モード時は他社チェックを隠す。
+      const controlsHtml = `
+        <div style="margin-bottom:8px;display:flex;gap:8px;align-items:center;">
+          <label class="oc-check" id="otherCompanyWrapper" style="${excludeCandidateMode ? 'display:none' : ''}">
+            <input type="checkbox" id="otherCompanyCheck"><span>🏢 他社物件</span>
+          </label>
+          <label class="oc-check" id="excludeWrapper">
+            <input type="checkbox" id="excludeCandidateCheck"><span>🚫 除外候補</span>
+          </label>
+        </div>`;
+
+      const groups = (excludeCandidateMode ? EXCLUDE_STATUS_GROUPS : STATUS_GROUPS).map(g => {
         const groupHtml = `
         <div class="status-group-label">${g.label}</div>
         <div class="status-grid">
           ${g.keys.map(k => {
-            const s = STATUS[k];
+            const s = excludeCandidateMode ? EXCLUDE_STATUS[k] : STATUS[k];
+            const color = s ? s.color : FALLBACK_COLOR;
+            const emoji = s && s.emoji ? s.emoji : "";
             return `<div><input class="status-option" type="radio" name="status" id="s-${k}" value="${k}">
-              <label class="status-label" for="s-${k}" style="--c:${s.color}"><span class="emoji">${s.emoji}</span>${s.label}</label></div>`;
+              <label class="status-label" for="s-${k}" style="--c:${color}"><span class="emoji">${emoji}</span>${s ? s.label : k}</label></div>`;
           }).join("")}
         </div>`;
-        return (isNgGroup ? ocHtml : "") + groupHtml;
+        return groupHtml;
       }).join("");
-      document.getElementById("statusGroups").innerHTML = html;
+
+      document.getElementById("statusGroups").innerHTML = controlsHtml + groups;
+
+      // checkbox バインド（切替時は選択中のstatusが新セットに存在するかを保持する）
+      const prevSelected = document.querySelector('input[name="status"]:checked')?.value;
+      const excl = document.getElementById("excludeCandidateCheck");
+      if (excl) {
+        excl.checked = excludeCandidateMode;
+        excl.addEventListener("change", (e) => {
+          const prev = document.querySelector('input[name="status"]:checked')?.value;
+          const prevOther = document.getElementById('otherCompanyCheck') ? document.getElementById('otherCompanyCheck').checked : false;
+          excludeCandidateMode = !!e.target.checked;
+          renderStatusOptions();
+          // 再描画後に前回選択が新セットに残っているなら維持、なければ未選択にする
+          if (prev) {
+            const keep = document.querySelector('input[name="status"][value="' + prev + '"]');
+            if (keep) keep.checked = true; else {
+              const cur = document.querySelector('input[name="status"]:checked'); if (cur) cur.checked = false;
+            }
+          }
+          // 他社チェックの状態を復元（表示される場合のみ）
+          const other = document.getElementById('otherCompanyCheck'); if (other) other.checked = !!prevOther;
+        });
+      }
+      const otherCmp = document.getElementById("otherCompanyCheck");
+      if (otherCmp) {
+        otherCmp.checked = false;
+      }
+      // 初回レンダー時は前回の選択を復元（ある場合のみ）
+      if (prevSelected) {
+        const el = document.querySelector('input[name="status"][value="' + prevSelected + '"]');
+        if (el) el.checked = true;
+      }
     }
     function setStatusRadio(key) {
       const el = document.getElementById("s-" + key);
@@ -817,15 +877,19 @@
     function renderMarker(id, data) {
       removePinMarker(id);
       // 未定義ステータスでも落ちない・透明にならないようガード。
-      const s = STATUS[data.status];
+      const s = STATUS[data.status] || EXCLUDE_STATUS[data.status];
+      // marker color precedence:
+      // 1) Permanent pin (PERMANENT_COLOR)
+      // 2) excludeCandidate (EXCLUDE_COLOR)
+      // 3) status color (STATUS or EXCLUDE_STATUS)
       // マーカー本体は「カテゴリ色＋ステータス頭文字」。固定連番(seqNo)は
       // マーカー上のHTMLオーバーレイ(#001形式)で表示する（下の UserWidget）。
       // seqNo 無し（万一の旧データ）はステータス頭文字→"?"でフォールバック（落とさない）。
       const marker = new ZDC.Marker(
         new ZDC.LatLng(data.lat, data.lng),
         {
-          color: isPermanentPin(data) ? PERMANENT_COLOR : (s ? s.color : FALLBACK_COLOR),
-          text: s ? s.label[0] : "?",
+          color: isPermanentPin(data) ? PERMANENT_COLOR : (data.excludeCandidate ? EXCLUDE_COLOR : (s ? s.color : FALLBACK_COLOR)),
+          text: s ? (s.text || s.label[0]) : "?",
         }
       );
       marker.pinId = id;
@@ -844,14 +908,12 @@
       // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
       if (data.seqNo != null) {
         const label = "#" + String(data.seqNo).padStart(3, "0");
-        // 背景は担当者カラー（文字は白固定）。ただし要確認（住所不明 or 地番未取得）の
-        // ピンは赤背景で目立たせ、事務所での要確認を促す。色基準は admin.html と統一。
-        // ラベル背景色：要確認赤 ＞ 永久黒 ＞ 周回色（担当者色は廃止）。過去周回の通常ピンは薄色。
-        const labelBg = labelColor(data);
+        // ラベル背景色：要確認赤 ＞ 永久黒 ＞ 除外候補(黄) ＞ 周回色
+        const labelBg = data.excludeCandidate ? EXCLUDE_COLOR : labelColor(data);
         const labelOpacity = isPastRound(data) ? ".45" : "1";
         // 他社物件フラグは背景色（＝色優先順位）を上書きせず、🏢＋黄土枠で重畳表示（状態と両方見える）。
         const oc = data.otherCompany === true;
-        const labelBorder = oc ? "2px solid #CA8A04" : "1px solid rgba(255,255,255,.65)";
+        const labelBorder = data.excludeCandidate ? `2px solid ${EXCLUDE_BORDER}` : (oc ? "2px solid #CA8A04" : "1px solid rgba(255,255,255,.65)");
         const seqLabel = new ZDC.UserWidget(
           new ZDC.LatLng(data.lat, data.lng),
           {
@@ -879,8 +941,11 @@
       editingPinId = null;
       editingPinData = null;
       document.getElementById("modalTitle").textContent = "ピンを追加";
+      excludeCandidateMode = false;
+      renderStatusOptions();
       setStatusRadio("akiya");
-      document.getElementById("otherCompanyCheck").checked = false;
+      const oc = document.getElementById("otherCompanyCheck"); if (oc) oc.checked = false;
+      const excl = document.getElementById("excludeCandidateCheck"); if (excl) excl.checked = false;
       document.getElementById("memo").value = "";
       document.getElementById("chibanInput").value = "";
       document.getElementById("chibanInput").placeholder = "地番取得中…";
@@ -897,8 +962,16 @@
       editingPinData = data;
       pendingLatLng = { lat: data.lat, lng: data.lng };
       document.getElementById("modalTitle").textContent = "ピンを編集";
-      setStatusRadio(data.status);
-      document.getElementById("otherCompanyCheck").checked = data.otherCompany === true;
+      // restore excludeCandidate mode and selected status
+      excludeCandidateMode = !!data.excludeCandidate;
+      renderStatusOptions();
+      // ensure correct status radio exists in the rendered set; otherwise reset to default
+      const statusKey = data.status || (excludeCandidateMode ? Object.keys(EXCLUDE_STATUS)[0] : "akiya");
+      setStatusRadio(statusKey);
+      const ocEl = document.getElementById("otherCompanyCheck");
+      if (ocEl) ocEl.checked = data.otherCompany === true;
+      const exclEl = document.getElementById("excludeCandidateCheck");
+      if (exclEl) exclEl.checked = !!data.excludeCandidate;
       document.getElementById("memo").value = data.memo || "";
       document.getElementById("addressLabel").textContent = data.address || "取得中…";
       document.getElementById("chibanInput").value = data.chiban || "";
@@ -1063,7 +1136,12 @@
       if (!status) { showToast("ステータスを選択してください", "warn"); return; }
       const memo   = document.getElementById("memo").value.trim();
       const address = document.getElementById("addressLabel").textContent;
-      const otherCompany = document.getElementById("otherCompanyCheck").checked;   // 状態と独立の属性
+      const otherCompanyEl = document.getElementById("otherCompanyCheck");
+      const otherCompany = otherCompanyEl ? otherCompanyEl.checked : false;
+      const excludeEl = document.getElementById("excludeCandidateCheck");
+      let excludeCandidate = excludeEl ? !!excludeEl.checked : false;
+      // 除外モード表示中は必ず除外候補フラグを立てる（チェック要素が無いケースへの保険）
+      if (excludeCandidateMode) excludeCandidate = true;
       const btn = document.getElementById("saveBtn");
       btn.disabled = true;
       btn.textContent = "保存中…";
@@ -1072,7 +1150,8 @@
 
       if (editingPinId) {
         try {
-          const update = { status, memo, address, otherCompany };
+          const update = { status, memo, address, otherCompany, excludeCandidate };
+          console.log("[debug] update payload:", update);
           // 地番を手修正したときだけ chiban を更新し、手修正フラグ(chibanManual)を
           // 立てて要確認フラグを解除する（手修正は自動再取得より優先）。
           if (chiban !== (editingPinData?.chiban || "")) {
@@ -1100,12 +1179,14 @@
           status,
           memo,
           otherCompany,       // 他社所有/媒介の属性（状態とは独立・boolean）
+          excludeCandidate,
           areaCode: pendingAreaCode,   // reverse由来のJIS5桁市区町村コード（失敗時null・推測しない）
           areaName: pendingAreaName,   // reverse由来の市区町村名（政令市は区／失敗時null）
           surveyRound: (roundState[`${myBranch}__${pendingAreaCode}`]?.currentRound) || 1,   // そのエリアの現在周回（未取得/未判定=1・現場を止めない）
           branch: myBranch,   // ログイン調査員の所属店（loadMyBranchで確定。名古屋員は"名古屋"のまま）
           createdAt: new Date().toISOString(),
         };
+        console.log("[debug] pinData before save:", pinData);
         // 参考地番(近傍筆・住居表示地区)を現場でそのまま採用＝要確認フラグを立てる。
         // 手修正して確定した場合(chibanManual=true)は対象外＝確定扱い。
         if (pendingChibanRef && chiban && chiban === pendingChiban) {
@@ -1118,6 +1199,7 @@
             pinData.seqNo = await nextSeqNo();
             const ref = await addDoc(collection(db, "pins"), pinData);
             renderMarker(ref.id, pinData);
+            console.log("[debug] rendered after save:", ref.id, pinData);
             showToast("保存しました");
           } catch(e) {
             offlineQueue.push(pinData);
