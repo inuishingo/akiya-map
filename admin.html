@@ -110,8 +110,34 @@
       { key: "land",     label: "土地系", keys: ["sarachi", "zasshu", "parking", "tahata"] },
       { key: "ng",       label: "NG系", keys: ["hansha", "ng"] },  // key="ng"は互換維持（DOM id/フィルタ）
     ];
+    const EXCLUDE_STATUS = {
+      ex_new: { label: "新築中", color: "#FACC15", text: "新", group: "building" },
+      ex_demo: { label: "解体中", color: "#FACC15", text: "解", group: "building" },
+      ex_live: { label: "居住中", color: "#FACC15", text: "居", group: "building" },
+      ex_kouhogai_tate: { label: "候補外(建物)", color: "#FACC15", text: "外", group: "building" },
+      ex_sale: { label: "分譲中", color: "#FACC15", text: "分", group: "land" },
+      ex_fill: { label: "造成中", color: "#FACC15", text: "造", group: "land" },
+      ex_parking: { label: "駐車場", color: "#FACC15", text: "P", group: "land" },
+      ex_kouhogai_tochi: { label: "候補外(土地)", color: "#FACC15", text: "外", group: "land" },
+    };
+    const EXCLUDE_STATUS_GROUPS = [
+      { label: "建物系（除外）", keys: ["ex_new", "ex_demo", "ex_live", "ex_kouhogai_tate"] },
+      { label: "土地系（除外）", keys: ["ex_sale", "ex_fill", "ex_parking", "ex_kouhogai_tochi"] },
+    ];
     // 未定義ステータス（旧データ等）のフォールバック色
     const FALLBACK_COLOR = "#9CA3AF";
+    const EXCLUDE_COLOR = "#FACC15";
+    const EXCLUDE_BORDER = "#78350F";
+
+    function isExcludeCandidatePin(p) {
+      return p?.excludeCandidate === true || (typeof p?.status === "string" && /^ex_/.test(p.status));
+    }
+
+    function statusDisplayLabel(key) {
+      if (!key) return "";
+      const info = EXCLUDE_STATUS[key] || STATUS[key];
+      return info ? info.label : String(key);
+    }
 
     // ===== 担当者カラー（地図ピン） =====
     // 担当者色は displayNames レジストリの order（0始まりの固定index）で決まる（index.html と同一方式）。
@@ -167,10 +193,11 @@
     function currentRoundOf(p){ const s = roundState[`${pinBranch(p)}__${areaKey(p)}`]; return (s && Number(s.currentRound)) || 1; }
     function roundOf(p){ return Number(p.surveyRound) || 1; }
     function isPastRound(p){ return !isPermanentPin(p) && roundOf(p) < currentRoundOf(p); }   // 過去周回の通常ピン=薄色対象
-    // ラベル背景色（index/admin統一）：要確認赤 ＞ 永久黒 ＞ 周回色（1青/2緑/3橙/4紫→((r-1)%4)ローテ）。担当者色は廃止。
+    // ラベル背景色（index/admin統一）：要確認赤 ＞ 永久黒 ＞ 除外候補黄 ＞ 周回色（1青/2緑/3橙/4紫→((r-1)%4)ローテ）。担当者色は廃止。
     const ROUND_COLORS = ["#2563EB","#16A34A","#EA580C","#9333EA"];
     function roundColor(r){ return ROUND_COLORS[(((r||1)-1)%4+4)%4]; }
     function labelColor(p){
+      if (isExcludeCandidatePin(p)) return EXCLUDE_COLOR;
       if (isReviewFlagged(p)) return "#EF4444";
       if (isPermanentPin(p))  return PERMANENT_COLOR;
       return roundColor(roundOf(p));
@@ -209,14 +236,18 @@
 
     // グループ見出し付き <optgroup> を生成（selected 指定で現在値を選択）。
     function statusOptionsHTML(selected) {
-      const known = STATUS_GROUPS.map(g =>
+      const groups = [
+        ...STATUS_GROUPS.map(g => ({ ...g, entries: g.keys.map(k => ({ key: k, label: STATUS[k]?.label || statusDisplayLabel(k) })) })),
+        ...EXCLUDE_STATUS_GROUPS.map(g => ({ ...g, entries: g.keys.map(k => ({ key: k, label: EXCLUDE_STATUS[k]?.label || statusDisplayLabel(k) })) }))
+      ];
+      const known = groups.map(g =>
         `<optgroup label="${g.label}">` +
-        g.keys.map(k => `<option value="${k}" ${selected === k ? "selected" : ""}>${STATUS[k].label}</option>`).join("") +
+        g.entries.map(entry => `<option value="${entry.key}" ${selected === entry.key ? "selected" : ""}>${entry.label}</option>`).join("") +
         `</optgroup>`
       ).join("");
       // 未定義キー（旧データ）は壊さず現状値を選択肢として先頭に残す
-      const legacy = (selected && !STATUS[selected])
-        ? `<option value="${selected}" selected>${selected}（旧）</option>` : "";
+      const legacy = (selected && !STATUS[selected] && !EXCLUDE_STATUS[selected])
+        ? `<option value="${selected}" selected>${selected}</option>` : "";
       return legacy + known;
     }
 
@@ -816,10 +847,14 @@
     function initStatusFilter() {
       const sel = document.getElementById("statusFilter");
       if (!sel) return;
+      const groups = [
+        ...STATUS_GROUPS.map(g => ({ ...g, entries: g.keys.map(k => ({ key: k, label: STATUS[k]?.label || statusDisplayLabel(k) })) })),
+        ...EXCLUDE_STATUS_GROUPS.map(g => ({ ...g, entries: g.keys.map(k => ({ key: k, label: EXCLUDE_STATUS[k]?.label || statusDisplayLabel(k) })) }))
+      ];
       sel.innerHTML = `<option value="all">ステータス：すべて</option>` +
-        STATUS_GROUPS.map(g =>
+        groups.map(g =>
           `<optgroup label="${g.label}">` +
-          g.keys.map(k => `<option value="${k}">${STATUS[k].label}</option>`).join("") +
+          g.entries.map(entry => `<option value="${entry.key}">${entry.label}</option>`).join("") +
           `</optgroup>`
         ).join("");
     }
@@ -839,8 +874,12 @@
     // 矛盾組合せ(建物系×反社)は積集合が空→0件で正しく空表示。
     function statusAllowed(p) {
       if (activeGroupFilter !== "all") {
-        const g = STATUS_GROUPS.find(x => x.key === activeGroupFilter);
-        if (!g || !g.keys.includes(p.status)) return false;
+        const allowedKeys = activeGroupFilter === "building"
+          ? [...(STATUS_GROUPS.find(x => x.key === "building")?.keys || []), ...(EXCLUDE_STATUS_GROUPS[0]?.keys || [])]
+          : activeGroupFilter === "land"
+            ? [...(STATUS_GROUPS.find(x => x.key === "land")?.keys || []), ...(EXCLUDE_STATUS_GROUPS[1]?.keys || [])]
+            : (STATUS_GROUPS.find(x => x.key === activeGroupFilter)?.keys || []);
+        if (!allowedKeys.includes(p.status)) return false;
       }
       if (activeStatusFilter !== "all" && p.status !== activeStatusFilter) return false;
       return true;
@@ -921,11 +960,15 @@
       }
       container.innerHTML = pins.map(p => {
         // 未定義ステータスでも崩れないようガード
-        const s = STATUS[p.status];
-        const sLabel = s ? s.label : (p.status || "不明");
+        const s = STATUS[p.status] || EXCLUDE_STATUS[p.status];
+        const isExclude = isExcludeCandidatePin(p);
+        const sLabel = isExclude
+          ? (EXCLUDE_STATUS[p.status] ? `除外候補：${EXCLUDE_STATUS[p.status].label}` : "除外候補")
+          : (s ? s.label : (p.status || "不明"));
         // 要確認（住所不明 or 地番未取得）はバッジを赤にして示す。色基準は needsReviewNow に統一。
         const review = isReviewFlagged(p);
-        const sColor = review ? "#EF4444" : (isPermanentPin(p) ? PERMANENT_COLOR : (s ? s.color : FALLBACK_COLOR));
+        const sColor = isExclude ? EXCLUDE_COLOR : (review ? "#EF4444" : (isPermanentPin(p) ? PERMANENT_COLOR : (s ? s.color : FALLBACK_COLOR)));
+        const sTextColor = isExclude ? "#111827" : "#fff";
         const date = jstYmd(p.createdAt) || "–";
         const isChecked = checkedIds.has(p.id);
         const isSelected = selectedPinId === p.id;
@@ -945,7 +988,7 @@
             <input type="checkbox" class="pin-check" ${isChecked ? "checked" : ""}
               onclick="toggleCheck('${p.id}',event)">
             ${p.seqNo != null ? `<span class="pin-seq">${fmtSeq(p.seqNo)}</span>` : ""}
-            <span class="status-badge" style="background:${sColor};color:#fff">${sLabel}</span>
+            <span class="status-badge" style="background:${sColor};color:${sTextColor}">${sLabel}</span>
             ${p.otherCompany ? `<span class="oc-badge" title="他社看板">🏢 他社物件</span>` : ""}
             <span class="pin-date">${date}</span>
             <span class="pin-staff">${staffName(p.email)}</span>
@@ -1036,12 +1079,16 @@
       markers = [];
       filtered().forEach(p => {
         // 未定義ステータスでも落ちない・透明にならないようガード
-        const s = STATUS[p.status];
+        const s = STATUS[p.status] || EXCLUDE_STATUS[p.status];
+        const isExclude = isExcludeCandidatePin(p);
         // マーカー色は「担当者(メール)ごとの固定色」。頭文字はステータスを示す。
         // 固定連番(seqNo)はマーカー上のHTMLオーバーレイ(#001形式)で表示する（下の UserWidget）。
         const marker = new ZDC.Marker(
           new ZDC.LatLng(p.lat, p.lng),
-          { color: isPermanentPin(p) ? PERMANENT_COLOR : roundColor(roundOf(p)), text: s ? s.label[0] : "?" }
+          {
+            color: isPermanentPin(p) ? PERMANENT_COLOR : (isExclude ? EXCLUDE_COLOR : (s ? s.color : FALLBACK_COLOR)),
+            text: s ? (s.text || s.label[0]) : "?"
+          }
         );
         marker.pinId = p.id;
         marker.addEventListener("click", function() { selectPin(p.id); });
@@ -1057,7 +1104,7 @@
           const labelOpacity = isPastRound(p) ? ".45" : "1";
           // 他社物件フラグは背景色（色優先順位）を上書きせず、🏢＋黄土枠で重畳表示。
           const oc = p.otherCompany === true;
-          const labelBorder = oc ? "2px solid #CA8A04" : "1px solid rgba(255,255,255,.65)";
+          const labelBorder = isExcludeCandidatePin(p) ? `2px solid ${EXCLUDE_BORDER}` : (oc ? "2px solid #CA8A04" : "1px solid rgba(255,255,255,.65)");
           const seqLabel = new ZDC.UserWidget(
             new ZDC.LatLng(p.lat, p.lng),
             {
@@ -1334,7 +1381,7 @@
           banchi || "",        // 住居表記(番地)：型は下で文字列に固定
           p.chiban || "",      // 地番：型は下で文字列に固定
           "",                  // レ：REINS確認用の空白列（事務員が手入力。維持）
-          STATUS[p.status]?.label || p.status, // ステータス
+          statusDisplayLabel(p.status) || p.status, // ステータス
           p.memo || "",        // 調査員メモ（現地memo）：型は下で文字列に固定
           p.adminMemo || "",   // 事務員メモ（adminMemo）：型は下で文字列に固定
           jstYmd(p.createdAt), // 発見日：JST固定（表示・フィルタと一致）
