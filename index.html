@@ -393,6 +393,9 @@
         document.getElementById("mapScreen").style.display = "flex";
         document.getElementById("userLabel").textContent = user.email;
         await loadMyBranch(user.email);   // 自店を確定してからピン/グリッド作成に入る（branch に使う）
+        // 担当者カラー/表示名は displayNames の全件読み。ログイン時に1回だけ読む
+        // （以前は pins の onSnapshot ごとに読んでおり、ピン1件の追加/編集でも毎回 getDocs が走っていた）。
+        await Promise.all([buildStaffColors(), buildStaffNames()]);
         initMap();
         // 再ログイン時は initMap が早期returnするため、map既存ならここで購読を張り直す
         // （初回ログインは map 生成後の ready コールバック内で listenPins する）
@@ -618,6 +621,7 @@
 
             // 地図移動・ズーム完了(idle)でグリッドを可視範囲だけ再描画（gridMode中のみ）。
             map.addEventListener("idle", function() { if (gridMode) redrawGrid(); });
+            map.addEventListener("idle", function(){ relayoutVisiblePins(); });  // 可視範囲のピンだけ描く（範囲外は消す）
             map.addEventListener("idle", function(){ redrawActiveLayers(); }); // 用途地域ON中のみ追従再描画
 
             // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
@@ -667,14 +671,72 @@
     function layerBBoxArr(){ const b=map.getLatLngBounds(); const sw=map.latlngToWebMercator(b.getSouthWest()); const ne=map.latlngToWebMercator(b.getNorthEast()); return [sw[0],sw[1],ne[0],ne[1]]; }
     function removeYouto(){ if(youtoWidget){ try{ map.removeWidget(youtoWidget); }catch(e){} youtoWidget=null; } }
 
+    // ===== 描画カリング（ビューポート＋過去周回）=====
+    // 端末の重さは「地図に載っているウィジェット数」にほぼ比例する（1ピン＝marker＋#001ラベルの2個）。
+    // 購読は全件のまま（lastPinDocs にメモリ保持）、描画だけを可視範囲＋バッファに絞る。
+    // 範囲外は marker とラベルをウィジェットごと外す（removePinMarker が両方消す）。
+    const VIEW_BUFFER_RATIO = 0.15;   // 可視範囲を上下左右にこの割合ぶん広げてからカリング（パン時のチラつき防止）
+    let showPastRounds = false;       // 過去周回ピンの表示（既定OFF＝描画しない。旧ボタンでON）
+
+    // バッファ込みの可視範囲。取得できない場合は null（＝カリングせず従来どおり描く）。
+    function viewBounds() {
+      if (!map) return null;
+      let b;
+      try { b = map.getLatLngBounds(); } catch (e) { return null; }
+      if (!b) return null;
+      const sw = b.getSouthWest(), ne = b.getNorthEast();
+      const dLat = (ne.lat - sw.lat) * VIEW_BUFFER_RATIO;
+      const dLng = (ne.lng - sw.lng) * VIEW_BUFFER_RATIO;
+      return { south: sw.lat - dLat, north: ne.lat + dLat, west: sw.lng - dLng, east: ne.lng + dLng };
+    }
+    function inViewBounds(data, vb) {
+      const lat = Number(data.lat), lng = Number(data.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;   // 座標欠落は描けない
+      if (!vb) return true;   // 範囲が取れない時は従来どおり描く（現場を止めない）
+      return lat >= vb.south && lat <= vb.north && lng >= vb.west && lng <= vb.east;
+    }
+    // 描画対象＝「可視範囲内」かつ「（過去周回OFFなら）過去周回でない」。
+    // 永久ピン(反社/NG)は isPastRound が常に false ＝ 過去周回OFFでも従来どおり常時表示。
+    function shouldRenderPin(data, vb) {
+      if (!showPastRounds && isPastRound(data)) return false;
+      return inViewBounds(data, vb);
+    }
+    // 可視範囲の変化に追従して描画を差分更新（範囲内で未描画は追加／対象外は marker＋ラベルごと除去）。
+    // 既に描画済みのピンは触らない＝パンのたびに全再生成しない。
+    function relayoutVisiblePins() {
+      if (!map) return;
+      const vb = viewBounds();
+      const keep = new Set();
+      lastPinDocs.forEach(p => {
+        if (!shouldRenderPin(p.data, vb)) return;
+        keep.add(p.id);
+        if (!pinWidgetMap.has(p.id)) renderMarker(p.id, p.data);
+      });
+      for (const id of Array.from(pinWidgetMap.keys())) {
+        if (!keep.has(id)) removePinMarker(id);
+      }
+    }
+
     // 物件マーカーを直近データから全再描画（onSnapshot と共用。重畳画像の上へ戻すため）
+    // 全消し→描き直しだが、描くのは可視範囲内かつ表示対象のピンだけ。
     function renderAllMarkers(){
       if(!map) return;
       for (const id of Array.from(pinWidgetMap.keys())) {
         removePinMarker(id);
       }
-      lastPinDocs.forEach(p => renderMarker(p.id, p.data));
+      const vb = viewBounds();
+      lastPinDocs.forEach(p => { if (shouldRenderPin(p.data, vb)) renderMarker(p.id, p.data); });
     }
+
+    // 過去周回ピンの表示トグル（既定OFF）。ONで従来の薄色(opacity .45)表示に戻る。
+    window.togglePastRounds = () => {
+      showPastRounds = !showPastRounds;
+      const btn = document.getElementById("pastBtn");
+      if (btn) btn.classList.toggle("active", showPastRounds);
+      relayoutVisiblePins();
+      showToast(showPastRounds ? "過去周回ピン：表示" : "過去周回ピン：非表示（現在の周回のみ）",
+                showPastRounds ? "warn" : "ok");
+    };
 
     // ── 用途地域レイヤ（不動産情報ライブラリ XKT002 / GeoJSON）──────────────
     // XYZタイル方式（z=11〜15）。可視範囲を覆うタイルだけを取りに行くので、
@@ -844,17 +906,17 @@
     function listenPins() {
       if (!map) return;
       if (pinsUnsub) pinsUnsub();   // 多重購読防止：既存リスナーを解除してから張り直す
-      pinsUnsub = onSnapshot(collection(db, "pins"), async snap => {
-        // 担当者カラー・表示名（全担当者基準）を先に構築してからマーカーを再描画
-        await buildStaffColors();
-        await buildStaffNames();
+      pinsUnsub = onSnapshot(collection(db, "pins"), snap => {
+        // 担当者カラー・表示名はログイン時に1回読み済み（ここでは読まない）。
         lastPinDocs = snap.docs.map(d => ({ id:d.id, data:d.data() }));
+        const vb = viewBounds();
         snap.docChanges().forEach(change => {
           const id = change.doc.id;
           const data = change.doc.data();
           if (change.type === "added" || change.type === "modified") {
             removePinMarker(id);
-            renderMarker(id, data);
+            // 可視範囲外／過去周回(OFF時)は描かない。範囲内に入ったら idle の relayoutVisiblePins が拾う。
+            if (shouldRenderPin(data, vb)) renderMarker(id, data);
           } else if (change.type === "removed") {
             removePinMarker(id);
           }
@@ -1198,7 +1260,8 @@
             // 固定連番を採番してから保存（オンライン時のみ。オフラインは同期時に採番）。
             pinData.seqNo = await nextSeqNo();
             const ref = await addDoc(collection(db, "pins"), pinData);
-            renderMarker(ref.id, pinData);
+            // 保存直後の即時描画も表示対象判定を通す（保存中に画面外へパンした場合は描かない。onSnapshot/idleが拾う）
+            if (shouldRenderPin(pinData, viewBounds())) renderMarker(ref.id, pinData);
             console.log("[debug] rendered after save:", ref.id, pinData);
             showToast("保存しました");
           } catch(e) {
@@ -1421,6 +1484,11 @@
       background:#1f2937;border:1px solid #374151;color:#9ca3af;font-size:18px;font-weight:700;
       display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.4); }
     .youto-btn.active { background:#d97706;border-color:#d97706;color:#fff; } /* ON=オレンジ */
+    /* 過去周回ピンの表示トグル（用途地域ボタンの上）。既定OFF＝過去周回は描かない（描画量の削減） */
+    .past-btn { position:fixed; bottom:220px; right:16px; z-index:100; width:48px;height:48px;border-radius:50%;
+      background:#1f2937;border:1px solid #374151;color:#9ca3af;font-size:18px;font-weight:700;
+      display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.4); }
+    .past-btn.active { background:#7C3AED;border-color:#7C3AED;color:#fff; } /* ON=紫 */
     /* 用途地域 属性ポップアップ（上部） */
     .youto-info { display:none; position:fixed; top:130px; left:12px; right:12px; z-index:250;
       background:rgba(17,24,39,.96);color:#e5e7eb;border:1px solid #374151;border-radius:10px;
@@ -1530,6 +1598,7 @@
   <div class="grid-banner" id="gridBanner">🗺️ 調査グリッド記録モード：マスをタップで調査済み/解除（ピン追加は一時停止中）</div>
   <div class="youto-banner" id="youtoBanner">🏠 用途地域モード：地図タップで用途地域の属性表示（ピン追加は一時停止中）</div>
   <div class="youto-info" id="youtoInfo" style="display:none"></div>
+  <button class="past-btn" id="pastBtn" onclick="togglePastRounds()" title="過去周回ピンの表示（既定OFF）">旧</button>
   <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド記録モード">▦</button>
   <button class="youto-btn" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋タップで属性">用</button>
   <button class="locate-btn following" onclick="locateMe()" title="現在地">📍</button>
