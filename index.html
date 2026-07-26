@@ -575,8 +575,10 @@
           return;
         }
 
-        // まず仮の中心＝名古屋駅で即表示（白画面回避）。現在地は取得でき次第寄せる。
-        mapOptions.center = new ZDC.LatLng(35.170, 136.882);
+        // 初期中心はログイン者の拠点駅で即表示（白画面回避）。京都=京都駅／名古屋・全店=名古屋駅。
+        // myBranchはloadMyBranchで確定済み。モバイルは現在地取得で上書きされる。
+        const HOME_CENTER = { "京都": new ZDC.LatLng(34.9859, 135.7585) };   // 京都駅
+        mapOptions.center = HOME_CENTER[myBranch] || new ZDC.LatLng(35.170, 136.882);   // 既定=名古屋駅
         mapOptions.zoom = 15;
         mapOptions.movable = true;
         mapOptions.zoomable = true;
