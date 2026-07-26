@@ -677,6 +677,8 @@
     // 範囲外は marker とラベルをウィジェットごと外す（removePinMarker が両方消す）。
     const VIEW_BUFFER_RATIO = 0.15;   // 可視範囲を上下左右にこの割合ぶん広げてからカリング（パン時のチラつき防止）
     let showPastRounds = false;       // 過去周回ピンの表示（既定OFF＝描画しない。旧ボタンでON）
+    const LABEL_MIN_ZOOM = 16;        // #001番号ラベルはこのズーム以上でのみ描画（広域ではmarkerのみ＝1ピン ウィジェット1個）
+    let labelsShown = null;           // ラベルを描いているか（ズーム閾値の状態）。跨いだら描画済みピンを描き直す
 
     // バッファ込みの可視範囲。取得できない場合は null（＝カリングせず従来どおり描く）。
     function viewBounds() {
@@ -706,6 +708,12 @@
     function relayoutVisiblePins() {
       if (!map) return;
       const vb = viewBounds();
+      // #001ラベルはズーム閾値以上でのみ描く。閾値を跨いだら描画済みピンを消して描き直し、ラベル有無を更新。
+      const showLabels = map.getZoom() >= LABEL_MIN_ZOOM;
+      if (showLabels !== labelsShown) {
+        labelsShown = showLabels;
+        for (const id of Array.from(pinWidgetMap.keys())) removePinMarker(id);
+      }
       const keep = new Set();
       lastPinDocs.forEach(p => {
         if (!shouldRenderPin(p.data, vb)) return;
@@ -968,7 +976,7 @@
       let labelWidget = null;
       // ピン番号ラベル(#001形式)をマーカーの上にHTMLオーバーレイ表示。
       // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
-      if (data.seqNo != null) {
+      if (data.seqNo != null && map.getZoom() >= LABEL_MIN_ZOOM) {
         const label = "#" + String(data.seqNo).padStart(3, "0");
         // ラベル背景色：要確認赤 ＞ 永久黒 ＞ 除外候補(黄) ＞ 周回色
         const labelBg = data.excludeCandidate ? EXCLUDE_COLOR : labelColor(data);
@@ -1284,12 +1292,18 @@
     window.deletePin = async () => {
       if (!editingPinId) return;
       if (!confirm("このピンを削除しますか？")) return;
+      const id = editingPinId;            // closeModalでnullになる前に控える
+      // 楽観削除：押した瞬間にUIから消す。実削除の確定はonSnapshotの"removed"でも起きる。
+      // 低速回線でawaitが転けても削除は後でサーバーに反映されるので、成功表示を先に出す（誤エラー対策）。
+      removePinMarker(id);
+      closeModal();
+      showToast("削除しました");
       try {
-        await deleteDoc(doc(db, "pins", editingPinId));
-        showToast("削除しました");
-        closeModal();
-      } catch(e) {
-        showToast("削除に失敗しました", "error");
+        await deleteDoc(doc(db, "pins", id));
+      } catch (e) {
+        // 本当の失敗（権限）だけ通知。ネットワーク一時失敗は黙認（Firestore再送＋onSnapshotで確定）。
+        // 権限で消せていない場合、lastPinDocsに残り次のidleのrelayoutVisiblePinsでピンが戻る＝実態を反映。
+        if (e && e.code === "permission-denied") showToast("削除できませんでした（権限）", "error");
       }
     };
 
