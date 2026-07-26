@@ -280,15 +280,18 @@
     function staffName(email) {
       return staffNameMap[email] || email || "–";
     }
-    // ログイン調査員自身の所属店を displayNames から取得。ピン/グリッド作成の branch に使う。
-    // 読取NG/未設定は "名古屋" フォールバック（二重防御）。名古屋員は branch="名古屋" のまま＝挙動不変。
+    // ===== 店舗判定（メールルールに一本化）=====
+    // scope=見えるピン範囲・branch=新規ピンの所属。「kyoto含む→京都／@housemarket.com(kyoto無)→全店／それ以外→名古屋」。
+    function branchOfEmail(email){
+      return String(email||"").toLowerCase().includes("kyoto") ? "京都" : "名古屋";
+    }
+    function isAllStore(email){
+      const e = String(email||"").toLowerCase();
+      return !e.includes("kyoto") && e.endsWith("@housemarket.com");
+    }
+    // ログイン者の所属店（新規ピン/グリッドのbranchに使う）。メールで決定＝全店アカウントは名古屋拠点扱い。
     async function loadMyBranch(email) {
-      myBranch = "名古屋";
-      try {
-        const snap = await getDoc(doc(db, "displayNames", email));
-        const b = snap.exists() ? snap.data().branch : null;
-        if (b && String(b).trim()) myBranch = b;
-      } catch (e) { /* 読取NGは名古屋フォールバック */ }
+      myBranch = branchOfEmail(email);
     }
     // ピンの所属店。branch空/欠落は "名古屋" とみなす（admin.html と同一判定）。
     function pinBranch(p) {
@@ -910,11 +913,14 @@
       redrawActiveLayers();
     };
 
-    // ===== LISTEN PINS（全調査員のピンをリアルタイム共有。admin.html と同じ全件購読方式）=====
+    // ===== LISTEN PINS（第二便：自店のピンだけ購読。全店アカウント(@housemarket.com)のみ全件）=====
     function listenPins() {
       if (!map) return;
       if (pinsUnsub) pinsUnsub();   // 多重購読防止：既存リスナーを解除してから張り直す
-      pinsUnsub = onSnapshot(collection(db, "pins"), snap => {
+      const base = collection(db, "pins");
+      // 自店に絞る（全店アカウントのみ全件）。myBranchはloadMyBranchで確定済み。
+      const src = isAllStore(currentUser && currentUser.email) ? base : query(base, where("branch", "==", myBranch));
+      pinsUnsub = onSnapshot(src, snap => {
         // 担当者カラー・表示名はログイン時に1回読み済み（ここでは読まない）。
         lastPinDocs = snap.docs.map(d => ({ id:d.id, data:d.data() }));
         const vb = viewBounds();
