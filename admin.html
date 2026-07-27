@@ -749,10 +749,12 @@
             htmlSource:
               '<div onclick="event.stopPropagation();showKouzuInfo(\'' + m.id + '\')"'
               + ' style="transform:translateX(-50%);white-space:nowrap;'
-              + 'padding:1px 7px;border-radius:9px;'
-              + 'background:' + KOUZU_COLOR + ';color:#062c33;'
-              + 'font-size:11px;font-weight:700;line-height:1.6;'
-              + 'border:1px solid rgba(255,255,255,.85);'
+              + 'padding:2px 9px;border-radius:9px;'
+              // チップはマーカー(シアン)と別色のオレンジ。青ピン群に埋もれないための視認色で、
+              // 他社#CA8A04 / 要確認#EF4444 / 反社#1F2937 のいずれとも被らない。
+              + 'background:#EA580C;color:#fff;'
+              + 'font-size:12px;font-weight:800;line-height:1.6;'
+              + 'border:1px solid #fff;'
               + 'box-shadow:0 1px 3px rgba(0,0,0,.35);'
               + 'pointer-events:auto;cursor:pointer;">📄公図</div>',
             offset: new ZDC.Point(0, -58),
