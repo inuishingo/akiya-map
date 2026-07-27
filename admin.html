@@ -737,6 +737,30 @@
         mk.addEventListener("click", function() { showKouzuInfo(m.id); });
         map.addWidget(mk);
         kouzuWidgets.push(mk);
+
+        // 判別＋クリック確実化用のチップ。既存ピンとマーカーが重なると本体を掴めず削除できないため、
+        // 「見えているチップ自体」をクリック対象にする（pointer-events:auto）。
+        // seqLabel(#001) と同じ UserWidget・同じ offset。propagation:false と stopPropagation で
+        // クリックを地図へ抜けさせない（公図取得モードON中に登録モーダルが開くのを防ぐ）。
+        // m.id は Firestore 自動ID（英数）なのでシングルクオート内に直接埋めて安全。
+        const chip = new ZDC.UserWidget(
+          new ZDC.LatLng(m.lat, m.lng),
+          {
+            htmlSource:
+              '<div onclick="event.stopPropagation();showKouzuInfo(\'' + m.id + '\')"'
+              + ' style="transform:translateX(-50%);white-space:nowrap;'
+              + 'padding:1px 7px;border-radius:9px;'
+              + 'background:' + KOUZU_COLOR + ';color:#062c33;'
+              + 'font-size:11px;font-weight:700;line-height:1.6;'
+              + 'border:1px solid rgba(255,255,255,.85);'
+              + 'box-shadow:0 1px 3px rgba(0,0,0,.35);'
+              + 'pointer-events:auto;cursor:pointer;">📄公図</div>',
+            offset: new ZDC.Point(0, -58),
+            propagation: false,
+          }
+        );
+        map.addWidget(chip);
+        kouzuWidgets.push(chip);   // トグルOFF/削除時にマーカーと一緒に removeWidget される
       });
     }
 
@@ -768,6 +792,9 @@
       box.style.display = "block";
     }
     window.closeKouzuInfo = () => { const b = document.getElementById("kouzuInfo"); if (b) b.style.display = "none"; };
+    // 📄公図チップのインライン onclick から呼ぶため window に出す（module スコープのままだと
+    // インラインhandler=グローバル評価で ReferenceError になり、チップが反応しない）。
+    window.showKouzuInfo = showKouzuInfo;
 
     // 削除は管理者のみ（rules でも担保）。楽観更新＝先にローカルから外して再描画し、
     // 失敗時はロールバック（index.html の deletePin と同思想）。
