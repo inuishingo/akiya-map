@@ -60,5 +60,15 @@ service cloud.firestore {
                     && (resource.data.surveyedBy == request.auth.token.email || isAdmin());
     }
     // ───────────────────────────────────────────────────────────────
+
+    // 公図取得済みマーク（kouzu_marks）。法務局/登記情報提供サービスで公図を取得した地点の記録。
+    //   二重取得の防止が目的。read も isAdmin にすることで調査員(index.html)からは購読しても読めない
+    //   ＝完全に管理者専用。公図ファイル本体は保持しない（マークとメタ情報のみ）。
+    match /kouzu_marks/{markId} {
+      allow read:   if isAdmin();
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
   }
 }

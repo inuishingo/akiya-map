@@ -17,7 +17,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy, runTransaction }
+    import { getFirestore, collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy, runTransaction, serverTimestamp }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -53,6 +53,16 @@
     let regStatus = "hansha";   // 登録ステータス（hansha/ng）
     let lastGeoLatLng = null;   // 直近ジオコード座標（住所からの登録用）
     let regTempMarker = null;   // 一時マーカー（登録前の仮位置）
+
+    // ===== 公図取得済みマーク（kouzu_marks）— 管理画面専用 =====
+    // 地番レイヤで地番が取得できず「公図」を法務局/登記情報提供サービスで取得したエリアの記録。
+    // 二重取得の防止が目的。調査員(index.html)には購読・描画とも一切追加しない（rules の read も isAdmin）。
+    const KOUZU_COLOR = "#06B6D4";  // 専用色。反社#1F2937 / NG#6B7280 / 要確認#EF4444 / staff色と重複なし
+    let kouzuMode  = false;   // 地図クリックで公図マークを登録するモード（反社/NG登録と排他）
+    let kouzuOn    = true;    // 公図マークの表示ON/OFF（既定ON）
+    let kouzuMarks = [];      // Firestoreミラー（自店分のみ）
+    let kouzuWidgets = [];    // 地図ウィジェット。markers とは別配列＝ピン再描画で消えない
+    let kouzuPending = null;  // 登録モーダルで保留中の座標 {lat,lng}
 
     // ===== 要確認(赤)判定 — 単一真実 =====
     // 赤＝住所が要確認 or 地番が未取得。index.html と同一定義（色基準を統一）。
@@ -285,6 +295,7 @@
         listenPins();
         listenSurveyGrids();   // 調査グリッドの進捗をリアルタイム購読（表示はトグルON時のみ）
         listenRounds();        // 周回マスタを購読（現在周回で色/薄色・周回フィルタ候補を判定）
+        listenKouzuMarks();    // 公図取得済みマーク（管理者専用）を購読
       } else {
         document.getElementById("loginScreen").style.display = "flex";
         document.getElementById("adminScreen").style.display = "none";
@@ -431,9 +442,11 @@
             map.addEventListener("click", function(e){
               if (!e || !e.latlng) return;
               if (regMode) { registerFromClick(e.latlng); return; }   // 反社/NG登録モード優先
+              if (kouzuMode) { openKouzuModal(e.latlng); return; }    // 公図取得モード（regModeと排他）
               if (youtoOn) queryYouto(e.latlng);
             });
             renderMapMarkers();
+            renderKouzuMarks();   // 購読が地図生成より先に来ていた場合の初回描画（以降は onSnapshot 起点）
           },
           function() { console.error("地図初期化失敗"); }
         );
@@ -670,6 +683,13 @@
     window.closeYoutoInfo = () => { const b=document.getElementById("youtoInfo"); if(b) b.style.display="none"; };
     window.toggleYouto    = () => { youtoOn=!youtoOn; const btn=document.getElementById("youtoBtn"); if(btn) btn.classList.toggle("active",youtoOn); if(!youtoOn) closeYoutoInfo(); redrawActiveLayers(); };
     window.toggleChiban   = () => { chibanOn=!chibanOn; const btn=document.getElementById("chibanBtn"); if(btn) btn.classList.toggle("active",chibanOn); redrawActiveLayers(); };
+    // 公図マークの表示ON/OFF（既定ON）。レイヤ重畳ではないので redrawActiveLayers は呼ばない。
+    window.toggleKouzu    = () => {
+      kouzuOn = !kouzuOn;
+      const btn = document.getElementById("kouzuBtn"); if (btn) btn.classList.toggle("active", kouzuOn);
+      if (!kouzuOn) closeKouzuInfo();
+      renderKouzuMarks();
+    };
 
     // ===== REALTIME LISTEN =====
     function listenPins() {
@@ -687,6 +707,84 @@
         renderMapMarkers();
       });
     }
+
+    // ===== 公図取得済みマーク：購読・描画・ポップアップ・削除（管理画面専用）=====
+    // マークの所属店。branch空/欠落は "名古屋" とみなす（pinBranch と同じ二重防御）。
+    function kouzuBranch(m) { return (m.branch && String(m.branch).trim()) ? m.branch : "名古屋"; }
+
+    // rules 未deploy時は read が既定denyで例外になる。errorコールバックで握りつぶし、
+    // pins/グリッド等の既存機能を巻き込んで壊さない（コード反映とrules反映は別便のため必須）。
+    function listenKouzuMarks() {
+      onSnapshot(collection(db, "kouzu_marks"),
+        snap => {
+          kouzuMarks = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+            .filter(m => kouzuBranch(m) === myBranch);   // pins と同じ自店スコープ
+          renderKouzuMarks();
+        },
+        err => { console.warn("kouzu_marks 購読不可（rules未反映の可能性）", err); }
+      );
+    }
+
+    // markers とは別配列で管理。renderMapMarkers() と互いに消し合わない。
+    function renderKouzuMarks() {
+      if (!map) return;
+      kouzuWidgets.forEach(w => { try { map.removeWidget(w); } catch(e){} });
+      kouzuWidgets = [];
+      if (!kouzuOn) return;
+      kouzuMarks.forEach(m => {
+        if (typeof m.lat !== "number" || typeof m.lng !== "number") return;   // 壊れdocで落ちない
+        const mk = new ZDC.Marker(new ZDC.LatLng(m.lat, m.lng), { color: KOUZU_COLOR, text: "公" });
+        mk.addEventListener("click", function() { showKouzuInfo(m.id); });
+        map.addWidget(mk);
+        kouzuWidgets.push(mk);
+      });
+    }
+
+    // serverTimestamp は書込直後（ローカル反映）では null。サーバ確定までは「保存中…」を出す。
+    function kouzuDateText(m) {
+      const d = m.createdAt && m.createdAt.toDate ? m.createdAt.toDate() : null;
+      if (!d) return "保存中…";
+      return new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo",
+        year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+    }
+    // 取得者名は displayNames（staffNameMap）で解決。未登録はメールのローカル部にフォールバック。
+    function kouzuWho(email) {
+      const e = email || "";
+      return staffNameMap[e] || (e.includes("@") ? e.split("@")[0] : e) || "–";
+    }
+
+    function showKouzuInfo(id) {
+      const box = document.getElementById("kouzuInfo");
+      const m = kouzuMarks.find(x => x.id === id);
+      if (!box || !m) return;
+      box.innerHTML =
+        '<span class="ki-close" onclick="closeKouzuInfo()">✕</span>'
+        + '<b>📄 公図 取得済み</b><br>'
+        + '対象：' + escAttr(m.targetChiban || "（未記入）") + '<br>'
+        + (m.note ? 'メモ：' + escAttr(m.note) + '<br>' : '')
+        + '取得日：' + kouzuDateText(m) + '<br>'
+        + '取得者：' + escAttr(kouzuWho(m.createdBy)) + '<br>'
+        + '<button class="ki-del" onclick="deleteKouzuMark(\'' + m.id + '\')">🗑 このマークを削除</button>';
+      box.style.display = "block";
+    }
+    window.closeKouzuInfo = () => { const b = document.getElementById("kouzuInfo"); if (b) b.style.display = "none"; };
+
+    // 削除は管理者のみ（rules でも担保）。楽観更新＝先にローカルから外して再描画し、
+    // 失敗時はロールバック（index.html の deletePin と同思想）。
+    window.deleteKouzuMark = async (id) => {
+      if (!confirm("この公図取得済みマークを削除しますか？")) return;
+      const before = kouzuMarks;
+      kouzuMarks = kouzuMarks.filter(m => m.id !== id);
+      renderKouzuMarks();
+      closeKouzuInfo();
+      try {
+        await deleteDoc(doc(db, "kouzu_marks", id));
+        showToast("公図マークを削除しました");
+      } catch(e) {
+        kouzuMarks = before; renderKouzuMarks();
+        showToast("削除に失敗しました（権限/通信）", "error");
+      }
+    };
 
     // ===== STATS =====
     function updateStats() {
@@ -1299,11 +1397,16 @@
     function applyRegModeUI() {
       const btn = document.getElementById("regModeBtn");
       if (btn) { btn.classList.toggle("active", regMode); btn.textContent = regMode ? "📍クリック登録：ON" : "📍クリック登録：OFF"; }
-      const mapEl = document.getElementById("map"); if (mapEl) mapEl.style.cursor = regMode ? "crosshair" : "";
+      // カーソルは2モード共有。片方OFFでも他方がONなら crosshair を維持する。
+      const mapEl = document.getElementById("map"); if (mapEl) mapEl.style.cursor = (regMode || kouzuMode) ? "crosshair" : "";
       if (!regMode) clearRegTempMarker();   // モードOFFで仮位置★を残さない
     }
     // 内部状態を真実として反映（ON/OFFを明示指定）。オートOFF等から呼ぶ。
-    function setRegMode(on) { regMode = !!on; applyRegModeUI(); }
+    function setRegMode(on) {
+      regMode = !!on;
+      if (regMode && kouzuMode) setKouzuMode(false);   // 公図取得モードと排他（同時ONにしない）
+      applyRegModeUI();
+    }
     // ボタンから呼ぶトグル。旧: onclick="toggleRegMode(!regMode)" は regMode が module スコープ変数のため
     // インラインhandler(グローバル評価)から参照不可でReferenceError→ハンドラが落ちてON化しなかった。
     // 引数を取らず内部状態を反転するだけに修正。
@@ -1319,6 +1422,57 @@
       const ok = await createPermanentPin(latlng.lat, latlng.lng, address);
       if (ok) setRegMode(false);   // 登録成功後は自動OFF（誤ピン防止）。失敗/キャンセルはON維持で再クリック可
     }
+
+    // ===== 公図取得モード（地図クリックで登録・管理画面専用）=====
+    // 反社/NG登録モードと排他。ONの間だけ地図クリックで登録モーダルを開く。
+    function applyKouzuModeUI() {
+      const btn = document.getElementById("kouzuModeBtn");
+      if (btn) { btn.classList.toggle("active", kouzuMode); btn.textContent = kouzuMode ? "📄公図取得：ON" : "📄公図取得：OFF"; }
+      const mapEl = document.getElementById("map");
+      if (mapEl) mapEl.style.cursor = (kouzuMode || regMode) ? "crosshair" : "";
+    }
+    function setKouzuMode(on) {
+      kouzuMode = !!on;
+      if (kouzuMode && regMode) setRegMode(false);   // 反社/NG登録モードと排他
+      applyKouzuModeUI();
+    }
+    window.toggleKouzuMode = () => setKouzuMode(!kouzuMode);
+
+    // 登録モーダル：クリック座標を保留し、対象地番/メモ（どちらも任意）を入れて登録。
+    // 取得者(email)・取得日(serverTimestamp)・所属店(myBranch)は自動付与。公図ファイルは持たない。
+    function openKouzuModal(latlng) {
+      kouzuPending = { lat: latlng.lat, lng: latlng.lng };
+      const t = document.getElementById("kouzuTarget"); if (t) t.value = "";
+      const n = document.getElementById("kouzuNote");   if (n) n.value = "";
+      const ov = document.getElementById("kouzuModal"); if (ov) ov.style.display = "flex";
+      if (t) setTimeout(() => t.focus(), 0);
+    }
+    window.closeKouzuModal = () => {
+      kouzuPending = null;
+      const ov = document.getElementById("kouzuModal"); if (ov) ov.style.display = "none";
+    };
+    window.saveKouzuMark = async () => {
+      if (!kouzuPending) { closeKouzuModal(); return; }
+      const btn = document.getElementById("kouzuSaveBtn");
+      if (btn) btn.disabled = true;
+      const data = {
+        lat: kouzuPending.lat,
+        lng: kouzuPending.lng,
+        targetChiban: (document.getElementById("kouzuTarget")?.value || "").trim(),
+        note: (document.getElementById("kouzuNote")?.value || "").trim(),
+        createdBy: auth.currentUser?.email || "",
+        branch: myBranch,
+        createdAt: serverTimestamp(),
+      };
+      try {
+        await addDoc(collection(db, "kouzu_marks"), data);   // onSnapshot が拾って自動描画
+        closeKouzuModal();
+        setKouzuMode(false);   // 登録後は自動OFF（誤登録防止・反社/NG登録と同思想）
+        showToast("公図取得済みマークを登録しました");
+      } catch(e) {
+        showToast("登録に失敗しました（権限/通信）", "error"); console.error("saveKouzuMark", e);
+      } finally { if (btn) btn.disabled = false; }
+    };
 
     // ===== SAVE 事務員メモ（adminMemo）=====
     // 調査員メモ(memo)とは別フィールド。adminMemo だけを更新し、memo には絶対に触れない
@@ -1711,6 +1865,31 @@
     .reg-btn:hover { background: #1f2937; }
     .reg-toggle.active { background: #ef4444; border-color: #dc2626; }
 
+    /* 公図（kouzu_marks・管理者専用）。専用色 #06B6D4 は反社#1F2937 / NG#6B7280 / 要確認赤 / staff色と重複しない */
+    .layer-btn.kouzu.active { background:#06B6D4; border-color:#06B6D4; color:#062c33; }
+    .reg-btn.kouzu-toggle.active { background:#06B6D4; border-color:#0891b2; color:#062c33; }
+    .kouzu-info { position:absolute; bottom:12px; right:10px; max-width:300px; z-index:20;
+      background:rgba(15,23,42,.94); color:#e2e8f0; border:1px solid #0e7490; border-radius:8px;
+      padding:10px 12px; font-size:12px; line-height:1.7; box-shadow:0 4px 14px rgba(0,0,0,.4); }
+    .kouzu-info .ki-close { float:right; cursor:pointer; color:#94a3b8; font-weight:700; margin-left:8px; }
+    .kouzu-info b { color:#22d3ee; }
+    .kouzu-info .ki-del { margin-top:8px; padding:5px 10px; border-radius:6px; background:#7f1d1d;
+      color:#fca5a5; border:1px solid #991b1b; font-size:12px; cursor:pointer; font-family:inherit; }
+    .kouzu-modal { position:fixed; inset:0; z-index:9998; background:rgba(15,23,42,.55);
+      display:flex; align-items:center; justify-content:center; padding:16px; }
+    .kouzu-modal-box { background:#fff; border-radius:10px; padding:16px 18px; width:min(420px,100%);
+      box-shadow:0 10px 30px rgba(0,0,0,.35); display:flex; flex-direction:column; gap:10px; }
+    .kouzu-modal-title { font-size:15px; font-weight:700; color:#0e7490; }
+    .kouzu-field { display:flex; flex-direction:column; gap:4px; font-size:12px; color:#374151; font-weight:600; }
+    .kouzu-field input, .kouzu-field textarea { padding:7px 10px; border:1px solid #cbd5e1; border-radius:6px;
+      font-size:13px; font-family:inherit; font-weight:400; outline:none; resize:vertical; }
+    .kouzu-field input:focus, .kouzu-field textarea:focus { border-color:#06B6D4; }
+    .kouzu-modal-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:4px; }
+    .kouzu-cancel { padding:7px 14px; border-radius:6px; background:#fff; border:1px solid #cbd5e1;
+      color:#475569; font-size:13px; cursor:pointer; font-family:inherit; }
+    .kouzu-save { padding:7px 16px; border-radius:6px; background:#06B6D4; border:1px solid #0891b2;
+      color:#fff; font-size:13px; font-weight:700; cursor:pointer; font-family:inherit; }
+
     .toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
       padding: 10px 20px; border-radius: 20px; font-size: 13px; font-weight: 500;
@@ -1760,6 +1939,8 @@
     <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
     <button class="layer-btn youto" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋クリックで属性">用途地域</button>
     <button class="layer-btn" id="chibanBtn" onclick="toggleChiban()" title="地番（ブルーマップ）重畳">地番</button>
+    <!-- 公図取得済みマークの表示切替。既定ON（初期から class="active"） -->
+    <button class="layer-btn kouzu active" id="kouzuBtn" onclick="toggleKouzu()" title="公図取得済みマークの表示切替（管理者専用）">公図</button>
     <button class="csv-btn" onclick="exportExcel()">📥 Excel出力</button>
     <button class="csv-btn undo-btn" onclick="unexportAll()" title="チェックがあれば選択分／無ければ表示中の出力済みを未出力に戻す">↩ 出力取消</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
@@ -1829,10 +2010,30 @@
         <label class="reg-radio"><input type="radio" name="regStatus" value="ng" onchange="setRegStatus('ng')"> NG</label>
         <button class="reg-btn" onclick="registerFromAddress()">この住所位置に登録</button>
         <button id="regModeBtn" class="reg-btn reg-toggle" onclick="toggleRegMode()">📍クリック登録：OFF</button>
+        <button id="kouzuModeBtn" class="reg-btn kouzu-toggle" onclick="toggleKouzuMode()"
+          title="ONの間、地図クリックで公図取得済みマークを登録（反社/NG登録とは排他）">📄公図取得：OFF</button>
       </div>
     </div>
     <div id="map"></div>
     <div id="youtoInfo" class="youto-info" style="display:none"></div>
+    <div id="kouzuInfo" class="kouzu-info" style="display:none"></div>
+  </div>
+</div>
+
+<!-- 公図取得済みマーク 登録モーダル（管理者専用）。ファイルのアップロードは持たない＝マークとメタ情報のみ -->
+<div id="kouzuModal" class="kouzu-modal" style="display:none">
+  <div class="kouzu-modal-box">
+    <div class="kouzu-modal-title">📄 公図取得済みマークを登録</div>
+    <label class="kouzu-field">対象地番／住所（任意）
+      <input id="kouzuTarget" type="text" placeholder="例：中村区亀島2丁目25-4 ／ 25-4" autocomplete="off">
+    </label>
+    <label class="kouzu-field">メモ（任意）
+      <textarea id="kouzuNote" rows="3" placeholder="例：登記情報提供サービスで取得（連棟の残地確認用）"></textarea>
+    </label>
+    <div class="kouzu-modal-actions">
+      <button class="kouzu-cancel" onclick="closeKouzuModal()">キャンセル</button>
+      <button id="kouzuSaveBtn" class="kouzu-save" onclick="saveKouzuMark()">登録</button>
+    </div>
   </div>
 </div>
 
