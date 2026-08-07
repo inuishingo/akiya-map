@@ -53,6 +53,10 @@
     let pendingAreaCode = null;     // 直近reverseのareaCode(JIS5桁)。ピン保存で使う（reverse失敗時null）
     let pendingAreaName = null;     // 直近reverseのareaName(市区町村名／政令市は区)。失敗時null
     let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue") || "[]");
+    // Undo：このセッションで自分が立てたピンだけを積む（過去セッション・他人のピンは入れない＝絶対に消えない）。
+    // ログアウトで捨てる。詳細は「UNDO」ブロック参照。
+    let undoStack = [];
+    const UNDO_MAX = 50;   // 際限なく溜めない（現場の1日ぶんには十分）
     let editingPinId = null;
     let editingPinData = null;
 
@@ -381,7 +385,8 @@
         try {
           // オフライン中に採番できなかったピンは同期時に採番（既に番号があれば維持）。
           if (item.seqNo == null) item.seqNo = await nextSeqNo();
-          await addDoc(collection(db, "pins"), item);
+          const ref = await addDoc(collection(db, "pins"), item);
+          undoUpgradeQueued(item, ref.id);   // 同期でIDが確定＝Undo対象を doc に昇格（同期後もUndoできる）
         } catch(e) {
           remaining.push(item);
         }
@@ -439,6 +444,9 @@
     };
 
     window.doLogout = async () => {
+      // 共有タブレットで担当が入れ替わったとき、前の担当者のピンがUndo対象に残らないよう捨てる。
+      undoStack = [];
+      updateUndoBtn();
       await signOut(auth);
     };
 
@@ -1375,6 +1383,7 @@
             // 固定連番を採番してから保存（オンライン時のみ。オフラインは同期時に採番）。
             pinData.seqNo = await nextSeqNo();
             const ref = await addDoc(collection(db, "pins"), pinData);
+            undoPush({ kind: "doc", id: ref.id });   // 直近作成としてUndo対象に積む
             // 保存直後の即時描画も表示対象判定を通す（保存中に画面外へパンした場合は描かない。onSnapshot/idleが拾う）
             if (shouldRenderPin(pinData, viewBounds())) renderMarker(ref.id, pinData);
             console.log("[debug] rendered after save:", ref.id, pinData);
@@ -1382,11 +1391,13 @@
           } catch(e) {
             offlineQueue.push(pinData);
             localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
+            undoPush({ kind: "queued", item: pinData });   // IDが無いのでオブジェクト参照で持つ
             showToast("オフライン保存（後で自動送信）", "warn");
           }
         } else {
           offlineQueue.push(pinData);
           localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
+          undoPush({ kind: "queued", item: pinData });     // 同上（同期時に doc へ昇格する）
           showToast("オフライン保存（後で自動送信）", "warn");
         }
         closeModal();
@@ -1396,15 +1407,11 @@
     };
 
     // ===== DELETE PIN =====
-    window.deletePin = async () => {
-      if (!editingPinId) return;
-      if (!confirm("このピンを削除しますか？")) return;
-      const id = editingPinId;            // closeModalでnullになる前に控える
-      // 楽観削除：押した瞬間にUIから消す。実削除の確定はonSnapshotの"removed"でも起きる。
-      // 低速回線でawaitが転けても削除は後でサーバーに反映されるので、成功表示を先に出す（誤エラー対策）。
+    // 楽観削除の中核。押した瞬間にUIから消す。実削除の確定はonSnapshotの"removed"でも起きる。
+    // 低速回線でawaitが転けても削除は後でサーバーに反映されるので、成功表示は呼び出し側で先に出す（誤エラー対策）。
+    // 個別削除(deletePin)とUndo(undoLastPin)の両方から使う。
+    async function removePinDoc(id) {
       removePinMarker(id);
-      closeModal();
-      showToast("削除しました");
       try {
         await deleteDoc(doc(db, "pins", id));
       } catch (e) {
@@ -1412,6 +1419,65 @@
         // 権限で消せていない場合、lastPinDocsに残り次のidleのrelayoutVisiblePinsでピンが戻る＝実態を反映。
         if (e && e.code === "permission-denied") showToast("削除できませんでした（権限）", "error");
       }
+    }
+    window.deletePin = async () => {
+      if (!editingPinId) return;
+      if (!confirm("このピンを削除しますか？")) return;
+      const id = editingPinId;            // closeModalでnullになる前に控える
+      closeModal();
+      showToast("削除しました");
+      await removePinDoc(id);
+    };
+
+    // ===== UNDO（直近に自分が立てたピンを1タップで戻す）=====
+    // 現場FB：ピンが乱立していると、消したいピンをタップするつもりで隣を誤爆する。
+    // 「今の1本を取り消す」だけに用途を絞り、確認ダイアログ無しで即実行する（LIFOで1つずつ遡れる）。
+    //
+    // スタックには2種類が入る：
+    //   {kind:"doc",    id}   … オンライン作成。docIDが確定している
+    //   {kind:"queued", item} … オフライン作成。IDが無いので offlineQueue の要素を参照で持つ
+    // このアプリはFirestoreのオフライン永続を使わず自前のlocalStorageキューなので、
+    // オフライン作成分を積まないとUndoが1つズレて「別のピンが消える」事故になる。必ず両方積む。
+    function undoPush(entry) {
+      undoStack.push(entry);
+      if (undoStack.length > UNDO_MAX) undoStack.shift();   // 古い方から捨てる
+      updateUndoBtn();
+    }
+    // オフライン作成が同期されてIDが確定したら doc へ昇格させる（同期後もUndoできるようにする）。
+    function undoUpgradeQueued(item, id) {
+      for (let i = 0; i < undoStack.length; i++) {
+        if (undoStack[i].kind === "queued" && undoStack[i].item === item) {
+          undoStack[i] = { kind: "doc", id: id };
+          return;
+        }
+      }
+    }
+    function updateUndoBtn() {
+      const b = document.getElementById("undoBtn");
+      if (b) b.disabled = undoStack.length === 0;
+    }
+    window.undoLastPin = async () => {
+      while (undoStack.length) {
+        const top = undoStack.pop();
+        if (top.kind === "queued") {
+          // 未同期のまま＝キューから抜くだけで「作成そのもの」を取り消せる。
+          const i = offlineQueue.indexOf(top.item);
+          if (i < 0) continue;             // 既に同期済み等（昇格漏れ）＝この分は戻せないので次へ
+          offlineQueue.splice(i, 1);
+          localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
+          updateUndoBtn();
+          showToast("1件戻しました");
+          return;
+        }
+        // 手動で先に消された等でもう存在しないものは飛ばして次へ（追加の読み取りはせずスナップショットで判定）。
+        if (!lastPinDocs.some(p => p.id === top.id)) continue;
+        await removePinDoc(top.id);
+        updateUndoBtn();
+        showToast("1件戻しました");
+        return;
+      }
+      updateUndoBtn();
+      showToast("戻せるピンがありません", "warn");
     };
 
     // ===== TOAST =====
@@ -1987,6 +2053,17 @@
     .locate-btn.following {
       background: #2563EB; border-color: #2563EB; color: #fff;
     }
+    /* Undo（直近に自分が立てたピンを1タップで戻す）。📍の左隣に横並びで置く。
+       アイコンはインラインSVG＝OS依存の絵文字を使わない（currentColorなので無効時の減光も自動で乗る）。 */
+    .undo-btn {
+      position: fixed; bottom: 24px; right: 76px; z-index: 100;
+      width: 48px; height: 48px; border-radius: 50%; background: #1f2937;
+      border: 1px solid #374151; color: #9ca3af;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      -webkit-touch-callout: none; -webkit-user-select: none; user-select: none;
+    }
+    .undo-btn:disabled { opacity: .4; cursor: default; }   /* 戻せるピンが無い間は無効 */
     /* 右上のZDCコンパス＝「進行方向↑」のON/OFFトグル（専用FABは置かず、ここに集約）。
        ZDC既定は button 30px / 針30pxのPNG でタップターゲットとして小さいので拡大する。
        クラス hu-compass-box は attachCompassToggle が箱(div.zwgl-ctrl-group)に付ける。 */
@@ -2140,6 +2217,13 @@
   <button class="past-btn" id="pastBtn" onclick="togglePastRounds()" title="過去周回ピンの表示（既定OFF）">旧</button>
   <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド記録モード">▦</button>
   <button class="youto-btn" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋タップで属性">用</button>
+  <!-- 直近に自分が立てたピンを1タップで取り消す。戻せるものが無い間は disabled -->
+  <button class="undo-btn" id="undoBtn" onclick="undoLastPin()" title="一つ戻る" aria-label="一つ戻る" disabled>
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
+         stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/>
+    </svg>
+  </button>
   <button class="locate-btn following" onclick="locateMe()" title="現在地（長押しで初期縮尺の設定）">📍</button>
   <!-- 起動時の測位待ち。拠点駅中心のフレームを見せないために地図の上を覆う -->
   <div id="mapLoading">
