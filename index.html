@@ -44,6 +44,9 @@
     let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（listenPinsで消さない）
     let followMode = true;       // 追従モード（カーナビ式）。既定ON。手動パンでOFF、📍でON復帰
     let watchId = null;          // watchPosition のID（二重起動防止）
+    // 進行方向↑（ヘディングアップ）。起動時は必ず北固定＝false。詳細は「進行方向↑」ブロック参照
+    let headingUpMode = false;   // ユーザーの意思（トグルの状態）
+    let headingUpPaused = false; // 手動ひねりによる一時解除。モードは保持したまま追従だけ止める
     let pendingLatLng = null;
     let pendingChiban = "";
     let pendingChibanRef = false;   // 直近の自動地番が「参考地番(近傍筆)・要確認」か
@@ -482,7 +485,15 @@
       clearGridWidgets();
       if (!gridMode) return;
       const b = map.getLatLngBounds();
-      const sw = b.getSouthWest(), ne = b.getNorthEast();
+      let sw = b.getSouthWest(), ne = b.getNorthEast();
+      // 回転中は getLatLngBounds が heading 非考慮の軸並行矩形を返し、画面四隅がその外へはみ出す。
+      // はみ出すぶんだけ広げてから行列を求める（heading=0 のときは加算0＝従来と完全に同じ）。
+      const gpad = rotationBufferRatio();
+      if (gpad > 0) {
+        const gLat = (ne.lat - sw.lat) * gpad, gLng = (ne.lng - sw.lng) * gpad;
+        sw = new ZDC.LatLng(sw.lat - gLat, sw.lng - gLng);
+        ne = new ZDC.LatLng(ne.lat + gLat, ne.lng + gLng);
+      }
       const rMin = Math.floor((sw.lat - GRID.lat0) / GRID_DLAT);
       const rMax = Math.floor((ne.lat - GRID.lat0) / GRID_DLAT);
       const cMin = Math.floor((sw.lng - GRID.lng0) / GRID_DLNG);
@@ -671,6 +682,10 @@
           mapOptions.zoomable = true;
           mapOptions.touchOperation = true;
           mapOptions.mouseOperation = true;
+          // 進行方向↑（自動回転）に必須。ZDCは setHeading() を this._options.rotatable で守っており、
+          // これが無いと例外も出さず黙って無視される（＝回らない原因が分からなくなる既知の落とし穴）。
+          // tilt/tiltable は入れない＝2Dの方位回転のみで、3D傾きは使わない。
+          mapOptions.rotatable = true;
           // 下地を常時「標準住宅地図デザイン」に（表札＋住居表示。大縮尺=ズームインで視認）。
           // TODO: 本番キーでは契約発行の住宅地図デザインIDへ差し替え（検証環境は Ai3Y2Jwp）。
           mapOptions.zipsMapType = 'Ai3Y2Jwp';
@@ -682,6 +697,8 @@
               // コントロール追加
               map.addControl(new ZDC.ZoomButton('top-left'));
               map.addControl(new ZDC.ScaleBar('bottom-left'));
+              // 現在方位の可視化＋「進行方向↑」のON/OFFトグル（attachCompassToggle で挙動を差し替える）。
+              try { map.addControl(new ZDC.Compass('top-right')); } catch (e) { /* 非対応でも地図は出す */ }
               showMapLoading(false);   // 現在地中心で描けた時点で覆いを外す
 
               // 初期測位が取れていれば青ドットも出す（中心＝現在地なので位置は一致する）
@@ -706,6 +723,8 @@
               // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
               attachManualPanDetection();
               attachLocateLongPress();   // 📍長押し＝既定縮尺メニュー（地図が出来てから有効化）
+              attachManualRotateDetection();  // 2本指ひねり＝手動操作 → 自動回転を一時解除
+              attachCompassToggle();          // 右上コンパス＝進行方向↑のON/OFF（初期表示の反映もこの中）
 
               listenPins();
               loadSurveyGrids();   // 調査済みマスを先読み（gridMode ON時に即描画できるように）
@@ -769,8 +788,11 @@
       try { b = map.getLatLngBounds(); } catch (e) { return null; }
       if (!b) return null;
       const sw = b.getSouthWest(), ne = b.getNorthEast();
-      const dLat = (ne.lat - sw.lat) * VIEW_BUFFER_RATIO;
-      const dLng = (ne.lng - sw.lng) * VIEW_BUFFER_RATIO;
+      // 回転中ははみ出しぶんを上乗せする（heading=0 なら加算0＝従来どおり）。
+      // これが無いと、回転時に画面の角に見えているピンがカリングで消える。
+      const ratio = VIEW_BUFFER_RATIO + rotationBufferRatio();
+      const dLat = (ne.lat - sw.lat) * ratio;
+      const dLng = (ne.lng - sw.lng) * ratio;
       return { south: sw.lat - dLat, north: ne.lat + dLat, west: sw.lng - dLng, east: ne.lng + dLng };
     }
     function inViewBounds(data, vb) {
@@ -1451,6 +1473,20 @@
           const lat = pos.coords.latitude, lng = pos.coords.longitude;
           showMyLocation(lat, lng);                // 青ドットは常に現在地へ（followの有無に関係なく）
           if (followMode) { map.setCenter(new ZDC.LatLng(lat, lng)); } // 追従中のみ地図も追従
+          // 進行方向↑用：移動中はGPSの進行方向を優先する。停止時は heading が null になるためコンパスへ戻す。
+          // ON/OFFで別のしきい値を使う＝ヒステリシス（境界の速度で方位源をバタつかせない）。
+          const sp = pos.coords.speed;
+          if (typeof sp === "number" && !isNaN(sp)) {
+            const prevSrc = useGpsHeading;
+            if (!useGpsHeading && sp >= GPS_SPEED_ON) useGpsHeading = true;
+            else if (useGpsHeading && sp < GPS_SPEED_OFF) useGpsHeading = false;
+            if (prevSrc !== useGpsHeading) { headBufSin = []; headBufCos = []; } // 方位源が変わったら平滑化をやり直す
+          }
+          if (typeof pos.coords.heading === "number" && !isNaN(pos.coords.heading)) {
+            gpsHeading = pos.coords.heading;   // GPSの進行方向は真北基準・時計回り＝正規化不要
+            gpsHeadingAt = Date.now();
+          }
+          if (headingUpMode) requestHeadingApply();
         },
         () => { /* 取得失敗は無視（前回位置を維持） */ },
         { enableHighAccuracy: true, timeout: 8000, maximumAge: 5000 }
@@ -1477,6 +1513,293 @@
       el.addEventListener("mousedown", () => { mouseDown = true; }, { capture: true });
       el.addEventListener("mousemove", () => { if (mouseDown) setFollow(false); }, { capture: true });
       window.addEventListener("mouseup", () => { mouseDown = false; }, true);
+    }
+
+    // ===== 進行方向↑（ヘディングアップ自動回転）=====
+    // ZDCネイティブ回転(map.setHeading)を使う。CSSでコンテナを回す方式ではないので、
+    // ピン・#001ラベル・現在地ドット（いずれもDOMオーバーレイ）は正立を保ち、タップ座標もズレない。
+    // tiltは使わず2Dの方位回転のみ。
+    //
+    // 【符号】ZDC本体の getViewMat はカメラのup方向を (cos h, sin h) で持ち、core は h = 90°-K
+    // （K = setHeading の引数）で変換する。よって setHeading(K) は「真北から時計回りにK度の方位」を
+    // 画面上に向ける＝方位角をそのまま渡せる。公式ドキュメントは mapOptions.heading(時計回り正) と
+    // setHeading(反時計回り正) で記述が矛盾しているため、コード側は「真北から時計回りの方位角」で
+    // 統一し、ZDC側の符号は HEADING_SIGN 1箇所だけで吸収する。
+    const HEADING_SIGN      = 1;    // 実機15°テストで確定。逆に回ったらここを -1 に（他は触らない）
+    const SCREEN_ANGLE_SIGN = 1;    // Androidの画面回転補正の符号。横持ちでズレたら -1
+    const DECLINATION       = 0;    // 偏角補正（名古屋≒7.5°W）。現状は入れない＝後から定数だけで有効化できる
+    const HEADING_HZ        = 10;   // setHeading の適用上限。コンパスの生イベント(〜60Hz)は必ずここで間引く
+    const HEADING_AVG_N     = 12;   // sin/cos移動平均の窓＝ローパス。大きいほど滑らかで追従が遅れる（実機調整で8→12）
+    // デッドバンド。これ未満の変化では setHeading を呼ばない。無駄な _update と再描画を抑えるだけでなく、
+    // 「まっすぐ歩いている間の微ブレで地図が動いて酔う」を直接消すのが主目的（実機フィードバックで1.5→3）。
+    // 実際の旋回は一発で閾値を超えるので、追従のラグは増えない。
+    const HEADING_MIN_DELTA = 3;
+    const GPS_SPEED_ON      = 1.5;  // m/s。これ以上でGPS進行方向へ切替（徒歩前提で低め）
+    const GPS_SPEED_OFF     = 0.8;  // m/s。これ未満でコンパスへ戻す。ON/OFFの差＝ヒステリシス
+    const GPS_HEADING_TTL   = 5000; // ms。これより古いGPS方位は使わない
+    const MANUAL_TWIST_DEG  = 10;   // 2本指でこれ以上ひねったら自動回転を一時解除
+    const ORIENT_WATCHDOG_MS = 3000; // この時間に使える方位が1つも来なければセンサー無しとみなす
+
+    let orientHandler   = null;   // deviceorientation系ハンドラ。OFF時に removeEventListener するため保持
+    let orientEventName = null;   // 実際に購読しているイベント名
+    let orientPermitted = false;  // iOS: 一度grantedを取ったら保持し、再ON時に再要求しない
+    let orientGotSample = false;  // 使える方位が1つでも来たか（センサー無しの検出用）
+    let orientWatchdog  = null;
+    let headBufSin = [], headBufCos = [];
+    let lastAppliedHeading = null, lastHeadingApplyAt = 0, headingThrottleId = null;
+    let gpsHeading = null, gpsHeadingAt = 0, useGpsHeading = false;
+
+    // 0°/360°をまたいでも正しい最小角度差を返す
+    function angleDiff(a, b) {
+      const d = ((a - b) % 360 + 360) % 360;
+      return d > 180 ? 360 - d : d;
+    }
+
+    // 回転中は getLatLngBounds が heading 非考慮の軸並行矩形を返すため、画面四隅がその外にはみ出す。
+    // はみ出し量 |cos|+|sin|-1（0〜0.414）を可視範囲バッファに上乗せして、
+    // 「見えているのに角のピン/マスが消える」事故を防ぐ。heading=0 のときは 0＝従来と同じ挙動。
+    function rotationBufferRatio() {
+      if (!map || typeof map.getHeading !== "function") return 0;
+      let h = 0;
+      try { h = map.getHeading() || 0; } catch (e) { return 0; }
+      if (!h) return 0;
+      const r = (h % 90) * Math.PI / 180;
+      return Math.abs(Math.sin(r)) + Math.abs(Math.cos(r)) - 1;
+    }
+
+    // ZDCへの唯一の回転指示。引数は「真北から時計回りの方位角(度)」で統一する。
+    function applyHeading(bearingDeg) {
+      if (!map || typeof map.setHeading !== "function") return;
+      const n = Number(bearingDeg);
+      if (!Number.isFinite(n)) return;
+      const b = ((n + DECLINATION) % 360 + 360) % 360;
+      try { map.setHeading((b * HEADING_SIGN % 360 + 360) % 360); }
+      catch (e) { /* 回転非対応・失敗でも落とさない＝北固定のまま通常動作を続ける */ }
+    }
+    function resetHeadingNorth() {
+      lastAppliedHeading = null;
+      headBufSin = []; headBufCos = [];
+      applyHeading(0);
+    }
+
+    // 方位の平滑化：角度を直接平均すると 359°と1° の平均が180°になって暴れる。
+    // 単位ベクトル(sin,cos)で平均してから角度に戻す＝巻き戻りが構造的に起きず、そのままローパスになる。
+    function pushHeadingSample(deg) {
+      const r = deg * Math.PI / 180;
+      headBufSin.push(Math.sin(r)); headBufCos.push(Math.cos(r));
+      if (headBufSin.length > HEADING_AVG_N) { headBufSin.shift(); headBufCos.shift(); }
+    }
+    function smoothedHeading() {
+      if (!headBufSin.length) return null;
+      let s = 0, c = 0;
+      for (let i = 0; i < headBufSin.length; i++) { s += headBufSin[i]; c += headBufCos[i]; }
+      if (Math.abs(s) < 1e-6 && Math.abs(c) < 1e-6) return null;   // 打ち消し合った＝方位が定まらない
+      return (Math.atan2(s, c) * 180 / Math.PI + 360) % 360;
+    }
+
+    // iOSとAndroidで基準も向きも違うので、ここで「真北・時計回り 0-359」に揃える。
+    function normalizeCompass(e) {
+      // iOS(WebKit): webkitCompassHeading は真北基準・時計回り。そのまま使える。
+      if (typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading)) {
+        return (e.webkitCompassHeading % 360 + 360) % 360;
+      }
+      // Android(Chrome): alpha は磁北基準・反時計回り。360-alpha で時計回りへ反転し、画面回転ぶんを補正。
+      if (typeof e.alpha === "number" && !isNaN(e.alpha)
+          && (e.absolute === true || orientEventName === "deviceorientationabsolute")) {
+        let scr = 0;
+        try {
+          if (screen.orientation && typeof screen.orientation.angle === "number") scr = screen.orientation.angle;
+        } catch (err) { /* 参照できない環境は補正なし */ }
+        return ((360 - e.alpha + SCREEN_ANGLE_SIGN * scr) % 360 + 360) % 360;
+      }
+      return null;   // 絶対方位が取れないイベントは使わない（北固定のまま）
+    }
+
+    // 採用する方位：移動中はGPS進行方向、停止中はコンパス。切替はヒステリシス付き。
+    // 空家調査は停止時間が支配的なので、実運用ではコンパスが主・GPSが従になる。
+    function currentHeading() {
+      if (useGpsHeading && gpsHeading != null && (Date.now() - gpsHeadingAt) < GPS_HEADING_TTL) return gpsHeading;
+      return smoothedHeading();
+    }
+
+    // setHeading をスロットルして適用。回転のたび _update が飛んで表示中の全ピンDOMの位置が
+    // 再計算されるため、センサーの生イベントをそのまま流さないことが必須。
+    function requestHeadingApply() {
+      if (!headingUpMode || headingUpPaused) return;
+      const minGap = 1000 / HEADING_HZ;
+      const now = Date.now();
+      const wait = minGap - (now - lastHeadingApplyAt);
+      if (wait > 0) {
+        if (headingThrottleId == null) {
+          headingThrottleId = setTimeout(function() { headingThrottleId = null; requestHeadingApply(); }, wait);
+        }
+        return;
+      }
+      const h = currentHeading();
+      if (h == null) return;
+      if (lastAppliedHeading != null && angleDiff(h, lastAppliedHeading) < HEADING_MIN_DELTA) return; // 微小な揺れは無視
+      lastHeadingApplyAt = now;
+      lastAppliedHeading = h;
+      applyHeading(h);
+    }
+
+    // iOSは requestPermission がユーザー操作起点でしか通らない＝必ずトグルのタップハンドラから呼ぶ。
+    // 一度grantedを取れば orientPermitted に保持し、再ON時は再要求しない（未許可のときだけ呼ぶ）。
+    async function ensureOrientationPermission() {
+      if (!window.DeviceOrientationEvent) return false;
+      if (orientPermitted) return true;
+      if (typeof DeviceOrientationEvent.requestPermission === "function") {
+        try {
+          orientPermitted = (await DeviceOrientationEvent.requestPermission()) === "granted";
+          return orientPermitted;
+        } catch (e) { return false; }   // 拒否・ユーザー操作起点でない
+      }
+      orientPermitted = true;   // Android等は許可不要
+      return true;
+    }
+
+    function startOrientationWatch() {
+      if (orientHandler) return;
+      // absolute(真北基準)が取れる方を優先。無ければ通常の deviceorientation にフォールバック。
+      orientEventName = ("ondeviceorientationabsolute" in window) ? "deviceorientationabsolute" : "deviceorientation";
+      orientGotSample = false;
+      orientHandler = function(e) {
+        if (!headingUpMode || headingUpPaused) return;
+        if (useGpsHeading) return;                  // 移動中はGPS進行方向を優先
+        const h = normalizeCompass(e);
+        if (h == null) return;
+        orientGotSample = true;
+        pushHeadingSample(h);
+        requestHeadingApply();
+      };
+      window.addEventListener(orientEventName, orientHandler);
+      // センサー非搭載・イベントが来ない端末で「ONにしたのに何も起きない」を放置しない。
+      orientWatchdog = setTimeout(function() {
+        orientWatchdog = null;
+        if (!headingUpMode || orientGotSample || useGpsHeading) return;
+        showToast("方位センサーが使えないため北固定に戻します", "warn");
+        setHeadingUp(false);
+      }, ORIENT_WATCHDOG_MS);
+    }
+    // OFF時は必ず購読を解除する（電池と、無駄な再描画の抑制）。
+    function stopOrientationWatch() {
+      if (orientHandler && orientEventName) window.removeEventListener(orientEventName, orientHandler);
+      orientHandler = null;
+      if (orientWatchdog != null) { clearTimeout(orientWatchdog); orientWatchdog = null; }
+      if (headingThrottleId != null) { clearTimeout(headingThrottleId); headingThrottleId = null; }
+    }
+
+    // モードの切替。北復帰は「OFFにして北へ戻す」の1操作にする。
+    // モードONのまま setHeading(0) しても、次のセンサー更新で即上書きされて無意味なため。
+    function setHeadingUp(on) {
+      headingUpMode = !!on;
+      headingUpPaused = false;
+      if (headingUpMode) {
+        headBufSin = []; headBufCos = []; lastAppliedHeading = null;
+        startOrientationWatch();
+        startLocationWatch();     // GPS進行方向のため（watchIdで二重起動しない）
+        requestHeadingApply();
+      } else {
+        stopOrientationWatch();
+        useGpsHeading = false;
+        resetHeadingNorth();      // 北固定へ
+      }
+      updateCompassState();
+    }
+    // 状態表示は右上のZDCコンパスに集約する（専用の⬆FABは廃止）。
+    // ZDCの構造は div.zwgl-ctrl-group > button.zwgl-ctrl-compass > span.zwgl-ctrl-compass-arrow。
+    function compassBox() {
+      const btn = document.querySelector("#map .zwgl-ctrl-compass");
+      return btn ? (btn.closest(".zwgl-ctrl-group") || btn.parentElement) : null;
+    }
+    function updateCompassState() {
+      const box = compassBox();
+      if (!box) return;
+      box.classList.add("hu-compass-box");                                   // 拡大・状態色の掴みどころ
+      box.classList.toggle("hu-on", headingUpMode);                          // ON=シアン
+      box.classList.toggle("hu-paused", headingUpMode && headingUpPaused);   // 手動ひねり中=半透明
+      const btn = box.querySelector(".zwgl-ctrl-compass");
+      if (!btn) return;
+      btn.title = headingUpMode
+        ? (headingUpPaused ? "進行方向↑：手動操作で一時解除中（📍で復帰／タップで北固定）" : "進行方向↑：ON（タップで北固定に戻す）")
+        : "タップで進行方向を上にする（回転しているときは北へ戻す）";
+      btn.setAttribute("aria-label", btn.title);
+    }
+    // 北を向いているか。浮動小数の誤差を許容する。
+    function isHeadingNorth() {
+      if (!map || typeof map.getHeading !== "function") return true;
+      let h = 0;
+      try { h = map.getHeading() || 0; } catch (e) { return true; }
+      h = ((h % 360) + 360) % 360;
+      return h < 0.5 || h > 359.5;
+    }
+    // 手動ひねりで一時解除。モード自体は保持し、📍かトグルで復帰する＝自動と手動を競合させない。
+    function pauseHeadingUp() {
+      if (!headingUpMode || headingUpPaused) return;
+      headingUpPaused = true;
+      updateCompassState();
+      showToast("手動操作：自動回転を一時解除しました（📍で復帰）");
+    }
+    function resumeHeadingUp() {
+      if (!headingUpMode || !headingUpPaused) return;
+      headingUpPaused = false;
+      updateCompassState();
+      requestHeadingApply();
+    }
+
+    async function toggleHeadingUp() {
+      if (headingUpMode) { setHeadingUp(false); return; }   // ON→OFF＝北固定へ戻す
+      const ok = await ensureOrientationPermission();       // iOSはこのタップ起点でのみ通る
+      if (!ok) {
+        showToast("方位センサーの利用が許可されませんでした（北固定のまま使えます）", "warn");
+        setHeadingUp(false);
+        return;
+      }
+      setHeadingUp(true);
+      showToast("進行方向↑：ON");
+    }
+
+    // 2本指のひねり（rotatable:true の副作用で効くジェスチャ）を検出して自動回転を一時解除する。
+    // 既存の attachManualPanDetection は1本指限定なので役割が重ならない。
+    function attachManualRotateDetection() {
+      const el = document.getElementById("map");
+      if (!el) return;
+      let startAngle = null;
+      const angleOf = t => Math.atan2(t[1].clientY - t[0].clientY, t[1].clientX - t[0].clientX) * 180 / Math.PI;
+      el.addEventListener("touchstart", e => {
+        startAngle = (e.touches && e.touches.length === 2) ? angleOf(e.touches) : null;
+      }, { capture: true, passive: true });
+      el.addEventListener("touchmove", e => {
+        if (startAngle == null || !e.touches || e.touches.length !== 2) return;
+        let d = angleOf(e.touches) - startAngle;
+        d = ((d + 180) % 360 + 360) % 360 - 180;              // -180〜180 に正規化
+        if (Math.abs(d) > MANUAL_TWIST_DEG) pauseHeadingUp();  // ピンチズームだけなら角度は動かない
+      }, { capture: true, passive: true });
+      const clear = () => { startAngle = null; };
+      el.addEventListener("touchend", clear, { capture: true, passive: true });
+      el.addEventListener("touchcancel", clear, { capture: true, passive: true });
+    }
+
+    // 右上のZDCコンパスを「進行方向↑」のON/OFFトグルとして使う（⬆FABは廃止して集約）。
+    // ZDC標準はコンパスの button 自身に click で setHeading(0)+setTilt(0) を持っている。
+    // 祖先(#map)のキャプチャ段階で stopPropagation するとイベントが button へ到達しないので、
+    // この組み込み挙動を抑止して自前の切替に置き換えられる（針の回転はZDC側がheading_changedで面倒を見る）。
+    function attachCompassToggle() {
+      const el = document.getElementById("map");
+      if (!el) return;
+      el.addEventListener("click", function(e) {
+        const btn = (e.target && e.target.closest) ? e.target.closest(".zwgl-ctrl-compass") : null;
+        if (!btn) return;
+        e.stopPropagation();   // ZDC組み込みの setHeading(0)/setTilt(0) をここで止める
+        e.preventDefault();
+        if (headingUpMode) { setHeadingUp(false); return; }   // ON / 一時解除中 → OFF＋北へ
+        // OFFのとき：手動ひねりで傾いていれば「北へ戻す」、既に北なら「ONにする」。
+        // rotatable:true により進行方向↑とは無関係に2本指で回せてしまうため、
+        // 「傾いた針をタップしたら北に戻る」という一般的なコンパスの直感を優先する。
+        if (!isHeadingNorth()) { resetHeadingNorth(); return; }
+        toggleHeadingUp();
+      }, true);
+      updateCompassState();   // 箱にクラスを付けて初期表示(OFF)を確定させる
     }
 
     // ===== 既定縮尺の保存UI（📍の長押し＝最小トリガー。専用の設定画面は作らない）=====
@@ -1554,6 +1877,7 @@
     window.locateMe = () => {
       if (suppressLocateClick) { suppressLocateClick = false; return; }  // 長押しでメニューを出した直後は無視
       setFollow(true);          // 追従ON復帰
+      resumeHeadingUp();        // 手動ひねりで一時解除していた自動回転も併せて復帰
       startLocationWatch();     // 追跡が未開始/停止なら再開（watchIdで二重起動防止）
       if (!navigator.geolocation || !map) return;
       navigator.geolocation.getCurrentPosition(pos => {
@@ -1663,6 +1987,22 @@
     .locate-btn.following {
       background: #2563EB; border-color: #2563EB; color: #fff;
     }
+    /* 右上のZDCコンパス＝「進行方向↑」のON/OFFトグル（専用FABは置かず、ここに集約）。
+       ZDC既定は button 30px / 針30pxのPNG でタップターゲットとして小さいので拡大する。
+       クラス hu-compass-box は attachCompassToggle が箱(div.zwgl-ctrl-group)に付ける。 */
+    .hu-compass-box { border-radius: 50%; }
+    .hu-compass-box > button.zwgl-ctrl-compass {
+      width: 52px; height: 52px; padding: 0;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .hu-compass-box > button.zwgl-ctrl-compass > .zwgl-ctrl-compass-arrow {
+      width: 40px; height: 40px;                       /* 30pxのPNGを拡大（背景サイズも追従させる） */
+      background-size: contain; background-position: center;
+    }
+    /* ON=シアン塗り（📍の青と区別） / 手動ひねりで一時解除中=半透明 / OFF=ZDC既定の白 */
+    .hu-compass-box.hu-on,
+    .hu-compass-box.hu-on > button.zwgl-ctrl-compass { background: #06B6D4; }
+    .hu-compass-box.hu-paused { opacity: .55; }
     .offline-badge {
       position: fixed; top: 60px; left: 50%; transform: translateX(-50%);
       background: #f97316; color: #fff; font-size: 12px; font-weight: 700;
