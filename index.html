@@ -36,6 +36,7 @@
 
     // ===== STATE =====
     let map = null;
+    let mapInitStarted = false;  // initMapの二重起動ガード。mapへの代入まで最大5.5秒(初期測位待ち)空くためフラグで持つ
     let currentUser = null;
     let myBranch = "名古屋";   // ログイン調査員の所属店(displayNames[email].branch)。読取前は名古屋を既定に。
     let pinWidgetMap = new Map();
@@ -566,79 +567,155 @@
       updateYoutoBanner(); // gridMode ON 中は用途地域バナーを出さない（二重防止）
     };
 
+    // ===== 既定ズーム（縮尺）=====
+    // ZDCのズームは離散整数（1段＝縮尺2倍）。ScaleBar基準で 17≒100m / 16≒200m / 15≒400m。
+    // 旧コードは「初期描画=15 / 起動時の現在地遷移=16 / 📍現在地ボタン=17」とバラついていた（実質バグ）。
+    // 起動時も📍も getDefaultZoom() の1本だけを見る。保存があればそれ、無ければ DEFAULT_ZOOM。
+    const DEFAULT_ZOOM = 18;                          // 既定＝50m相当（現場調査の実用縮尺）
+    const ZOOM_KEY_PREFIX = "akiyamap_default_zoom_"; // 実キーは この接頭辞＋uid（下記 zoomKey）
+    const ZOOM_MIN  = 4, ZOOM_MAX = 22;               // 壊れた保存値・範囲外を弾く健全性ガード
+    // 拠点駅フォールバック時だけは従来どおり15（≒400m）。駅を50m相当で出しても駅前しか見えず使えないため、
+    // 「現在地の縮尺」とは別物として扱う（統一の対象は起動時の現在地表示と📍ボタンの2つ）。
+    const HOME_ZOOM = 15;
+
+    // 既定縮尺はアカウント別に持つ（共有タブレットで営業が入れ替わっても縮尺が混ざらない）。
+    // 保存先は端末のlocalStorageのまま＝端末間の同期はしない。uidが取れない異常時は null を返し、
+    // 呼び出し側が DEFAULT_ZOOM にフォールバックする。
+    function zoomKey() {
+      const uid = (auth && auth.currentUser && auth.currentUser.uid)
+        || (currentUser && currentUser.uid) || null;
+      return uid ? (ZOOM_KEY_PREFIX + uid) : null;
+    }
+
+    // 保存値が無い/壊れている/uidが取れない/localStorageが使えない(プライベートモード等)場合は
+    // 必ず DEFAULT_ZOOM に落ちる。
+    function getDefaultZoom() {
+      const key = zoomKey();
+      if (!key) return DEFAULT_ZOOM;
+      let raw = null;
+      try { raw = localStorage.getItem(key); } catch (e) { return DEFAULT_ZOOM; }
+      const z = parseInt(raw, 10);
+      return (Number.isInteger(z) && z >= ZOOM_MIN && z <= ZOOM_MAX) ? z : DEFAULT_ZOOM;
+    }
+
     // ===== MAP INIT =====
+    // 【2026-08 現在地優先の初期化】
+    //   旧: 拠点駅中心で ZDC.Map を同期生成 → 測位が返ってから setCenter+setZoom。
+    //       測位は enableHighAccuracy/timeout:8000 なので、駅の画面が「一瞬」ではなく
+    //       測位が返るまでの実時間ずっと見えていた（fly/アニメーションではなく生成順の問題）。
+    //   新: 測位と ZMALoader のロードを並行で走らせ、測位が確定してから ZDC.Map を生成する。
+    //       ＝拠点駅中心のフレームを一度も作らないので、視覚的な遷移そのものが起きない。
+    //       測位中はローディングで覆う（従来も同じ時間ぶん駅が映っていただけで、待ち時間は増えない）。
+    // 初期測位はローディングで画面を止めるので、旧8000msでは待たせすぎる。5000msで打ち切って拠点駅へ。
+    // （継続追跡の watchPosition は画面を止めないので8000msのまま）
+    const GEO_TIMEOUT_MS   = 5000;   // 初期測位の打ち切り
+    const GEO_MAX_ACCURACY = 1000;   // これより粗い測位は信用しない（従来ガードを踏襲）
+
+    // PCは位置推定が粗く岡崎等にズレるため測位に行かない（従来方針）。判定を1箇所に集約。
+    function isMobileUA() {
+      return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+        || (window.matchMedia && window.matchMedia("(pointer:coarse)").matches);
+    }
+
+    // 初期表示に使う現在地を1回だけ取る。成功なら {lat,lng}、それ以外は null。
+    // 【重要】必ず解決する。ブラウザが getCurrentPosition のコールバックを返さない実装
+    // （一部のAndroid WebView）でも setTimeout の保険で null に落ちる。これが無いとローディングが永久に残る。
+    function getInitialFix() {
+      return new Promise(function(resolve) {
+        if (!isMobileUA() || !navigator.geolocation) { resolve(null); return; }
+        let done = false;
+        const finish = v => { if (!done) { done = true; resolve(v); } };
+        setTimeout(function() { finish(null); }, GEO_TIMEOUT_MS + 500);
+        navigator.geolocation.getCurrentPosition(
+          pos => finish(pos.coords.accuracy > GEO_MAX_ACCURACY
+            ? null                                                       // 粗すぎる測位は使わず拠点駅へ
+            : { lat: pos.coords.latitude, lng: pos.coords.longitude }),
+          () => finish(null),                                            // 失敗・拒否・タイムアウト
+          { enableHighAccuracy: true, timeout: GEO_TIMEOUT_MS, maximumAge: 60000 }
+        );
+      });
+    }
+
+    function showMapLoading(on) {
+      const el = document.getElementById("mapLoading");
+      if (el) el.style.display = on ? "flex" : "none";
+    }
+
     function initMap() {
-      if (map) return;
+      if (mapInitStarted) return;   // map代入まで最大5.5秒空くので map ではなく開始フラグで二重起動を防ぐ
+      mapInitStarted = true;
+      // ローディングはモバイルだけ。PCは測位に行かない＝待ち時間ゼロで拠点駅を即表示するので、
+      // スピナーを挟むとかえって遅く見える。
+      if (isMobileUA() && navigator.geolocation) showMapLoading(true);
+
+      const fixPromise = getInitialFix();   // ZMALoaderのロードと並行で測位を開始（直列にしない）
+
       ZMALoader.setOnLoad(function(mapOptions, error) {
         if (error) {
+          showMapLoading(false);
+          mapInitStarted = false;           // 再ログイン等でやり直せるように戻す
           showToast("地図の読み込みに失敗しました", "error");
           return;
         }
 
-        // 初期中心はログイン者の拠点駅で即表示（白画面回避）。京都=京都駅／名古屋・全店=名古屋駅。
-        // myBranchはloadMyBranchで確定済み。モバイルは現在地取得で上書きされる。
-        const HOME_CENTER = { "京都": new ZDC.LatLng(34.9859, 135.7585) };   // 京都駅
-        mapOptions.center = HOME_CENTER[myBranch] || new ZDC.LatLng(35.170, 136.882);   // 既定=名古屋駅
-        mapOptions.zoom = 15;
-        mapOptions.movable = true;
-        mapOptions.zoomable = true;
-        mapOptions.touchOperation = true;
-        mapOptions.mouseOperation = true;
-        // 下地を常時「標準住宅地図デザイン」に（表札＋住居表示。大縮尺=ズームインで視認）。
-        // TODO: 本番キーでは契約発行の住宅地図デザインIDへ差し替え（検証環境は Ai3Y2Jwp）。
-        mapOptions.zipsMapType = 'Ai3Y2Jwp';
+        fixPromise.then(function(fix) {
+          // 現在地が取れたらそこを中心に。取れない時だけ拠点駅にフォールバック。
+          // 京都=京都駅／名古屋・全店=名古屋駅。myBranchはloadMyBranchで確定済み。
+          const HOME_CENTER = { "京都": new ZDC.LatLng(34.9859, 135.7585) };   // 京都駅
+          mapOptions.center = fix
+            ? new ZDC.LatLng(fix.lat, fix.lng)
+            : (HOME_CENTER[myBranch] || new ZDC.LatLng(35.170, 136.882));      // 既定=名古屋駅
+          // 現在地スタート＝📍ボタンと同一の縮尺（不整合の解消）／駅フォールバック＝従来の広域
+          mapOptions.zoom = fix ? getDefaultZoom() : HOME_ZOOM;
+          mapOptions.movable = true;
+          mapOptions.zoomable = true;
+          mapOptions.touchOperation = true;
+          mapOptions.mouseOperation = true;
+          // 下地を常時「標準住宅地図デザイン」に（表札＋住居表示。大縮尺=ズームインで視認）。
+          // TODO: 本番キーでは契約発行の住宅地図デザインIDへ差し替え（検証環境は Ai3Y2Jwp）。
+          mapOptions.zipsMapType = 'Ai3Y2Jwp';
 
-        map = new ZDC.Map(
-          document.getElementById("map"),
-          mapOptions,
-          function() {
-            // コントロール追加
-            map.addControl(new ZDC.ZoomButton('top-left'));
-            map.addControl(new ZDC.ScaleBar('bottom-left'));
+          map = new ZDC.Map(
+            document.getElementById("map"),
+            mapOptions,
+            function() {
+              // コントロール追加
+              map.addControl(new ZDC.ZoomButton('top-left'));
+              map.addControl(new ZDC.ScaleBar('bottom-left'));
+              showMapLoading(false);   // 現在地中心で描けた時点で覆いを外す
 
-            // モバイル(スマホ/タブレット)のみ現在地に寄せる。PCは位置推定が粗く岡崎等にズレるため取りに行かない。
-            // 失敗・拒否・タイムアウト・低精度(>1000m)時は仮の中心(名古屋駅)を維持（止めない）。
-            const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
-              || (window.matchMedia && window.matchMedia("(pointer:coarse)").matches);
-            if (isMobile && navigator.geolocation) {
-              navigator.geolocation.getCurrentPosition(
-                pos => {
-                  // 推定が粗い(>1000m)場合は飛ばさず仮中心を維持
-                  if (pos.coords.accuracy > 1000) return;
-                  map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
-                  map.setZoom(16);
-                  showMyLocation(pos.coords.latitude, pos.coords.longitude);
-                },
-                () => { /* 取得失敗時は仮の中心(名古屋駅)を維持 */ },
-                { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
-              );
-              // 継続追跡を開始（青ドット更新＋追従）。二重起動はwatchIdで防止。
-              startLocationWatch();
+              // 初期測位が取れていれば青ドットも出す（中心＝現在地なので位置は一致する）
+              if (fix) showMyLocation(fix.lat, fix.lng);
+              // モバイルは継続追跡を開始（青ドット更新＋追従）。二重起動はwatchIdで防止。
+              // 初期測位に失敗していても開始する（歩き出して取れるようになるケースを拾う＝従来どおり）。
+              if (isMobileUA() && navigator.geolocation) startLocationWatch();
+
+              // クリック：グリッド記録モードON時はマスをトグル、OFF時は従来どおりピン追加。
+              map.addEventListener("click", function(e) {
+                if (gridMode) { toggleGridCell(e.latlng.lat, e.latlng.lng); return; }
+                if (youtoOn) { if (e && e.latlng) queryYouto(e.latlng); return; } // 用途地域ON＝属性取得（ピン追加しない）
+                pendingLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
+                openPinModal();
+              });
+
+              // 地図移動・ズーム完了(idle)でグリッドを可視範囲だけ再描画（gridMode中のみ）。
+              map.addEventListener("idle", function() { if (gridMode) redrawGrid(); });
+              map.addEventListener("idle", function(){ relayoutVisiblePins(); });  // 可視範囲のピンだけ描く（範囲外は消す）
+              map.addEventListener("idle", function(){ redrawActiveLayers(); }); // 用途地域ON中のみ追従再描画
+
+              // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
+              attachManualPanDetection();
+              attachLocateLongPress();   // 📍長押し＝既定縮尺メニュー（地図が出来てから有効化）
+
+              listenPins();
+              loadSurveyGrids();   // 調査済みマスを先読み（gridMode ON時に即描画できるように）
+            },
+            function() {
+              showMapLoading(false);
+              showToast("地図の初期化に失敗しました", "error");
             }
-
-            // クリック：グリッド記録モードON時はマスをトグル、OFF時は従来どおりピン追加。
-            map.addEventListener("click", function(e) {
-              if (gridMode) { toggleGridCell(e.latlng.lat, e.latlng.lng); return; }
-              if (youtoOn) { if (e && e.latlng) queryYouto(e.latlng); return; } // 用途地域ON＝属性取得（ピン追加しない）
-              pendingLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
-              openPinModal();
-            });
-
-            // 地図移動・ズーム完了(idle)でグリッドを可視範囲だけ再描画（gridMode中のみ）。
-            map.addEventListener("idle", function() { if (gridMode) redrawGrid(); });
-            map.addEventListener("idle", function(){ relayoutVisiblePins(); });  // 可視範囲のピンだけ描く（範囲外は消す）
-            map.addEventListener("idle", function(){ redrawActiveLayers(); }); // 用途地域ON中のみ追従再描画
-
-            // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
-            attachManualPanDetection();
-
-            listenPins();
-            loadSurveyGrids();   // 調査済みマスを先読み（gridMode ON時に即描画できるように）
-          },
-          function() {
-            showToast("地図の初期化に失敗しました", "error");
-          }
-        );
+          );
+        });
       });
     }
 
@@ -1402,14 +1479,86 @@
       window.addEventListener("mouseup", () => { mouseDown = false; }, true);
     }
 
+    // ===== 既定縮尺の保存UI（📍の長押し＝最小トリガー。専用の設定画面は作らない）=====
+    // FABは既に4段積み（旧/▦/用/📍）なので5個目のボタンは足さず、📍の長押しに寄せる。
+    let suppressLocateClick = false;   // 長押しでメニューを出した直後の click で locateMe() が走るのを防ぐ
+
+    function openZoomMenu() {
+      const el = document.getElementById("zoomMenu");
+      if (!el || !map) return;
+      const z = Math.round(map.getZoom());
+      document.getElementById("zmSave").textContent  = "今の縮尺(Z" + z + ")を初期値として記憶";
+      document.getElementById("zmReset").textContent = "既定に戻す(Z" + DEFAULT_ZOOM + ")";
+      el.style.display = "block";
+      // 長押しで指を離した瞬間のclickが、指の真下に出現したbackdropに落ちて即座に閉じるのを防ぐ。
+      // 400msだけ backdrop を無反応にして合成clickを空振りさせる。
+      const bd = el.querySelector(".zoom-menu-backdrop");
+      if (bd) {
+        bd.style.pointerEvents = "none";
+        setTimeout(function() { bd.style.pointerEvents = "auto"; }, 400);
+      }
+    }
+    window.closeZoomMenu = () => {
+      const el = document.getElementById("zoomMenu");
+      if (el) el.style.display = "none";
+    };
+
+    // 保存/適用はズーム整数で行う（ScaleBarのm表記には依存しない）。
+    window.saveDefaultZoom = () => {
+      closeZoomMenu();
+      if (!map) return;
+      const key = zoomKey();
+      if (!key) { showToast("アカウント情報が取れず保存できませんでした", "error"); return; }
+      const z = Math.round(map.getZoom());
+      if (!Number.isFinite(z) || z < ZOOM_MIN || z > ZOOM_MAX) {
+        showToast("縮尺を取得できませんでした", "error"); return;
+      }
+      try { localStorage.setItem(key, String(z)); }
+      catch (e) { showToast("縮尺の保存に失敗しました", "error"); return; }
+      showToast("この縮尺(Z" + z + ")を初期値として記憶しました");
+    };
+    window.resetDefaultZoom = () => {
+      closeZoomMenu();
+      const key = zoomKey();
+      if (key) { try { localStorage.removeItem(key); } catch (e) { /* 使えない環境は既定値のまま動く */ } }
+      showToast("初期縮尺を既定(Z" + DEFAULT_ZOOM + ")に戻しました");
+    };
+
+    // 📍を600ms長押しでメニュー。通常タップは従来どおり現在地へ寄せる。
+    function attachLocateLongPress() {
+      const b = document.querySelector(".locate-btn");
+      if (!b) return;
+      let timer = null;
+      const start  = () => {
+        clearTimeout(timer);
+        timer = setTimeout(function() {
+          suppressLocateClick = true;
+          // clickが📍まで届かなかった場合（backdropに落ちた等）にフラグが残って
+          // 次回の通常タップを1回食う事故を防ぐ自動解除。
+          setTimeout(function() { suppressLocateClick = false; }, 700);
+          openZoomMenu();
+        }, 600);
+      };
+      const cancel = () => { clearTimeout(timer); timer = null; };
+      b.addEventListener("touchstart",  start,  { passive: true });
+      b.addEventListener("touchend",    cancel);
+      b.addEventListener("touchcancel", cancel);
+      b.addEventListener("touchmove",   cancel, { passive: true });
+      b.addEventListener("mousedown",   start);
+      b.addEventListener("mouseup",     cancel);
+      b.addEventListener("mouseleave",  cancel);
+      b.addEventListener("contextmenu", e => e.preventDefault());  // 長押し時の右クリック/選択メニューを抑止
+    }
+
     // ===== LOCATE（📍：現在地へ寄せる＋追従ON復帰）=====
     window.locateMe = () => {
+      if (suppressLocateClick) { suppressLocateClick = false; return; }  // 長押しでメニューを出した直後は無視
       setFollow(true);          // 追従ON復帰
       startLocationWatch();     // 追跡が未開始/停止なら再開（watchIdで二重起動防止）
       if (!navigator.geolocation || !map) return;
       navigator.geolocation.getCurrentPosition(pos => {
         map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
-        map.setZoom(17);
+        map.setZoom(getDefaultZoom());   // 起動時の初期表示と同一の縮尺（従来は17固定で起動時16とズレていた）
         showMyLocation(pos.coords.latitude, pos.coords.longitude);
       });
     };
@@ -1475,6 +1624,34 @@
       border: 1px solid #374151; color: #9ca3af; font-size: 12px; cursor: pointer;
     }
     #map { flex: 1; width: 100%; }
+    /* 起動時ローディング：初期測位が確定するまで画面を覆う。
+       これが無いと拠点駅中心のフレームが測位完了まで見えてしまう（＝改修前の挙動）。 */
+    #mapLoading {
+      display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 150;
+      background: #0f1117; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    }
+    #mapLoading .ml-spin {
+      width: 38px; height: 38px; border-radius: 50%;
+      border: 3px solid #1f2937; border-top-color: #2563EB;
+      animation: mlSpin .9s linear infinite;
+    }
+    #mapLoading .ml-text { font-size: 13px; color: #9ca3af; }
+    @keyframes mlSpin { to { transform: rotate(360deg); } }
+    /* 既定縮尺の最小メニュー（📍の長押しで表示）。専用の設定画面は作らない。 */
+    .zoom-menu { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 260; }
+    .zoom-menu-backdrop { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.35); }
+    .zoom-menu-panel {
+      position: absolute; right: 16px; bottom: 80px; max-width: calc(100vw - 32px);
+      background: #111827; border: 1px solid #374151; border-radius: 10px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.6); overflow: hidden; display: flex; flex-direction: column;
+    }
+    .zoom-menu-panel button {
+      background: transparent; border: 0; color: #e5e7eb; font-family: inherit; font-size: 13px;
+      padding: 13px 16px; text-align: left; cursor: pointer; white-space: nowrap;
+    }
+    .zoom-menu-panel button + button { border-top: 1px solid #1f2937; color: #9ca3af; }
+    /* 長押しでメニューを出すため、iOSの長押し選択・コールアウトを抑止 */
+    .locate-btn { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
     .locate-btn {
       position: fixed; bottom: 24px; right: 16px; z-index: 100;
       width: 48px; height: 48px; border-radius: 50%; background: #1f2937;
@@ -1623,7 +1800,20 @@
   <button class="past-btn" id="pastBtn" onclick="togglePastRounds()" title="過去周回ピンの表示（既定OFF）">旧</button>
   <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド記録モード">▦</button>
   <button class="youto-btn" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋タップで属性">用</button>
-  <button class="locate-btn following" onclick="locateMe()" title="現在地">📍</button>
+  <button class="locate-btn following" onclick="locateMe()" title="現在地（長押しで初期縮尺の設定）">📍</button>
+  <!-- 起動時の測位待ち。拠点駅中心のフレームを見せないために地図の上を覆う -->
+  <div id="mapLoading">
+    <div class="ml-spin"></div>
+    <div class="ml-text">現在地を取得中…</div>
+  </div>
+  <!-- 既定縮尺メニュー（📍長押しで表示） -->
+  <div class="zoom-menu" id="zoomMenu">
+    <div class="zoom-menu-backdrop" onclick="closeZoomMenu()"></div>
+    <div class="zoom-menu-panel">
+      <button id="zmSave" onclick="saveDefaultZoom()">今の縮尺を初期値として記憶</button>
+      <button id="zmReset" onclick="resetDefaultZoom()">既定に戻す</button>
+    </div>
+  </div>
 </div>
 
 <div id="pinModal" onclick="if(event.target===this)closeModal()">
