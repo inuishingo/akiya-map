@@ -17,7 +17,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy, runTransaction, serverTimestamp }
+    import { getFirestore, collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy, runTransaction, serverTimestamp, setDoc, writeBatch, arrayUnion }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -48,6 +48,7 @@
     let checkedIds = new Set();
     let selectedPinId = null;
     let myBranch = "名古屋";     // ログイン管理者の所属店(displayNames[email].branch)。読取前は名古屋を既定に。
+    let isAdminUser = false;    // admins/{uid} 存在＝管理者。周回管理UIの表示可否に使う（fail-closed・既定false）
     // 反社/NG登録（管理画面専用）
     let regMode = false;        // 地図クリックで反社/NG登録するモード
     let regStatus = "hansha";   // 登録ステータス（hansha/ng）
@@ -263,6 +264,7 @@
         // 判定は doc存在のみ（ドメイン判定はしない＝ルールの isAdmin と統一）。読取NG時は安全側で拒否。
         let isAdmin = false;
         try { isAdmin = (await getDoc(doc(db, "admins", user.uid))).exists(); } catch (e) { isAdmin = false; }
+        isAdminUser = isAdmin;   // 周回管理UIの開示条件（既定falseなので判定失敗時は出さない＝fail-closed）
         if (!isAdmin) {
           alert("この画面は管理者専用です。調査アプリ（index）に移動します。");
           location.href = "index.html";   // セッションは維持＝indexはそのまま使える
@@ -271,6 +273,9 @@
         document.getElementById("loginScreen").style.display = "none";
         document.getElementById("adminScreen").style.display = "grid";
         document.getElementById("userLabel").textContent = user.email;
+        // 周回管理ボタンは既定 display:none。管理者確定後にのみ開示（リダイレクト失敗時の二重防御）。
+        const rmBtn = document.getElementById("roundMgrBtn");
+        if (rmBtn && isAdminUser) rmBtn.style.display = "";
         initStatusFilter();       // ステータスDDの選択肢を構築（1回）
         updateStatsHighlight();   // カウンター初期ハイライト（総件数=全表示）
         initMap();
@@ -946,6 +951,121 @@
     }
     window.setAreaFilter  = (val) => { activeAreaFilter = val; renderList(); renderMapMarkers(); };
     window.setRoundFilter = (val) => { activeRoundFilter = val; renderList(); renderMapMarkers(); };
+
+    // ===== 周回管理（C-2）— 新しい周回を開始 =====
+    // エリア（自店×市区町村）単位で currentRound を +1 する。ピン削除は一切しない。
+    // 旧周回ピンの薄色化は isPastRound の副作用で自動（surveyRound は書き換えない）。
+    // 破壊寄りなのは otherCompany の一括解除のみ＝可逆（個別トグルで再設定できる）。
+    let roundExecBusy = false;      // 二重実行防止
+    let roundPendingPlan = null;    // dry-run の結果。［実行する］はこれを消費する
+
+    // 対象ピン＝自店 かつ 選択エリア。areaCode=null は areaKey(p)===null で絶対に一致しない（巻き込み防止）。
+    function roundTargetPins(areaCode) {
+      if (!areaCode) return [];
+      return allPins.filter(p => pinBranch(p) === myBranch && areaKey(p) === areaCode);
+    }
+    function roundCurrentOf(areaCode) {
+      const s = roundState[`${myBranch}__${areaCode}`];
+      return (s && Number(s.currentRound)) || 1;
+    }
+    // エリアDD：自店ピンが存在する areaCode を areaName で列挙。未判定(null)は選択肢に出さず件数だけ別枠表示。
+    window.openRoundManager = () => {
+      if (!isAdminUser) return;   // fail-closed（rules 側でも write=isAdmin で二重に守られる）
+      const nameByCode = {}; let noneCount = 0;
+      allPins.forEach(p => {
+        const c = areaKey(p);
+        if (c) nameByCode[c] = p.areaName || c;
+        else noneCount++;
+      });
+      const codes = Object.keys(nameByCode).sort((a,b) => nameByCode[a].localeCompare(nameByCode[b], "ja"));
+      const sel = document.getElementById("roundAreaSel");
+      sel.innerHTML = codes.length
+        ? codes.map(c => `<option value="${c}">${escAttr(nameByCode[c])}</option>`).join("")
+        : `<option value="">（対象エリアがありません）</option>`;
+      document.getElementById("roundNoneNote").textContent =
+        noneCount ? `エリア未判定 ${noneCount}件（今回の対象外）` : "";
+      document.getElementById("roundYear").value = new Date().getFullYear();
+      roundPendingPlan = null;
+      document.getElementById("roundPreview").style.display = "none";
+      document.getElementById("roundModal").style.display = "flex";
+      onRoundAreaChange();
+    };
+    window.closeRoundManager = () => {
+      roundPendingPlan = null;
+      document.getElementById("roundModal").style.display = "none";
+    };
+    // エリアを変えたら現周回と開始ボタンの文言を更新し、出しっぱなしのプレビューは破棄する。
+    window.onRoundAreaChange = () => {
+      const areaCode = document.getElementById("roundAreaSel").value;
+      const cur = roundCurrentOf(areaCode);
+      document.getElementById("roundCurLabel").textContent = `現在：第${cur}周`;
+      document.getElementById("roundStartBtn").textContent = `第${cur + 1}周を開始`;
+      document.getElementById("roundStartBtn").disabled = !areaCode;
+      roundPendingPlan = null;
+      document.getElementById("roundPreview").style.display = "none";
+    };
+    // dry-run：DBへの書き込みはゼロ。購読済み allPins だけで件数を数える。
+    window.previewRoundStart = () => {
+      const areaCode = document.getElementById("roundAreaSel").value;
+      if (!areaCode) return;
+      const year = Number(document.getElementById("roundYear").value);
+      if (!Number.isInteger(year) || year < 2000 || year > 2100) { showToast("年の入力が不正です", "error"); return; }
+      const cur = roundCurrentOf(areaCode), next = cur + 1;
+      const targets = roundTargetPins(areaCode);
+      const areaName = (targets[0] && targets[0].areaName) || areaCode;
+      // 薄色化＝現周回以下の非永久ピン（次周回から見て過去になる分）。
+      const fade   = targets.filter(p => !isPermanentPin(p) && roundOf(p) <= cur);
+      // 他社解除＝otherCompany===true の非永久ピン（NG系は据え置き＝触らない）。
+      const ocOff  = targets.filter(p => !isPermanentPin(p) && p.otherCompany === true);
+      const keepNg = targets.filter(p => isPermanentPin(p));
+      roundPendingPlan = { areaCode, areaName, next, year, ocIds: ocOff.map(p => p.id) };
+      document.getElementById("roundPreviewBody").innerHTML = `
+        <div class="round-pv-title">【${escAttr(areaName)}を第${next}周にします】</div>
+        <div class="round-pv-row"><span>薄色化する第${cur}周以下の非永久ピン</span><b>${fade.length}件</b></div>
+        <div class="round-pv-row"><span>他社物件フラグを解除（true→false）</span><b>${ocOff.length}件</b></div>
+        <div class="round-pv-row"><span>据え置き（NG系 反社/NG）</span><b>${keepNg.length}件</b></div>
+        <div class="round-pv-row"><span>削除されるピン</span><b>0件</b></div>
+        <div class="round-pv-note">※ピンは1件も削除しません。surveyRound も書き換えません（薄色化は自動判定）。</div>`;
+      document.getElementById("roundPreview").style.display = "block";
+    };
+    // 本実行。［実行する］押下時のみ。順序は「pins → survey_rounds」。
+    // 途中失敗しても周回が進まない＝再実行で同じ dry-run に戻れる（周回の二重進行を防ぐ）。
+    window.execRoundStart = async () => {
+      if (roundExecBusy || !roundPendingPlan) return;
+      if (!isAdminUser) { showToast("権限がありません", "error"); return; }
+      const plan = roundPendingPlan;
+      const btn = document.getElementById("roundExecBtn");
+      roundExecBusy = true; btn.disabled = true; btn.textContent = "実行中…";
+      try {
+        // ① otherCompany 一括解除。batch上限500に対し400刻みで分割。
+        for (let i = 0; i < plan.ocIds.length; i += 400) {
+          const batch = writeBatch(db);
+          plan.ocIds.slice(i, i + 400).forEach(id => batch.update(doc(db, "pins", id), { otherCompany: false }));
+          await batch.commit();
+        }
+        // ② 周回を進める。merge で既存 rounds を保ちつつ arrayUnion で履歴を追記。
+        //    startedAt は ISO文字列（配列の内側では serverTimestamp を使えないため。pins.createdAt と同形式）。
+        await setDoc(doc(db, "survey_rounds", `${myBranch}__${plan.areaCode}`), {
+          branch: myBranch,
+          areaKey: plan.areaCode,
+          currentRound: plan.next,
+          rounds: arrayUnion({
+            round: plan.next,
+            label: `第${plan.next}周`,
+            year: plan.year,
+            startedAt: new Date().toISOString(),
+          }),
+        }, { merge: true });
+        showToast(`${plan.areaName} を第${plan.next}周にしました（他社解除 ${plan.ocIds.length}件）`);
+        closeRoundManager();
+        // 周回DD・薄色・一覧/地図の更新は survey_rounds と pins の onSnapshot が担う（楽観更新は不要）
+      } catch (e) {
+        showToast("実行に失敗しました（権限/通信）。もう一度お試しください", "error");
+        console.error("execRoundStart", e);
+      } finally {
+        roundExecBusy = false; btn.disabled = false; btn.textContent = "実行する";
+      }
+    };
 
     // カウンターのハイライト。activeGroupFilter に対応する1枚だけ .active。
     // 総件数は「グループ絞りなし(all)」時にハイライト＝現在“全グループ表示”を示す。
@@ -1905,6 +2025,17 @@
     .kouzu-save { padding:7px 16px; border-radius:6px; background:#06B6D4; border:1px solid #0891b2;
       color:#fff; font-size:13px; font-weight:700; cursor:pointer; font-family:inherit; }
 
+    /* 周回管理（C-2）。モーダル外枠は .kouzu-modal 系を流用し、固有部分だけ定義する */
+    .round-mgr { border-color:#9333EA; color:#9333EA; }
+    .round-none-note { font-size:11px; color:#b45309; }
+    .round-cur { font-size:12px; font-weight:700; color:#0e7490; }
+    .round-preview { border-top:1px solid #e2e8f0; padding-top:10px; margin-top:2px; }
+    .round-pv-title { font-size:13px; font-weight:700; color:#7c2d12; margin-bottom:6px; }
+    .round-pv-row { display:flex; justify-content:space-between; font-size:12px; color:#374151; padding:2px 0; }
+    .round-pv-note { font-size:11px; color:#64748b; margin-top:6px; }
+    .round-exec { padding:7px 16px; border-radius:6px; background:#EA580C; border:1px solid #c2410c;
+      color:#fff; font-size:13px; font-weight:700; cursor:pointer; font-family:inherit; }
+
     .toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
       padding: 10px 20px; border-radius: 20px; font-size: 13px; font-weight: 500;
@@ -1951,6 +2082,8 @@
     <select id="roundFilter" onchange="setRoundFilter(this.value)" title="周回で絞り込み（NG系は常時表示）">
       <option value="all">周回：すべて</option>
     </select>
+    <!-- 周回管理（管理者専用）。既定 display:none で、admins 判定が通った時だけ開示する -->
+    <button class="layer-btn round-mgr" id="roundMgrBtn" style="display:none" onclick="openRoundManager()" title="エリアごとに新しい周回を開始（管理者専用）">🔄 周回管理</button>
     <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
     <button class="layer-btn youto" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋クリックで属性">用途地域</button>
     <button class="layer-btn" id="chibanBtn" onclick="toggleChiban()" title="地番（ブルーマップ）重畳">地番</button>
@@ -2048,6 +2181,33 @@
     <div class="kouzu-modal-actions">
       <button class="kouzu-cancel" onclick="closeKouzuModal()">キャンセル</button>
       <button id="kouzuSaveBtn" class="kouzu-save" onclick="saveKouzuMark()">登録</button>
+    </div>
+  </div>
+</div>
+
+<!-- 周回管理（C-2・管理者専用）。開始ボタン→dry-runプレビュー→［実行する］の2段構え。
+     プレビュー表示の時点ではDBに一切書き込まない。 -->
+<div id="roundModal" class="kouzu-modal" style="display:none">
+  <div class="kouzu-modal-box">
+    <div class="kouzu-modal-title">🔄 新しい周回を開始</div>
+    <label class="kouzu-field">エリア（市区町村）
+      <select id="roundAreaSel" onchange="onRoundAreaChange()"></select>
+    </label>
+    <div class="round-none-note" id="roundNoneNote"></div>
+    <div class="round-cur" id="roundCurLabel">現在：第1周</div>
+    <label class="kouzu-field">年
+      <input id="roundYear" type="number" min="2000" max="2100" step="1">
+    </label>
+    <div class="kouzu-modal-actions">
+      <button class="kouzu-cancel" onclick="closeRoundManager()">閉じる</button>
+      <button class="kouzu-save" id="roundStartBtn" onclick="previewRoundStart()">第2周を開始</button>
+    </div>
+    <div class="round-preview" id="roundPreview" style="display:none">
+      <div id="roundPreviewBody"></div>
+      <div class="kouzu-modal-actions">
+        <button class="kouzu-cancel" onclick="closeRoundManager()">やめる</button>
+        <button class="round-exec" id="roundExecBtn" onclick="execRoundStart()">実行する</button>
+      </div>
     </div>
   </div>
 </div>
