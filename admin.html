@@ -175,20 +175,6 @@
     }
 
     // ===== 調査周回（round）— C-1 基盤 =====
-    // areaKey：住所→市区（政令市=区／非政令市=市町村／県郡除去）。index.html cityWardKey と同一実装で
-    // キー文字列を一致させる（ピンの areaKey とグリッド由来 areaKey が同じ市区で一致する前提・C-3で使用）。
-    function cityWardKey(address) {
-      let a = (address || "").normalize("NFKC").trim();
-      if (!a) return "";
-      a = a.replace(/^(東京都|北海道|京都府|大阪府|.{2,3}県)/, "");
-      a = a.replace(/^.{1,4}郡/, "");
-      let m;
-      if ((m = a.match(/^(.+?市.+?区)/))) return m[1];   // 政令市の区
-      if ((m = a.match(/^(.+?市市?)/)))   return m[1];   // 市（四日市市等の二重市に対応）
-      if ((m = a.match(/^(.+?区)/)))      return m[1];   // 東京特別区など
-      if ((m = a.match(/^(.+?[町村])/)))  return m[1];   // 郡除去後の町・村
-      return "";
-    }
     function areaKey(p){ return (p && p.areaCode) || null; }   // areaCode(JIS5桁)ベース。旧cityWardKey(正規表現)は不使用
     let roundState = {};      // `${branch}__${areaKey}` -> {currentRound, rounds}
     let roundsUnsub = null;   // survey_rounds 購読の解除関数（多重購読防止）

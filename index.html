@@ -192,22 +192,6 @@
     }
 
     // ===== 市区「続きへ」ジャンプ =====
-    // 住所から市区キーを抽出（政令市＝区粒度／非政令市＝市・町・村まで・都道府県と郡は除去）。
-    // メンテ不要：全ピンの住所から自動抽出する。
-    function cityWardKey(address) {
-      let a = (address || "").normalize("NFKC").trim();
-      if (!a) return "";
-      // 都道府県を除去（「京都」の"都"等で誤切断しないよう府県を限定列挙）
-      a = a.replace(/^(東京都|北海道|京都府|大阪府|.{2,3}県)/, "");
-      // 郡を除去（町村の前置き。例: 海部郡蟹江町 → 蟹江町）
-      a = a.replace(/^.{1,4}郡/, "");
-      let m;
-      if ((m = a.match(/^(.+?市.+?区)/))) return m[1];   // 政令市の区（例 名古屋市瑞穂区）
-      if ((m = a.match(/^(.+?市市?)/)))   return m[1];   // 市（四日市市等の二重市に対応）
-      if ((m = a.match(/^(.+?区)/)))      return m[1];   // 東京特別区など市無しの区
-      if ((m = a.match(/^(.+?[町村])/)))  return m[1];   // 郡除去後の町・村
-      return "";
-    }
     // 市区プレフィックスを除いた住所末尾（町名+番地）。一覧の3列目に表示。
     function addrTail(address, key) {
       let a = (address || "").normalize("NFKC").trim();
