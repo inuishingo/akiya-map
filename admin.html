@@ -36,6 +36,12 @@
     let map = null;
     let allPins = [];
     let markers = [];
+    // ===== 描画コスト制御（第一便：番号ラベルのズーム制限）=====
+    // 端末の重さは「地図に載っているウィジェット数」にほぼ比例する。
+    // #001ラベルを畳むと 1ピン=2ウィジェット → 1ウィジェットになり、広域表示が軽くなる。
+    const LABEL_MIN_ZOOM      = 16;     // #001番号ラベルを描き始めるズーム（index.html と同値）
+    const ADMIN_DEFAULT_ZOOM  = 15;     // 初期ズーム。番号が出ないZ16未満に留めて起動を軽くする
+    let   labelsShown         = false;  // 直近の renderMapMarkers が実際にラベルを描いたか（閾値跨ぎの検出用）
     let reviewOnly = false;     // 「⚠️ 要調査のみ」フィルタ（赤ラベル＝住所不明 or 地番未取得 だけ表示）
     let activeStaffFilter = "all";
     let activeDateFilter = "all";
@@ -411,7 +417,7 @@
       ZMALoader.setOnLoad(function(mapOptions, error) {
         if (error) { console.error(error); return; }
         mapOptions.center = new ZDC.LatLng(35.1709, 136.8815);
-        mapOptions.zoom = 13;
+        mapOptions.zoom = ADMIN_DEFAULT_ZOOM;   // Z13(市域まるごと)から変更。番号ラベルが出ない帯に置く
         mapOptions.movable = true;
         mapOptions.zoomable = true;
         mapOptions.mouseOperation = true;
@@ -428,6 +434,11 @@
             map.addControl(new ZDC.ScaleBar('bottom-left'));
             // 地図移動・ズーム完了(idle)でグリッドを可視範囲だけ再描画（gridMode中のみ）。
             map.addEventListener("idle", function() { if (gridMode) redrawGrid(); });
+            // 番号ラベルのズーム閾値(Z16)を跨いだ時だけピンを描き直す。
+            // 同一ズーム帯のパン・ズームでは labelsShown が変わらない＝再生成しない（カクつき防止）。
+            map.addEventListener("idle", function(){
+              if ((map.getZoom() >= LABEL_MIN_ZOOM) !== labelsShown) renderMapMarkers();
+            });
             // 用途地域/地番レイヤ：移動・ズーム後に再描画／用途地域ON時はクリックで属性取得
             map.addEventListener("idle", function(){ redrawActiveLayers(); });
             map.addEventListener("click", function(e){
@@ -1310,6 +1321,9 @@
       if (!map) return;
       markers.forEach(m => map.removeWidget(m));
       markers = [];
+      // 今回の描画でラベルを描くか。ループ内で map.getZoom() を毎回呼ばないよう先に1回だけ確定させ、
+      // 同時に「実際に描いた状態」として記録する（idle の閾値跨ぎ判定がこれを見る）。
+      labelsShown = map.getZoom() >= LABEL_MIN_ZOOM;
       filtered().forEach(p => {
         // 未定義ステータスでも落ちない・透明にならないようガード
         const s = STATUS[p.status] || EXCLUDE_STATUS[p.status];
@@ -1330,7 +1344,8 @@
 
         // ピン番号ラベル(#001形式)をマーカーの上にHTMLオーバーレイ表示。
         // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
-        if (p.seqNo != null) {
+        // Z16未満では描かない（広域で全ピンぶんのHTMLオーバーレイを作らない＝第一便の軽量化の本体）。
+        if (p.seqNo != null && labelsShown) {
           // 要確認（住所不明 or 地番未取得）は赤背景で示す。現地画面(index.html)と色基準を統一。
           // ラベル背景色：要確認赤 ＞ 永久黒 ＞ 周回色（担当者色は廃止）。過去周回の通常ピンは薄色。
           const labelBg = labelColor(p);
