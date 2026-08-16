@@ -284,11 +284,13 @@
         if (rmBtn && isAdminUser) rmBtn.style.display = "";
         initStatusFilter();       // ステータスDDの選択肢を構築（1回）
         updateStatsHighlight();   // カウンター初期ハイライト（総件数=全表示）
+        // 自店は initMap より前に確定させる。初期中心の拠点駅分岐は mapOptions 段階で myBranch を読むため、
+        // ここが initMap の後ろだと ZMALoader のコールバックが先に走り、京都アカウントでも名古屋駅で開く。
+        await loadMyBranch(user.email);   // 初期中心の拠点駅分岐＋listenPins の絞り込みに使う
         initMap();
         // 表示名・担当者色マップ（どちらも displayNames 由来）を先に構築してから購読開始
         await buildStaffNames();
         await buildStaffColors();
-        await loadMyBranch(user.email);   // 自店を確定してから購読（listenPins の絞り込みに使う）
         listenPins();
         listenSurveyGrids();   // 調査グリッドの進捗をリアルタイム購読（表示はトグルON時のみ）
         listenRounds();        // 周回マスタを購読（現在周回で色/薄色・周回フィルタ候補を判定）
@@ -416,7 +418,10 @@
       if (map) return;
       ZMALoader.setOnLoad(function(mapOptions, error) {
         if (error) { console.error(error); return; }
-        mapOptions.center = new ZDC.LatLng(35.1709, 136.8815);
+        // 初期中心はログイン管理者の拠点駅。京都=京都駅／名古屋・全店=名古屋駅（index.html と同一方式）。
+        // myBranch は onAuthStateChanged 内で initMap より前に確定済み。
+        const HOME_CENTER = { "京都": new ZDC.LatLng(34.9859, 135.7585) };   // 京都駅
+        mapOptions.center = HOME_CENTER[myBranch] || new ZDC.LatLng(35.1709, 136.8815);   // 既定=名古屋駅
         mapOptions.zoom = ADMIN_DEFAULT_ZOOM;   // Z13(市域まるごと)から変更。番号ラベルが出ない帯に置く
         mapOptions.movable = true;
         mapOptions.zoomable = true;
