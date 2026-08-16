@@ -35,13 +35,22 @@
 
     let map = null;
     let allPins = [];
-    let markers = [];
+    let pinWidgetMap = new Map();   // pinId -> {marker, labelWidget}。差分更新のため配列ではなくMapで持つ
+    // filtered() の結果キャッシュ（地図描画専用）。idle のたびに 5694件×8条件を回さないために持つ。
+    // 更新者は renderList() ただ1つ。フィルタを変える set* ハンドラは全て renderList() を必ず呼ぶため
+    // これで同期が保てる（※将来 renderList() を経由しないフィルタ変更を足す場合はここも更新すること）。
+    // Excel出力/全選択/一括削除は従来どおり filtered() を直接呼ぶ＝集合の基準は変えない。
+    let filteredPins = [];
     // ===== 描画コスト制御（第一便：番号ラベルのズーム制限）=====
     // 端末の重さは「地図に載っているウィジェット数」にほぼ比例する。
     // #001ラベルを畳むと 1ピン=2ウィジェット → 1ウィジェットになり、広域表示が軽くなる。
     const LABEL_MIN_ZOOM      = 16;     // #001番号ラベルを描き始めるズーム（index.html と同値）
-    const ADMIN_DEFAULT_ZOOM  = 15;     // 初期ズーム。番号が出ないZ16未満に留めて起動を軽くする
-    let   labelsShown         = false;  // 直近の renderMapMarkers が実際にラベルを描いたか（閾値跨ぎの検出用）
+    // 初期ズーム。カリング導入で描画量は「総ピン数」ではなく「画面内の密度」で決まるようになったため、
+    // Z16未満に留める必要がなくなった。Z18(≒50m)は Z16 に対して面積1/16＝描画対象も概ね1/16で、
+    // 立ち上がりと現地の視認性を優先してここに置く（index.html の DEFAULT_ZOOM と同値）。
+    // LABEL_MIN_ZOOM(16)以上なので #001番号ラベルは初期から出る（事務員の照合運用に合わせる）。
+    const ADMIN_DEFAULT_ZOOM  = 18;
+    let   labelsShown         = false;  // 直近の renderAllMarkers が実際にラベルを描いたか（閾値跨ぎの検出用）
     let reviewOnly = false;     // 「⚠️ 要調査のみ」フィルタ（赤ラベル＝住所不明 or 地番未取得 だけ表示）
     let activeStaffFilter = "all";
     let activeDateFilter = "all";
@@ -192,7 +201,7 @@
       if (roundsUnsub) roundsUnsub();
       roundsUnsub = onSnapshot(collection(db, "survey_rounds"), snap => {
         roundState = {}; snap.forEach(d => roundState[d.id] = d.data());
-        updateRoundFilter(); renderList(); renderMapMarkers();
+        updateRoundFilter(); renderList(); renderAllMarkers();   // 周回色が変わる＝描画済みの見た目が変わるので全再描画
       }, e => {});
     }
     function currentRoundOf(p){ const s = roundState[`${pinBranch(p)}__${areaKey(p)}`]; return (s && Number(s.currentRound)) || 1; }
@@ -420,11 +429,13 @@
       if (map) return;
       ZMALoader.setOnLoad(function(mapOptions, error) {
         if (error) { console.error(error); return; }
-        // 初期中心はログイン管理者の拠点駅。京都=京都駅／名古屋・全店=名古屋駅（index.html と同一方式）。
+        // 初期中心はログイン管理者の「店の所在地」。事務所での作業起点なので駅ではなく店に置く。
+        // ※index.html は現場アプリなので拠点駅のまま（意図的に admin とは別基準）。
         // myBranch は onAuthStateChanged 内で initMap より前に確定済み。
-        const HOME_CENTER = { "京都": new ZDC.LatLng(34.9859, 135.7585) };   // 京都駅
-        mapOptions.center = HOME_CENTER[myBranch] || new ZDC.LatLng(35.1709, 136.8815);   // 既定=名古屋駅
-        mapOptions.zoom = ADMIN_DEFAULT_ZOOM;   // Z13(市域まるごと)から変更。番号ラベルが出ない帯に置く
+        const HOME_CENTER = { "京都": new ZDC.LatLng(34.957969663952724, 135.76069814005794) };   // 京都店
+        mapOptions.center = HOME_CENTER[myBranch]
+          || new ZDC.LatLng(35.12665773554829, 136.92989789393815);   // 既定=名古屋店
+        mapOptions.zoom = ADMIN_DEFAULT_ZOOM;   // Z18。カリング前提で「画面内の少数だけ描く」に合わせた倍率
         mapOptions.movable = true;
         mapOptions.zoomable = true;
         mapOptions.mouseOperation = true;
@@ -444,8 +455,12 @@
             // 番号ラベルのズーム閾値(Z16)を跨いだ時だけピンを描き直す。
             // 同一ズーム帯のパン・ズームでは labelsShown が変わらない＝再生成しない（カクつき防止）。
             map.addEventListener("idle", function(){
-              if ((map.getZoom() >= LABEL_MIN_ZOOM) !== labelsShown) renderMapMarkers();
+              if ((map.getZoom() >= LABEL_MIN_ZOOM) !== labelsShown) renderAllMarkers();
             });
+            // ビューポートカリング：移動・ズーム後に可視範囲のピンだけへ差分更新する。
+            // 【順序が重要】必ず上の閾値跨ぎリスナより後に登録する。跨いだ時は先に renderAllMarkers() が
+            // 走って labelsShown を更新し、こちらは no-op になる。逆順だと跨ぎが検出できなくなる。
+            map.addEventListener("idle", function(){ relayoutVisiblePins(); });
             // 用途地域/地番レイヤ：移動・ズーム後に再描画／用途地域ON時はクリックで属性取得
             map.addEventListener("idle", function(){ redrawActiveLayers(); });
             map.addEventListener("click", function(e){
@@ -454,7 +469,7 @@
               if (kouzuMode) { openKouzuModal(e.latlng); return; }    // 公図取得モード（regModeと排他）
               if (youtoOn) queryYouto(e.latlng);
             });
-            renderMapMarkers();
+            renderAllMarkers();
             renderKouzuMarks();   // 購読が地図生成より先に来ていた場合の初回描画（以降は onSnapshot 起点）
           },
           function() { console.error("地図初期化失敗"); }
@@ -544,7 +559,7 @@
         removeLayerWidget('youto'); removeLayerWidget('bluemap');
         if(youtoOn)  await drawYoutoLayer();
         if(chibanOn) await drawWmsLayer('bluemap');
-        if(youtoOn || chibanOn){ if(gridMode) redrawGrid(); renderMapMarkers(); } // 画像の上にグリッド→ピンを戻す
+        if(youtoOn || chibanOn){ if(gridMode) redrawGrid(); renderAllMarkers(); } // 画像の上にグリッド→ピンを戻す
         lastLayerKey = key;
       } finally {
         layerRedrawing=false;
@@ -713,7 +728,7 @@
         updateAreaFilter();
         updateRoundFilter();
         renderList();
-        renderMapMarkers();
+        renderAllMarkers();   // ピンデータ更新＝色/ラベルが変わり得るので全再描画
       });
     }
 
@@ -734,7 +749,7 @@
       );
     }
 
-    // markers とは別配列で管理。renderMapMarkers() と互いに消し合わない。
+    // pinWidgetMap とは別に管理。ピンの再描画（renderAllMarkers/relayoutVisiblePins）と互いに消し合わない。
     function renderKouzuMarks() {
       if (!map) return;
       kouzuWidgets.forEach(w => { try { map.removeWidget(w); } catch(e){} });
@@ -857,7 +872,7 @@
       updateDateFilter();    // 担当者→日付リストを連動（無効日付は「すべて」にリセット）
       updateStaffFilter();   // 日付がリセットされ得るので担当者リスト/選択も整え直す
       renderList();
-      renderMapMarkers();
+      relayoutVisiblePins();
     };
 
     // createdAt(ISO/UTC) を JST(+9h) の YYYY-MM-DD に。表示・フィルタ・Excelで共通利用（UTCずれ防止）。
@@ -884,7 +899,7 @@
       updateStaffFilter();   // 日付→担当者リストを連動（その日の出勤者だけ＋無効担当者はリセット）
       updateDateFilter();    // 担当者がリセットされ得るので日付リスト/選択も整え直す
       renderList();
-      renderMapMarkers();
+      relayoutVisiblePins();
     };
 
     // ===== 要調査フィルタ =====
@@ -893,7 +908,7 @@
     window.setReviewOnly = (on) => {
       reviewOnly = !!on;
       renderList();
-      renderMapMarkers();
+      relayoutVisiblePins();
     };
 
     // 総件数クリック → グループ絞りを解除して全グループ表示（＋要調査トグルもOFFへ）。
@@ -905,7 +920,7 @@
       if (cb) cb.checked = false;
       updateStatsHighlight();
       renderList();
-      renderMapMarkers();
+      relayoutVisiblePins();
     };
 
     // グループ絞り（カウンターのショートカット）。同じグループ再クリックで解除＝全表示へ。
@@ -913,14 +928,14 @@
       activeGroupFilter = (activeGroupFilter === groupKey) ? "all" : groupKey;
       updateStatsHighlight();
       renderList();
-      renderMapMarkers();
+      relayoutVisiblePins();
     };
 
     // ステータスDD（個別分類）。カウンターとは独立し filtered() 内でANDに合流。
     window.setStatusFilter = (val) => {
       activeStatusFilter = val;
       renderList();
-      renderMapMarkers();
+      relayoutVisiblePins();
     };
 
     // 他社物件フィルタ（すべて/除外/だけ）。DM運用で他社物件を除外した状態別リストを出す用途。
@@ -928,7 +943,7 @@
     window.setOtherCompanyFilter = (val) => {
       otherCompanyFilter = val;
       renderList();
-      renderMapMarkers();
+      relayoutVisiblePins();
     };
 
     // ===== エリア/周回フィルタ（C-1）=====
@@ -967,8 +982,8 @@
       for (let r=1; r<=maxR; r++) opts += `<option value="${r}" ${String(r)===activeRoundFilter?"selected":""}>第${r}周</option>`;
       sel.innerHTML = opts;
     }
-    window.setAreaFilter  = (val) => { activeAreaFilter = val; renderList(); renderMapMarkers(); };
-    window.setRoundFilter = (val) => { activeRoundFilter = val; renderList(); renderMapMarkers(); };
+    window.setAreaFilter  = (val) => { activeAreaFilter = val; renderList(); relayoutVisiblePins(); };
+    window.setRoundFilter = (val) => { activeRoundFilter = val; renderList(); relayoutVisiblePins(); };
 
     // ===== 周回管理（C-2）— 新しい周回を開始 =====
     // エリア（自店×市区町村）単位で currentRound を +1 する。ピン削除は一切しない。
@@ -1169,7 +1184,7 @@
       const clr = document.getElementById("searchClear");
       if (clr) clr.style.display = val ? "block" : "none";
       renderList();
-      renderMapMarkers();   // 地図ピンもリストと同じ表示集合に揃える
+      relayoutVisiblePins();   // 地図ピンもリストと同じ表示集合に揃える
     };
     window.clearSearch = () => {
       searchQuery = "";
@@ -1178,7 +1193,7 @@
       const clr = document.getElementById("searchClear");
       if (clr) clr.style.display = "none";
       renderList();
-      renderMapMarkers();
+      relayoutVisiblePins();
     };
 
     // ===== LIST =====
@@ -1189,6 +1204,7 @@
 
     function renderList() {
       const pins = filtered();
+      filteredPins = pins;   // 地図描画側のキャッシュを同時に更新（relayoutVisiblePins がこれを読む）
       const container = document.getElementById("pinList");
       const hasChecked = checkedIds.size > 0;
 
@@ -1323,64 +1339,139 @@
       } catch(e) { showToast("削除に失敗しました", "error"); }
     };
 
-    // ===== MAP MARKERS =====
-    function renderMapMarkers() {
-      if (!map) return;
-      markers.forEach(m => map.removeWidget(m));
-      markers = [];
-      // 今回の描画でラベルを描くか。ループ内で map.getZoom() を毎回呼ばないよう先に1回だけ確定させ、
-      // 同時に「実際に描いた状態」として記録する（idle の閾値跨ぎ判定がこれを見る）。
-      labelsShown = map.getZoom() >= LABEL_MIN_ZOOM;
-      filtered().forEach(p => {
-        // 未定義ステータスでも落ちない・透明にならないようガード
-        const s = STATUS[p.status] || EXCLUDE_STATUS[p.status];
-        const isExclude = isExcludeCandidatePin(p);
-        // マーカー色は「担当者(メール)ごとの固定色」。頭文字はステータスを示す。
-        // 固定連番(seqNo)はマーカー上のHTMLオーバーレイ(#001形式)で表示する（下の UserWidget）。
-        const marker = new ZDC.Marker(
+    // ===== MAP MARKERS（ビューポートカリング）=====
+    // 端末の重さは「地図に載っているウィジェット数」にほぼ比例する。5694件を全部描くと
+    // 1ピン＝marker(+Z16以上はラベル)がピン総数に比例して積み上がり、起動と操作が止まる。
+    // 描く対象を「可視範囲＋バッファ内」かつ「filtered() に残っている」ピンだけに絞り、
+    // 地図の idle で差分更新する（描画済みは触らない＝パンのたびに全再生成しない）。
+    const VIEW_BUFFER_RATIO = 0.15;   // 可視範囲を上下左右にこの割合ぶん広げる（パン時のチラつき防止）
+
+    // バッファ込みの可視範囲。取れない場合は null＝カリングせず従来どおり全部描く（事務所を止めない）。
+    // index.html と違い admin は initMap で rotatable を設定していない＝回転しないので、
+    // 回転ぶんのはみ出し補正（index の rotationBufferRatio）は不要。
+    function viewBounds() {
+      if (!map) return null;
+      let b;
+      try { b = map.getLatLngBounds(); } catch (e) { return null; }
+      if (!b) return null;
+      const sw = b.getSouthWest(), ne = b.getNorthEast();
+      const dLat = (ne.lat - sw.lat) * VIEW_BUFFER_RATIO;
+      const dLng = (ne.lng - sw.lng) * VIEW_BUFFER_RATIO;
+      return { south: sw.lat - dLat, north: ne.lat + dLat, west: sw.lng - dLng, east: ne.lng + dLng };
+    }
+    // admin の allPins はフラット形状（{id, ...data}）なので p をそのまま受ける（index は p.data 入れ子）。
+    function inViewBounds(p, vb) {
+      const lat = Number(p.lat), lng = Number(p.lng);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;   // 座標欠落は描けない
+      if (!vb) return true;   // 範囲が取れない時は従来どおり描く
+      return lat >= vb.south && lat <= vb.north && lng >= vb.west && lng <= vb.east;
+    }
+
+    function removePinMarker(id) {
+      const entry = pinWidgetMap.get(id);
+      if (!entry) return;
+      if (map) {
+        if (entry.marker)      { try { map.removeWidget(entry.marker); } catch (e) {} }
+        if (entry.labelWidget) { try { map.removeWidget(entry.labelWidget); } catch (e) {} }
+      }
+      pinWidgetMap.delete(id);
+    }
+
+    // 1ピンぶんの生成。色/ラベル/#001/他社🏢/過去周回の薄色の判定は従来と同一。
+    function renderMarker(p) {
+      removePinMarker(p.id);
+      // 未定義ステータスでも落ちない・透明にならないようガード
+      const s = STATUS[p.status] || EXCLUDE_STATUS[p.status];
+      const isExclude = isExcludeCandidatePin(p);
+      // マーカー色は「担当者(メール)ごとの固定色」。頭文字はステータスを示す。
+      // 固定連番(seqNo)はマーカー上のHTMLオーバーレイ(#001形式)で表示する（下の UserWidget）。
+      const marker = new ZDC.Marker(
+        new ZDC.LatLng(p.lat, p.lng),
+        {
+          color: isPermanentPin(p) ? PERMANENT_COLOR : (isExclude ? EXCLUDE_COLOR : (s ? s.color : FALLBACK_COLOR)),
+          text: s ? (s.text || s.label[0]) : "?"
+        }
+      );
+      marker.pinId = p.id;
+      marker.addEventListener("click", function() { selectPin(p.id); });
+      map.addWidget(marker);
+
+      let labelWidget = null;
+      // ピン番号ラベル(#001形式)をマーカーの上にHTMLオーバーレイ表示。
+      // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
+      // Z16未満では描かない（広域で全ピンぶんのHTMLオーバーレイを作らない＝第一便の軽量化の本体）。
+      // 判定は labelsShown ではなく都度 getZoom() を見る（差分追加されるピンにも正しく効く。index.html と同方式）。
+      if (p.seqNo != null && map.getZoom() >= LABEL_MIN_ZOOM) {
+        // 要確認（住所不明 or 地番未取得）は赤背景で示す。現地画面(index.html)と色基準を統一。
+        // ラベル背景色：要確認赤 ＞ 永久黒 ＞ 周回色（担当者色は廃止）。過去周回の通常ピンは薄色。
+        const labelBg = labelColor(p);
+        const labelOpacity = isPastRound(p) ? ".45" : "1";
+        // 他社物件フラグは背景色（色優先順位）を上書きせず、🏢＋黄土枠で重畳表示。
+        const oc = p.otherCompany === true;
+        const labelBorder = isExcludeCandidatePin(p) ? `2px solid ${EXCLUDE_BORDER}` : (oc ? "2px solid #CA8A04" : "1px solid rgba(255,255,255,.65)");
+        const seqLabel = new ZDC.UserWidget(
           new ZDC.LatLng(p.lat, p.lng),
           {
-            color: isPermanentPin(p) ? PERMANENT_COLOR : (isExclude ? EXCLUDE_COLOR : (s ? s.color : FALLBACK_COLOR)),
-            text: s ? (s.text || s.label[0]) : "?"
+            htmlSource:
+              '<div style="transform:translateX(-50%);white-space:nowrap;'
+              + 'padding:1px 6px;border-radius:9px;'
+              + 'background:' + labelBg + ';color:#fff;'
+              + 'font-size:11px;font-weight:700;line-height:1.6;'
+              + 'border:' + labelBorder + ';'
+              + 'box-shadow:0 1px 3px rgba(0,0,0,.35);'
+              + 'opacity:' + labelOpacity + ';'
+              + 'pointer-events:none;">' + fmtSeq(p.seqNo) + (oc ? ' 🏢' : '') + '</div>',
+            offset: new ZDC.Point(0, -58),
+            propagation: true,
           }
         );
-        marker.pinId = p.id;
-        marker.addEventListener("click", function() { selectPin(p.id); });
-        map.addWidget(marker);
-        markers.push(marker);
+        map.addWidget(seqLabel);
+        labelWidget = seqLabel;   // marker と対で持ち、除去時に一緒に removeWidget する
+      }
+      pinWidgetMap.set(p.id, { marker, labelWidget });
+    }
 
-        // ピン番号ラベル(#001形式)をマーカーの上にHTMLオーバーレイ表示。
-        // seqNo が無い旧データには付けない。pointer-events:none でマーカークリックを邪魔しない。
-        // Z16未満では描かない（広域で全ピンぶんのHTMLオーバーレイを作らない＝第一便の軽量化の本体）。
-        if (p.seqNo != null && labelsShown) {
-          // 要確認（住所不明 or 地番未取得）は赤背景で示す。現地画面(index.html)と色基準を統一。
-          // ラベル背景色：要確認赤 ＞ 永久黒 ＞ 周回色（担当者色は廃止）。過去周回の通常ピンは薄色。
-          const labelBg = labelColor(p);
-          const labelOpacity = isPastRound(p) ? ".45" : "1";
-          // 他社物件フラグは背景色（色優先順位）を上書きせず、🏢＋黄土枠で重畳表示。
-          const oc = p.otherCompany === true;
-          const labelBorder = isExcludeCandidatePin(p) ? `2px solid ${EXCLUDE_BORDER}` : (oc ? "2px solid #CA8A04" : "1px solid rgba(255,255,255,.65)");
-          const seqLabel = new ZDC.UserWidget(
-            new ZDC.LatLng(p.lat, p.lng),
-            {
-              htmlSource:
-                '<div style="transform:translateX(-50%);white-space:nowrap;'
-                + 'padding:1px 6px;border-radius:9px;'
-                + 'background:' + labelBg + ';color:#fff;'
-                + 'font-size:11px;font-weight:700;line-height:1.6;'
-                + 'border:' + labelBorder + ';'
-                + 'box-shadow:0 1px 3px rgba(0,0,0,.35);'
-                + 'opacity:' + labelOpacity + ';'
-                + 'pointer-events:none;">' + fmtSeq(p.seqNo) + (oc ? ' 🏢' : '') + '</div>',
-              offset: new ZDC.Point(0, -58),
-              propagation: true,
-            }
-          );
-          map.addWidget(seqLabel);
-          // markers 配列に入れておけば再描画時の removeWidget ループで一緒に消える。
-          markers.push(seqLabel);
-        }
+    // 可視範囲の変化に追従して差分更新（範囲内で未描画は追加／対象外は marker＋ラベルごと除去）。
+    // 既に描画済みのピンは触らない＝パンのたびに全再生成しない。
+    function relayoutVisiblePins() {
+      if (!map) return;
+      const vb = viewBounds();
+      const keep = new Set();
+      filteredPins.forEach(p => {
+        if (!inViewBounds(p, vb)) return;
+        keep.add(p.id);
+        if (!pinWidgetMap.has(p.id)) renderMarker(p);
       });
+      for (const id of Array.from(pinWidgetMap.keys())) {
+        if (!keep.has(id)) removePinMarker(id);
+      }
+      updateMapCount();   // 「該当N件／地図M件」の更新はここ1箇所に集約する
+    }
+
+    // 全消し→可視範囲だけ描き直す。差分版は描画済みを触らないため、
+    // 「見た目そのものが変わる」時（周回色・ステータス変更）と
+    // 「重畳画像の上へピンを戻す」時（用途地域/地番レイヤ）はこちらを使う。
+    function renderAllMarkers() {
+      if (!map) return;
+      // 今回の描画でラベルを描くか。idle の閾値跨ぎ判定がこの値を見るので、描く前に確定させる。
+      labelsShown = map.getZoom() >= LABEL_MIN_ZOOM;
+      for (const id of Array.from(pinWidgetMap.keys())) removePinMarker(id);
+      relayoutVisiblePins();
+    }
+
+    // 一覧(filtered)と地図(カリング後)の件数を明示する。数の食い違いを説明できないと
+    // 「ピンが消えた」と読まれるため、初期中心/倍率の変更と同じ便で入れる。
+    function updateMapCount() {
+      const el = document.getElementById("mapCount");
+      if (!el) return;
+      const n = filteredPins.length, m = pinWidgetMap.size;
+      if (n > 0 && m === 0) {
+        el.textContent = `該当 ${n}件／表示範囲に該当ピンがありません`;
+        el.classList.add("warn");
+      } else {
+        el.textContent = `該当 ${n}件／地図 ${m}件`;
+        el.classList.remove("warn");
+      }
     }
     
     // ===== SELECT PIN =====
@@ -1398,10 +1489,10 @@
         card.classList.add("flash");
       }
 
-      // 地図は再描画しない。マーカーの見た目は selectedPinId を参照しておらず
+      // 地図は全再描画しない。マーカーの見た目は selectedPinId を参照しておらず
       // （色=status/永久/除外、ラベル=labelColor/isPastRound/otherCompany）、
-      // ここでの全再構築は 5694 件ぶんのウィジェットを作り直すだけで画面は1pxも変わらなかった
-      // ＝「カード/ピンをクリックすると固まる」の主因。
+      // 全再構築は表示中ぶんのウィジェットを作り直すだけで画面は1pxも変わらなかった
+      // ＝「カード/ピンをクリックすると固まる」の主因（便②-0で削除）。
       // ズーム変化に伴う #001ラベルの出し入れは initMap 内の idle リスナが担当する。
 
       const pin = allPins.find(p => p.id === id);
@@ -1411,6 +1502,10 @@
         map.setCenter(new ZDC.LatLng(pin.lat, pin.lng));
         if (targetZoom !== map.getZoom()) map.setZoom(targetZoom);
         // レイヤON中は B-1 で追加の "idle" リスナが移動完了後に redrawActiveLayers() を呼び追従する。
+        // カリング後は「可視範囲外のピンを一覧から選ぶ」場合に、移動先で描画し直す必要がある。
+        // 通常は移動完了の idle が拾うが、既に同じ中心・同じズームだと idle が発火しない穴があるため
+        // ここで明示的に1回呼ぶ（差分更新なので描画済みには触らず安価）。
+        relayoutVisiblePins();
       }
     };
 
@@ -1906,6 +2001,9 @@
     }
     .select-all-label input { cursor: pointer; }
     .select-count { font-size: 12px; color: #64748b; }
+    .count-group { display: flex; align-items: center; gap: 10px; }
+    .map-count { font-size: 12px; color: #64748b; }
+    .map-count.warn { color: #b45309; font-weight: 600; }   /* 該当はあるが画面内に無い時 */
 
     #bulkDeleteBtn {
       display: none; align-items: center; justify-content: center;
@@ -2162,7 +2260,11 @@
         <input type="checkbox" id="selectAllCheck" onchange="toggleSelectAll(this)">
         全選択
       </label>
-      <span class="select-count" id="selectCount"></span>
+      <span class="count-group">
+        <!-- 地図はカリングで画面内だけ描く。一覧の件数と食い違うので「ピンが消えた」と誤解されないよう明示する -->
+        <span class="map-count" id="mapCount"></span>
+        <span class="select-count" id="selectCount"></span>
+      </span>
     </div>
 
     <button id="bulkDeleteBtn" onclick="bulkDelete()">🗑 0件削除</button>
