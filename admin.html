@@ -1398,7 +1398,11 @@
         card.classList.add("flash");
       }
 
-      renderMapMarkers();
+      // 地図は再描画しない。マーカーの見た目は selectedPinId を参照しておらず
+      // （色=status/永久/除外、ラベル=labelColor/isPastRound/otherCompany）、
+      // ここでの全再構築は 5694 件ぶんのウィジェットを作り直すだけで画面は1pxも変わらなかった
+      // ＝「カード/ピンをクリックすると固まる」の主因。
+      // ズーム変化に伴う #001ラベルの出し入れは initMap 内の idle リスナが担当する。
 
       const pin = allPins.find(p => p.id === id);
       if (pin && map) {
