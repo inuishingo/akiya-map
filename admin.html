@@ -265,6 +265,27 @@
       return legacy + known;
     }
 
+    // ステータス<select>の遅延生成。20option×5optgroup を全カードぶん先に作ると
+    // 一覧DOMの半分がこの中身になる（5694件で option 113,880個 / 全ノードの52%）。
+    // 開くまでは現在値1件だけ持たせ、ポインタが乗った/フォーカスした時点で全選択肢を流し込む
+    // （見た目・操作は変えない）。
+    function statusCurrentOptionHTML(selected) {
+      // statusOptionsHTML と同じ見え方に合わせる：未定義キー(旧データ)は値そのまま。
+      // 空/欠落は statusOptionsHTML でも「どのoptionも selected でない」＝先頭候補が表示されるので、
+      // その先頭候補を明示的に置いて従来と同じ表示にする。
+      if (!selected) {
+        const first = STATUS_GROUPS[0].keys[0];
+        return `<option value="${first}" selected>${STATUS[first].label}</option>`;
+      }
+      return `<option value="${selected}" selected>${statusDisplayLabel(selected)}</option>`;
+    }
+    // カードの<select>から呼ぶため window に出す。冪等（2回目以降は何もしない）。
+    window.fillStatusOptions = (el) => {
+      if (!el || el.dataset.filled) return;
+      el.innerHTML = statusOptionsHTML(el.dataset.status || "");
+      el.dataset.filled = "1";
+    };
+
     function makeSvgUrl(color, text) {
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="40" viewBox="0 0 32 40">
         <path d="M16 0 C7.16 0 0 7.16 0 16 C0 28 16 40 16 40 C16 40 32 28 32 16 C32 7.16 24.84 0 16 0Z" fill="${color}"/>
@@ -1202,9 +1223,45 @@
       return n != null ? "#" + String(n).padStart(3, "0") : "";
     }
 
+    // 一覧に一度に描くカード数。5694件を全部 innerHTML に流すと 18MB/27万ノードになり、
+    // 起動と担当者切替でブラウザが止まる。論理集合(filtered)は全件のまま、描画だけ先頭から刻む。
+    // ※真の仮想スクロールは採らない。カード高さがメモ有無/出力済み行で可変なため、
+    //   高さ実測かスペーサー補正が要り、スクロール位置ズレのバグに対して割に合わない。
+    // ※Excel出力/全選択/一括削除/selectionTargets() は従来どおり filtered() 全件が対象。
+    //   ここで絞るのは「DOMに描く枚数」だけで、操作の対象集合は一切変えない。
+    const LIST_PAGE_SIZE = 100;
+    let listLimit = LIST_PAGE_SIZE;
+    let lastFilterSig = null;
+
+    // フィルタ状態の署名。変わった時だけ表示件数を先頭に戻す。
+    // チェック操作や onSnapshot 由来の再描画では変わらない＝「さらに表示」で広げた位置を壊さない。
+    // ※フィルタを新設したらここにも足すこと（足し忘れるとそのフィルタ変更で先頭に戻らない）。
+    function filterSignature() {
+      // JSON化して連結する。区切り文字を自前で持つと searchQuery(自由入力)に同じ文字が来た時に
+      // 別条件が同じ署名になり得るため、値の境界が壊れない形にしておく。
+      return JSON.stringify([reviewOnly, activeStaffFilter, activeDateFilter, searchQuery,
+        activeGroupFilter, activeStatusFilter, otherCompanyFilter, activeAreaFilter, activeRoundFilter]);
+    }
+    window.showMoreList = () => { listLimit += LIST_PAGE_SIZE; renderList(); };
+
+    // 一覧の末尾。まだ描いていない件数と、いま何件描画中かを出す（②-1 の「該当N／地図M」と読み合わせる）。
+    function listFooterHTML(shownCount, totalCount) {
+      if (shownCount < totalCount) {
+        const next = Math.min(LIST_PAGE_SIZE, totalCount - shownCount);
+        return `<button class="more-btn" onclick="showMoreList()">さらに ${next}件を表示`
+             + `<span class="more-sub">${shownCount} / ${totalCount}件を表示中</span></button>`;
+      }
+      return totalCount > LIST_PAGE_SIZE ? `<div class="list-end">全 ${totalCount}件を表示中</div>` : "";
+    }
+
     function renderList() {
       const pins = filtered();
       filteredPins = pins;   // 地図描画側のキャッシュを同時に更新（relayoutVisiblePins がこれを読む）
+      // ↑ここは常に全件。地図(②-1のカリング)は listLimit の影響を受けない＝101件目以降も画面内なら描く。
+      // フィルタが変わった時だけ表示件数を先頭に戻す（チェック操作や購読更新では戻さない）。
+      const sig = filterSignature();
+      if (sig !== lastFilterSig) { lastFilterSig = sig; listLimit = LIST_PAGE_SIZE; }
+      const shown = pins.slice(0, listLimit);   // DOMに描くのはここまで。以下の全選択判定は pins(全件) のまま
       const container = document.getElementById("pinList");
       const hasChecked = checkedIds.size > 0;
 
@@ -1225,7 +1282,7 @@
         container.innerHTML = `<div class="empty">該当するピンがありません</div>`;
         return;
       }
-      container.innerHTML = pins.map(p => {
+      container.innerHTML = shown.map(p => {
         // 未定義ステータスでも崩れないようガード
         const s = STATUS[p.status] || EXCLUDE_STATUS[p.status];
         const isExclude = isExcludeCandidatePin(p);
@@ -1285,8 +1342,10 @@
           </div>
           <div class="pin-actions">
             <a class="sv-btn" href="${gmapUrl}" target="_blank" onclick="event.stopPropagation()">🗺 地図で開く</a>
-            <select class="status-sel" onchange="updateStatus('${p.id}',this.value)" onclick="event.stopPropagation()">
-              ${statusOptionsHTML(p.status)}
+            <select class="status-sel" data-status="${escAttr(p.status)}"
+              onpointerenter="fillStatusOptions(this)" onfocus="fillStatusOptions(this)" onmousedown="fillStatusOptions(this)"
+              onchange="updateStatus('${p.id}',this.value)" onclick="event.stopPropagation()">
+              ${statusCurrentOptionHTML(p.status)}
             </select>
           </div>
           <label class="oc-toggle" onclick="event.stopPropagation()">
@@ -1294,7 +1353,7 @@
           </label>
           ${exported ? `<div class="export-line">✓ Excel出力済 ${exportedMD}${exportedByName ? ` ・ ${exportedByName}` : ""}</div>` : ""}
         </div>`;
-      }).join("");
+      }).join("") + listFooterHTML(shown.length, pins.length);
     }
 
     // ===== CHECKBOX =====
@@ -1477,6 +1536,15 @@
     // ===== SELECT PIN =====
     window.selectPin = (id) => {
       selectedPinId = id;
+
+      // 一覧は先頭 listLimit 件しか描いていない。地図から選んだピンがその外にあるとカードが存在せず、
+      // ハイライトもスクロールもできないため、含まれるまで広げて描き直す。
+      // 広げた分だけDOMは増えるが、便②-2 以前は毎回 全件 を描いていたので上限は従来と同じ。
+      const idx = filteredPins.findIndex(p => p.id === id);
+      if (idx >= listLimit) {
+        listLimit = Math.ceil((idx + 1) / LIST_PAGE_SIZE) * LIST_PAGE_SIZE;
+        renderList();
+      }
 
       document.querySelectorAll(".pin-card").forEach(c => c.classList.remove("selected"));
       const card = document.getElementById(`card-${id}`);
@@ -2004,6 +2072,17 @@
     .count-group { display: flex; align-items: center; gap: 10px; }
     .map-count { font-size: 12px; color: #64748b; }
     .map-count.warn { color: #b45309; font-weight: 600; }   /* 該当はあるが画面内に無い時 */
+
+    /* 一覧の件数上限（便②-2）。描画は先頭 LIST_PAGE_SIZE 件まで＝続きはこのボタンで刻む */
+    .more-btn {
+      display: flex; flex-direction: column; align-items: center; gap: 2px;
+      width: calc(100% - 16px); margin: 8px; padding: 10px;
+      border-radius: 8px; background: #fff; border: 1px solid #cbd5e1; color: #334155;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    .more-btn:hover { background: #f1f5f9; }
+    .more-sub { font-size: 11px; font-weight: 400; color: #94a3b8; }
+    .list-end { margin: 8px; padding: 8px; text-align: center; font-size: 12px; color: #94a3b8; }
 
     #bulkDeleteBtn {
       display: none; align-items: center; justify-content: center;
