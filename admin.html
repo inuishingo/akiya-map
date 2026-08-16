@@ -66,7 +66,9 @@
     // 二重取得の防止が目的。調査員(index.html)には購読・描画とも一切追加しない（rules の read も isAdmin）。
     const KOUZU_COLOR = "#06B6D4";  // 専用色。反社#1F2937 / NG#6B7280 / 要確認#EF4444 / staff色と重複なし
     let kouzuMode  = false;   // 地図クリックで公図マークを登録するモード（反社/NG登録と排他）
-    let kouzuOn    = true;    // 公図マークの表示ON/OFF（既定ON）
+    // 表示は既定OFF。京都は数百件あり、起動時に全チップを描くと初期表示が重い（実機確認済み）。
+    // 購読(listenKouzuMarks)は従来どおり走らせる＝トグルONの瞬間に取得待ちを出さない。
+    let kouzuOn    = false;   // 公図マークの表示ON/OFF（既定OFF・手動ON運用）
     let kouzuMarks = [];      // Firestoreミラー（自店分のみ）
     let kouzuWidgets = [];    // 地図ウィジェット。markers とは別配列＝ピン再描画で消えない
     let kouzuPending = null;  // 登録モーダルで保留中の座標 {lat,lng}
@@ -690,7 +692,7 @@
     window.closeYoutoInfo = () => { const b=document.getElementById("youtoInfo"); if(b) b.style.display="none"; };
     window.toggleYouto    = () => { youtoOn=!youtoOn; const btn=document.getElementById("youtoBtn"); if(btn) btn.classList.toggle("active",youtoOn); if(!youtoOn) closeYoutoInfo(); redrawActiveLayers(); };
     window.toggleChiban   = () => { chibanOn=!chibanOn; const btn=document.getElementById("chibanBtn"); if(btn) btn.classList.toggle("active",chibanOn); redrawActiveLayers(); };
-    // 公図マークの表示ON/OFF（既定ON）。レイヤ重畳ではないので redrawActiveLayers は呼ばない。
+    // 公図マークの表示ON/OFF（既定OFF）。レイヤ重畳ではないので redrawActiveLayers は呼ばない。
     window.toggleKouzu    = () => {
       kouzuOn = !kouzuOn;
       const btn = document.getElementById("kouzuBtn"); if (btn) btn.classList.toggle("active", kouzuOn);
@@ -2107,8 +2109,8 @@
     <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
     <button class="layer-btn youto" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋クリックで属性">用途地域</button>
     <button class="layer-btn" id="chibanBtn" onclick="toggleChiban()" title="地番（ブルーマップ）重畳">地番</button>
-    <!-- 公図取得済みマークの表示切替。既定ON（初期から class="active"） -->
-    <button class="layer-btn kouzu active" id="kouzuBtn" onclick="toggleKouzu()" title="公図取得済みマークの表示切替（管理者専用）">公図</button>
+    <!-- 公図取得済みマークの表示切替。既定OFF（active を付けない＝kouzuOn の初期値と揃える） -->
+    <button class="layer-btn kouzu" id="kouzuBtn" onclick="toggleKouzu()" title="公図取得済みマークの表示切替（管理者専用）">公図</button>
     <button class="csv-btn" onclick="exportExcel()">📥 Excel出力</button>
     <button class="csv-btn undo-btn" onclick="unexportAll()" title="チェックがあれば選択分／無ければ表示中の出力済みを未出力に戻す">↩ 出力取消</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
