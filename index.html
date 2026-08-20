@@ -156,12 +156,18 @@
         if (map) renderAllMarkers();
       }, e => {});
     }
-    function currentRoundOf(p){ const s = roundState[`${pinBranch(p)}__${areaKey(p)}`]; return (s && Number(s.currentRound)) || 1; }
-    function roundOf(p){ return Number(p.surveyRound) || 1; }
+    // 0 は正当な周回番号（第0周＝冊子リスト由来の未調査ピン）。|| だと 0 が 1 に化けて
+    // 全件が1周目扱いになるため ?? を使う。ただし Number(undefined) は NaN で ?? に拾われないので、
+    // Number(x ?? 1) の順序（?? を内側）でなければならない。Number(undefined) ?? 1 は NaN のまま。
+    function currentRoundOf(p){ const s = roundState[`${pinBranch(p)}__${areaKey(p)}`]; return Number(s?.currentRound ?? 1); }
+    function roundOf(p){ return Number(p.surveyRound ?? 1); }
     function isPastRound(p){ return !isPermanentPin(p) && roundOf(p) < currentRoundOf(p); }   // 過去周回の通常ピン=薄色対象
     // ラベル背景色（index/admin統一）：要確認赤 ＞ 永久黒 ＞ 周回色（1青/2緑/3橙/4紫→((r-1)%4)ローテ）。担当者色は廃止。
     const ROUND_COLORS = ["#2563EB","#16A34A","#EA580C","#9333EA"];
-    function roundColor(r){ return ROUND_COLORS[(((r||1)-1)%4+4)%4]; }
+    // 第0周（冊子リスト）は周回ローテとは別系統のグレー。((0-1)%4) だと第4周の紫と衝突するため専用色にする。
+    // isPastRound=true で薄色化が乗るため、薄いグレーだと地図上で消える。輪郭が残る濃さを選ぶこと。
+    const ROUND0_COLOR = "#64748B";
+    function roundColor(r){ return (Number(r) === 0) ? ROUND0_COLOR : ROUND_COLORS[(((r ?? 1)-1)%4+4)%4]; }
     function labelColor(p){
       if (isReviewFlagged(p)) return "#EF4444";
       if (isPermanentPin(p))  return PERMANENT_COLOR;
@@ -1351,7 +1357,7 @@
           excludeCandidate,
           areaCode: pendingAreaCode,   // reverse由来のJIS5桁市区町村コード（失敗時null・推測しない）
           areaName: pendingAreaName,   // reverse由来の市区町村名（政令市は区／失敗時null）
-          surveyRound: (roundState[`${myBranch}__${pendingAreaCode}`]?.currentRound) || 1,   // そのエリアの現在周回（未取得/未判定=1・現場を止めない）
+          surveyRound: (roundState[`${myBranch}__${pendingAreaCode}`]?.currentRound) ?? 1,   // そのエリアの現在周回（未取得/未判定=1・現場を止めない）
           branch: myBranch,   // ログイン調査員の所属店（loadMyBranchで確定。名古屋員は"名古屋"のまま）
           createdAt: new Date().toISOString(),
         };

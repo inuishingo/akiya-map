@@ -204,12 +204,18 @@
         updateRoundFilter(); renderList(); renderAllMarkers();   // 周回色が変わる＝描画済みの見た目が変わるので全再描画
       }, e => {});
     }
-    function currentRoundOf(p){ const s = roundState[`${pinBranch(p)}__${areaKey(p)}`]; return (s && Number(s.currentRound)) || 1; }
-    function roundOf(p){ return Number(p.surveyRound) || 1; }
+    // 0 は正当な周回番号（第0周＝冊子リスト由来の未調査ピン）。|| だと 0 が 1 に化けて
+    // 全件が1周目扱いになるため ?? を使う。ただし Number(undefined) は NaN で ?? に拾われないので、
+    // Number(x ?? 1) の順序（?? を内側）でなければならない。Number(undefined) ?? 1 は NaN のまま。
+    function currentRoundOf(p){ const s = roundState[`${pinBranch(p)}__${areaKey(p)}`]; return Number(s?.currentRound ?? 1); }
+    function roundOf(p){ return Number(p.surveyRound ?? 1); }
     function isPastRound(p){ return !isPermanentPin(p) && roundOf(p) < currentRoundOf(p); }   // 過去周回の通常ピン=薄色対象
     // ラベル背景色（index/admin統一）：要確認赤 ＞ 永久黒 ＞ 除外候補黄 ＞ 周回色（1青/2緑/3橙/4紫→((r-1)%4)ローテ）。担当者色は廃止。
     const ROUND_COLORS = ["#2563EB","#16A34A","#EA580C","#9333EA"];
-    function roundColor(r){ return ROUND_COLORS[(((r||1)-1)%4+4)%4]; }
+    // 第0周（冊子リスト）は周回ローテとは別系統のグレー。((0-1)%4) だと第4周の紫と衝突するため専用色にする。
+    // isPastRound=true で薄色化が乗るため、薄いグレーだと地図上で消える。輪郭が残る濃さを選ぶこと。
+    const ROUND0_COLOR = "#64748B";
+    function roundColor(r){ return (Number(r) === 0) ? ROUND0_COLOR : ROUND_COLORS[(((r ?? 1)-1)%4+4)%4]; }
     function labelColor(p){
       if (isExcludeCandidatePin(p)) return EXCLUDE_COLOR;
       if (isReviewFlagged(p)) return "#EF4444";
@@ -992,15 +998,17 @@
       sel.innerHTML = html;
     }
     function updateRoundFilter(){
-      // 周回番号の最大＝マスタ currentRound と ピン surveyRound の最大（マスタ未作成でもピンから拾う）
+      // 周回番号の範囲＝マスタ currentRound と ピン surveyRound の最小〜最大（マスタ未作成でもピンから拾う）。
+      // 冊子リストは第0周で入るため、下限を 1 に固定すると「第0周」が選択肢に出ない。
       let maxR = 1;
-      Object.values(roundState).forEach(s => { const r = Number(s.currentRound)||1; if (r>maxR) maxR=r; });
-      allPins.forEach(p => { const r = roundOf(p); if (r>maxR) maxR=r; });
+      let minR = 1;
+      Object.values(roundState).forEach(s => { const r = Number(s.currentRound ?? 1); if (r>maxR) maxR=r; if (r<minR) minR=r; });
+      allPins.forEach(p => { const r = roundOf(p); if (r>maxR) maxR=r; if (r<minR) minR=r; });
       if (activeRoundFilter !== "all" && Number(activeRoundFilter) > maxR) activeRoundFilter = "all";
       const sel = document.getElementById("roundFilter");
       if (!sel) return;
       let opts = `<option value="all">周回：すべて</option>`;
-      for (let r=1; r<=maxR; r++) opts += `<option value="${r}" ${String(r)===activeRoundFilter?"selected":""}>第${r}周</option>`;
+      for (let r=minR; r<=maxR; r++) opts += `<option value="${r}" ${String(r)===activeRoundFilter?"selected":""}>第${r}周</option>`;
       sel.innerHTML = opts;
     }
     window.setAreaFilter  = (val) => { activeAreaFilter = val; renderList(); relayoutVisiblePins(); };
@@ -1020,7 +1028,7 @@
     }
     function roundCurrentOf(areaCode) {
       const s = roundState[`${myBranch}__${areaCode}`];
-      return (s && Number(s.currentRound)) || 1;
+      return Number(s?.currentRound ?? 1);
     }
     // エリアDD：自店ピンが存在する areaCode を areaName で列挙。未判定(null)は選択肢に出さず件数だけ別枠表示。
     window.openRoundManager = () => {
@@ -1635,13 +1643,28 @@
     };
 
     // ===== 住所ジオコーディング＋反社/NG登録（管理画面専用） =====
+    // reverse(type=reverse) / forward(/search/address) いずれの item からも {areaCode, areaName} を作る。
+    // index.html の areaFromReverseItem と同一仕様に揃える（2ページで定義が重複するため同期が必要）。
+    // areaCode = 都道府県コード(2桁)+市区町村コード(3桁) = JIS5桁（政令市は区まで分離）。
+    // 「◯◯郡△△町/村」は郡名を除去。欠落時は null＝推測しない。
+    function areaFromItem(item) {
+      if (!item || !item.address_code2 || !item.address_code3) return { areaCode: null, areaName: null };
+      const areaCode = String(item.address_code2).padStart(2, "0") + String(item.address_code3).padStart(3, "0");
+      const a3 = item.address3 || "";
+      const gm = a3.match(/^.+?郡(.+[町村])$/);
+      return { areaCode: areaCode, areaName: gm ? gm[1] : (a3 || null) };
+    }
+
     // 住所→座標は ZENRIN Web API forward（admin既存WMSと同じ3ヘッダ認証。word=住所→position=[lon,lat]）。
     async function geocodeAddress(word) {
       const url = "https://test-web.zmaps-api.com/search/address?word=" + encodeURIComponent(word);
       const res = await fetch(url, { headers: { "x-api-key": WMS_KEY, "Authorization": "referer" } });
       const it = (await res.json()).result?.item?.[0];
       if (!it || !Array.isArray(it.position)) return null;
-      return { lng: it.position[0], lat: it.position[1], address: it.address || word };
+      // 市区町村コードは同じレスポンスに入っている（address_code2/3）＝追加リクエストなしで取れる。
+      const a = areaFromItem(it);
+      return { lng: it.position[0], lat: it.position[1], address: it.address || word,
+               areaCode: a.areaCode, areaName: a.areaName };
     }
 
     // 一時マーカー(登録前の仮位置★)を消す。登録成功/キャンセル/モードOFF/住所未ヒットで呼ぶ。
@@ -1658,7 +1681,8 @@
       let g = null;
       try { g = await geocodeAddress(word); } catch(e) { g = null; }
       if (!g) { clearRegTempMarker(); showToast("住所が見つかりません", "error"); return; }
-      lastGeoLatLng = { lat: g.lat, lng: g.lng, address: g.address };
+      lastGeoLatLng = { lat: g.lat, lng: g.lng, address: g.address,
+                        areaCode: g.areaCode, areaName: g.areaName };
       if (map) {
         map.setCenter(new ZDC.LatLng(g.lat, g.lng));
         map.setZoom(Math.max(map.getZoom(), 17));
@@ -1685,10 +1709,16 @@
     }
 
     // 反社/NG永久ピンを作成（住所登録・クリック登録の共通処理）。座標が最優先・住所はおまけ。
-    async function createPermanentPin(lat, lng, address) {
+    // area = {areaCode, areaName}。呼び出し側が reverse/forward のレスポンス item から作って渡す
+    // （エリア単位購読では areaCode が無いピンはどのエリアを選んでも表示されない＝必須項目）。
+    // 判定できなかった場合は null のまま保存する（推測しない＝index.html:1174 と同じ方針）。
+    async function createPermanentPin(lat, lng, address, area) {
       if (regStatus !== "hansha" && regStatus !== "ng") return false;
       const label = STATUS[regStatus]?.label || regStatus;
       if (!confirm(`この位置に「${label}」ピンを登録しますか？\n${address || "（住所なし）"}`)) { clearRegTempMarker(); return false; }
+      const areaCode = (area && area.areaCode) || null;
+      const areaName = (area && area.areaName) || null;
+      if (!areaCode) console.warn("[areaCode未判定] 反社/NG登録", { lat, lng, address, area });
       try {
         const pinData = {
           uid: auth.currentUser?.uid || "",
@@ -1699,13 +1729,17 @@
           status: regStatus,
           memo: "",
           branch: myBranch,
+          areaCode,   // JIS5桁市区町村コード（判定不能時 null・推測しない）
+          areaName,   // 市区町村名（政令市は区／判定不能時 null）
           needsReview: false,
           createdAt: new Date().toISOString(),
           seqNo: await nextSeqNo(),
         };
         await addDoc(collection(db, "pins"), pinData);   // onSnapshot が拾って自動再描画
         clearRegTempMarker();
-        showToast(`「${label}」ピンを登録しました`);
+        // エリア未判定は事務員がその場で気づけるよう警告色で明示する（D-1b のバックフィル対象になる）。
+        showToast(`「${label}」ピンを登録しました${areaCode ? "" : "（エリア未判定）"}`,
+                  areaCode ? "ok" : "warn");
         return true;
       } catch(e) { showToast("登録に失敗しました", "error"); console.error("createPermanentPin", e); return false; }
     }
@@ -1713,7 +1747,7 @@
     // 方法A：住所ジオコード座標に登録
     window.registerFromAddress = async () => {
       if (!lastGeoLatLng) { showToast("先に住所で地図へ移動してください", "warn"); return; }
-      await createPermanentPin(lastGeoLatLng.lat, lastGeoLatLng.lng, lastGeoLatLng.address);
+      await createPermanentPin(lastGeoLatLng.lat, lastGeoLatLng.lng, lastGeoLatLng.address, lastGeoLatLng);
     };
 
     // 方法B：地図クリック登録モード ON/OFF
@@ -1739,11 +1773,14 @@
     // 方法Bのクリック時：reverseで住所補完（失敗しても座標優先で登録は継続）。
     async function registerFromClick(latlng) {
       let address = "";
+      let area = { areaCode: null, areaName: null };
       try {
         const r = await fetch(`https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`);
-        address = (await r.json()).result?.item?.[0]?.address || "";
+        const item = (await r.json()).result?.item?.[0] || null;
+        address = item?.address || "";
+        area = areaFromItem(item);   // 同じ item から取る＝reverse の追加呼び出しは不要
       } catch(e) { address = ""; }   // reverse失敗は無視（座標が最優先・住所はおまけ）
-      const ok = await createPermanentPin(latlng.lat, latlng.lng, address);
+      const ok = await createPermanentPin(latlng.lat, latlng.lng, address, area);
       if (ok) setRegMode(false);   // 登録成功後は自動OFF（誤ピン防止）。失敗/キャンセルはON維持で再クリック可
     }
 
@@ -2246,6 +2283,9 @@
     }
     .toast.ok    { background: #065f46; color: #6ee7b7; }
     .toast.error { background: #7f1d1d; color: #fca5a5; }
+    /* warn は既に6箇所で使われていたが admin 側だけ定義が無く、背景なし＝地図上で読めなかった。
+       index.html と同値に揃える（「エリア未判定」等の警告を事務員が確実に気づけるようにするため）。 */
+    .toast.warn  { background: #78350f; color: #fcd34d; }
   </style>
 </head>
 <body>
