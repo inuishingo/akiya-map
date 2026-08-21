@@ -52,6 +52,11 @@
     let pendingChibanRef = false;   // 直近の自動地番が「参考地番(近傍筆)・要確認」か
     let pendingAreaCode = null;     // 直近reverseのareaCode(JIS5桁)。ピン保存で使う（reverse失敗時null）
     let pendingAreaName = null;     // 直近reverseのareaName(市区町村名／政令市は区)。失敗時null
+    // 保存する住所は「ラベルの表示文字列」ではなくこの変数から取る。ラベルは
+    // "住所取得中…" / "住所不明" / "（オフライン）" を出すため、textContent をそのまま保存すると
+    // UI文字列がDBに永続化される（実測63件）。null=reverse未完了 / ""=取得できなかった（空で保存）。
+    let pendingAddress = null;
+    let pendingReverse = null;      // 進行中のreverseのPromise。保存時に短時間だけ待つのに使う
     let offlineQueue = JSON.parse(localStorage.getItem("offlineQueue") || "[]");
     // Undo：このセッションで自分が立てたピンだけを積む（過去セッション・他人のピンは入れない＝絶対に消えない）。
     // ログアウトで捨てる。詳細は「UNDO」ブロック参照。
@@ -1127,7 +1132,7 @@
       document.getElementById("chibanRefNote").style.display = "none";
       document.getElementById("deleteBtn").style.display = "none";
       document.getElementById("pinModal").style.display = "flex";
-      reverseGeocode(pendingLatLng);
+      pendingReverse = reverseGeocode(pendingLatLng);   // 保存時に短時間だけ待てるようPromiseを保持
       fetchChiban(pendingLatLng);
     }
 
@@ -1161,6 +1166,8 @@
       pendingLatLng = null;
       pendingChiban = "";
       pendingChibanRef = false;
+      pendingAddress = null;
+      pendingReverse = null;
       document.getElementById("chibanRefNote").style.display = "none";
       editingPinId = null;
       editingPinData = null;
@@ -1186,13 +1193,16 @@
     async function reverseGeocode(latlng) {
       document.getElementById("addressLabel").textContent = "住所取得中…";
       pendingAreaCode = null; pendingAreaName = null;   // 新規タップごとにリセット（失敗時はnullのまま保存）
+      pendingAddress = null;                            // null=未取得。保存時に待つかどうかの判定に使う
       try {
         const item = await fetchReverseItem(latlng.lat, latlng.lng);
         document.getElementById("addressLabel").textContent = (item && item.address) || "住所不明";
+        pendingAddress = (item && item.address) || "";  // 取れなければ空文字（"住所不明"は表示専用）
         const a = areaFromReverseItem(item);
         pendingAreaCode = a.areaCode; pendingAreaName = a.areaName;
       } catch {
         document.getElementById("addressLabel").textContent = "（オフライン）";
+        pendingAddress = "";                            // 表示は「（オフライン）」でも保存は空文字
       }
     }
 
@@ -1310,7 +1320,6 @@
       const status = document.querySelector('input[name="status"]:checked')?.value;
       if (!status) { showToast("ステータスを選択してください", "warn"); return; }
       const memo   = document.getElementById("memo").value.trim();
-      const address = document.getElementById("addressLabel").textContent;
       const otherCompanyEl = document.getElementById("otherCompanyCheck");
       const otherCompany = otherCompanyEl ? otherCompanyEl.checked : false;
       const excludeEl = document.getElementById("excludeCandidateCheck");
@@ -1325,7 +1334,11 @@
 
       if (editingPinId) {
         try {
-          const update = { status, memo, address, otherCompany, excludeCandidate };
+          // 【意図的な仕様変更】address を update から外す。
+          // indexの住所欄は表示専用のdivで、ラベルには "取得中…" 等のUI文字列が入り得るため、
+          // 書き戻すとプレースホルダが保存される。さらに、事務方がadminで手入力した住所を
+          // 調査員の編集保存が上書きしてしまう経路にもなっていた。indexからは住所を変更しない。
+          const update = { status, memo, otherCompany, excludeCandidate };
           console.log("[debug] update payload:", update);
           // 地番を手修正したときだけ chiban を更新し、手修正フラグ(chibanManual)を
           // 立てて要確認フラグを解除する（手修正は自動再取得より優先）。
@@ -1342,6 +1355,15 @@
           showToast("更新に失敗しました", "error");
         }
       } else {
+        // reverse が未完了なら最大1.5秒だけ待つ（実測 中央値0.22秒／10回平均0.226秒）。
+        // モーダルは reverse を待たずに開くため、素早く連続でピンを立てると
+        // 完了前に保存できてしまい "住所取得中…" が保存されていた（実測8件）。
+        // 待ち切れなければ住所は空のまま保存し要確認を立てる＝現場を止めない。
+        if (pendingAddress === null && pendingReverse) {
+          await Promise.race([pendingReverse, new Promise(r => setTimeout(r, 1500))]);
+        }
+        const addrPending = (pendingAddress === null);
+        const address = pendingAddress || "";
         const pinData = {
           uid: currentUser.uid,
           email: currentUser.email,
@@ -1367,6 +1389,13 @@
         if (pendingChibanRef && chiban && chiban === pendingChiban) {
           pinData.needsReview = true;
           pinData.reviewReason = "参考地番・要確認";
+        }
+        // reverse を待ち切れずに保存した場合。両方に該当するときは参考地番の理由を優先して残す
+        // （admin側が reviewReason==="参考地番・要確認" の完全一致で表示・地番確定の二重ガードを
+        //   掛けているため、併記にするとそのガードが外れる）。住所が空なことで事務方は気づける。
+        if (addrPending && !pinData.needsReview) {
+          pinData.needsReview = true;
+          pinData.reviewReason = "住所未取得・要確認";
         }
         if (navigator.onLine) {
           try {

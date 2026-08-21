@@ -1630,6 +1630,22 @@
       // 参考地番(要確認)は住所補正だけでは確定しない＝赤を維持。地番確定時のみ解除。
       const isRefChiban = p.reviewReason === "参考地番・要確認" && p.chibanManual !== true;
       const review = needsReviewNow({ ...p, address }) || isRefChiban;
+      // 住所を直しても areaCode が追随せず、エリア単位の購読・周回から漏れるピンが
+      // 増え続けていた（実測22件・addressManual=true なのに areaCode=null）。
+      // D-1a で入れた geocodeAddress()+areaFromItem() をそのまま流用して同時に再判定する。
+      let area = null;
+      if (address) {
+        try { area = await geocodeAddress(address); } catch(e) { area = null; }
+        // ZENRIN forward は「ヒットなし」を返さず曖昧一致で拾ってくる。
+        // 実測: "あいうえお"→青森県五所川原市(02205) / "テスト"→福井県敦賀市(18202)。
+        // そのまま採用すると打ち間違い1つで別県のエリアに飛ぶため、
+        // 「入力した住所に、判定された市区町村名が含まれること」を最低条件にする。
+        // 政令市の区・郡部の町村・都道府県なしの入力はいずれも通ることを実測で確認済み。
+        if (area && area.areaName && !address.includes(area.areaName)) {
+          console.warn("[エリア判定を棄却] 入力と判定結果が対応しない", { address, area });
+          area = null;
+        }
+      }
       try {
         const update = {
           address,
@@ -1637,8 +1653,17 @@
           needsReview: review,
         };
         if (!review) update.reviewReason = deleteField();
+        // 判定できたときだけ書く。できなければ既存値に触らない（推測しない・非破壊）。
+        // null を書く実装にすると、正しい areaCode が入っているピンの住所を少し直しただけで
+        // その値を壊すため。元が null のピンは null のまま残る。
+        if (area && area.areaCode) {
+          update.areaCode = area.areaCode;
+          update.areaName = area.areaName;
+        }
         await updateDoc(doc(db, "pins", id), update);
-        showToast("住所を保存しました");
+        if (!address)                   showToast("住所を保存しました");
+        else if (area && area.areaCode) showToast(`住所を保存しました（${area.areaName}）`);
+        else                            showToast("住所を保存しました（エリア未判定）", "warn");
       } catch(e) { showToast("保存に失敗しました", "error"); }
     };
 
