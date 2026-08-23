@@ -2041,15 +2041,25 @@
 
     #adminScreen {
       display: none;
-      grid-template-rows: 52px 1fr;
+      /* ヘッダーは折り返した分だけ伸ばす。52px固定のままだと .header に flex-wrap を
+         足しても2段目がこの行の外へ出てクリップされ、症状が1mmも改善しない（実測確認済み）。 */
+      grid-template-rows: auto 1fr;
       grid-template-columns: 380px 1fr;
       height: 100vh;
     }
 
     .header {
       grid-column: 1 / -1;
-      display: flex; align-items: center; gap: 8px;
-      padding: 0 16px; background: #0f172a; border-bottom: 1px solid #1e293b;
+      /* 17要素を1行に詰め込んでいるため、幅が足りないと文字が縦に潰れ、
+         さらに狭いと枠外へ押し出されて押せなくなる。足りない分は素直に折り返す。 */
+      display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+      /* 折り返した2段目以降を右詰めにする。1段のときは .header-spacer(flex:1) が
+         余白を吸い切るため効かず、従来の配置のまま（全17要素の座標が変わらないことを実測確認）。
+         2段目が左端に落ちると、1段のとき右端にあったボタンの位置が飛ぶため。 */
+      justify-content: flex-end;
+      /* 上下8px＝1段のときの高さが 35(中身)+16+1(border)=52px となり従来と同一。
+         2段以上になったときは gap:8px が行間にも効き、ボタンが窓枠や隣の行に貼り付かない。 */
+      padding: 8px 16px; background: #0f172a; border-bottom: 1px solid #1e293b;
     }
     .header-title { font-size: 15px; font-weight: 700; color: #f8fafc; margin-right: 4px; }
     #userLabel { font-size: 12px; color: #64748b; }
@@ -2350,7 +2360,9 @@
 
 <div id="adminScreen">
   <div class="header">
-    <div class="header-title">🏚 空家マップ 管理画面</div>
+    <!-- タイトルはアイコンのみ。文字を出すと157px使い、フルHD最大化(1904px)でヘッダーが
+         2段に折り返して地図が43px低くなるため。名称はホバー(title属性)で分かるようにする。 -->
+    <div class="header-title" title="空家マップ 管理画面">🏚</div>
     <div id="userLabel"></div>
     <div class="header-spacer"></div>
     <select id="dateFilter" onchange="setDateFilter(this.value)">
