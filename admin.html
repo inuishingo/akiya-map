@@ -109,6 +109,33 @@
       return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
     }
 
+    // ===== 地番取得の診断表示（表示専用）=====
+    // 成功したピンには chibanDiag が無いので何も出ない。
+    // needsReview（赤＝要調査）には一切影響させない。「親番のみで確定」は今まで
+    // 成功として緑側に紛れていたため誰も気づけなかった。赤とは別系統の琥珀で示す。
+    const CHIBAN_DIAG_LABEL = {
+      bm_no_match:       "親番のみで確定（枝番未確定）",
+      bm_empty:          "地番データが見つからない",
+      bm_http:           "地番取得に失敗",
+      bm_error:          "地番取得に失敗（通信）",
+      bm_no_detail2:     "地番の親番が空",
+      ref_too_far:       "近傍の筆が遠すぎる",
+      reverse_http:      "住所解決に失敗",
+      reverse_error:     "住所解決に失敗（通信）",
+      reverse_no_oyaban: "親番が取れない",
+      pending:           "取得が間に合わず保存",
+    };
+    function chibanDiagText(d) {
+      if (!d || !d.reason) return "";
+      const st   = d.status ? `（HTTP ${d.status}）` : "";
+      const oya  = (d.detail && d.detail.oyaban) ? `／reverseの親番 ${d.detail.oyaban}` : "";
+      const near = (d.detail && d.detail.nearestAll != null)
+        ? `／最近傍 ${d.detail.nearestAll}m ＝ ${d.detail.nearestAllOyaban || "?"}${d.detail.nearestAllBranch ? "-" + d.detail.nearestAllBranch : ""}`
+        : "";
+      const race = d.raceDetected ? "／保存レース検出" : "";
+      return (CHIBAN_DIAG_LABEL[d.reason] || d.reason) + st + oya + near + race;
+    }
+
     // ===== 調査グリッド(MVP) 状態 — 管理画面は表示専用（俯瞰のみ・タップ編集なし） =====
     let gridMode = false;       // グリッド進捗オーバーレイの表示ON/OFF（初期OFF）
     let gridWidgets = [];       // グリッド線＋塗りのZDCウィジェット（markersとは別管理）
@@ -1380,6 +1407,7 @@
           <label class="oc-toggle" onclick="event.stopPropagation()">
             <input type="checkbox" ${p.otherCompany ? "checked" : ""} onchange="toggleOtherCompany('${p.id}',this.checked)"> 🏢 他社物件（他社看板）
           </label>
+          ${p.chibanDiag ? `<div class="chiban-diag">⚠ 地番：${escAttr(chibanDiagText(p.chibanDiag))}</div>` : ""}
           ${exported ? `<div class="export-line">✓ Excel出力済 ${exportedMD}${exportedByName ? ` ・ ${exportedByName}` : ""}</div>` : ""}
         </div>`;
       }).join("") + listFooterHTML(shown.length, pins.length);
@@ -2205,6 +2233,12 @@
     .pin-card.past.selected, .pin-card.past.checked { opacity: 1; }  /* 選択/チェック時は見やすく戻す */
     .pin-card.exported.selected,
     .pin-card.exported.checked { opacity: 1; }  /* 選択/チェック時は見やすく戻す */
+    /* 地番取得の診断。赤(要調査)とは別系統＝琥珀。needsReview には影響させない。 */
+    .chiban-diag {
+      font-size: 11px; font-weight: 700; color: #92400e; background: #fef3c7;
+      border: 1px solid #fcd34d; border-radius: 4px;
+      padding: 2px 8px; margin-top: 6px; display: inline-block;
+    }
     .export-line {
       font-size: 11px; font-weight: 700; color: #fff; background: #6b7280;
       padding: 2px 8px; border-radius: 4px; margin-top: 6px;

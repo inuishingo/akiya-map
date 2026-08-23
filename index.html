@@ -68,6 +68,12 @@
     let pendingLatLng = null;
     let pendingChiban = "";
     let pendingChibanRef = false;   // 直近の自動地番が「参考地番(近傍筆)・要確認」か
+    // 地番取得の診断。失敗した経路と、劣化して確定した経路(bm_no_match)を記録する。
+    // 成功時は null のまま＝ピンにフィールドを増やさない。挙動は一切変えない（記録のみ）。
+    let chibanDiag = null;
+    // "idle" | "loading" | "done"。保存時に未完了だったかの判定と、
+    // 住所待ち(1.5秒)の間に完了したか＝保存レースの実測に使う。
+    let chibanState = "idle";
     let pendingAreaCode = null;     // 直近reverseのareaCode(JIS5桁)。ピン保存で使う（reverse失敗時null）
     let pendingAreaName = null;     // 直近reverseのareaName(市区町村名／政令市は区)。失敗時null
     // 保存する住所は「ラベルの表示文字列」ではなくこの変数から取る。ラベルは
@@ -1188,6 +1194,8 @@
       pendingLatLng = null;
       pendingChiban = "";
       pendingChibanRef = false;
+      chibanDiag = null;
+      chibanState = "idle";
       pendingAddress = null;
       pendingReverse = null;
       document.getElementById("chibanRefNote").style.display = "none";
@@ -1239,11 +1247,27 @@
     async function fetchChiban(latlng) {
       pendingChiban = "";
       pendingChibanRef = false;
+      chibanDiag = null;
+      chibanState = "loading";
       let manualReason = "";   // 自動取得できない理由（UI表示用）
       const REF_MAX_DIST = 15; // 参考地番(近傍筆)を採用する最大距離(m)。実ピン9点(最大13.4m)で確定。
       const norm = (s) => (typeof s === "string" ? s.normalize("NFKC").trim() : "");
       const input = document.getElementById("chibanInput");
       const refNote = document.getElementById("chibanRefNote");
+      // bm の「全候補」の最近傍（同一親番かどうかを問わない）。
+      // TBNルート(下の分岐)には距離の足切りが無く、同一親番が無ければ距離を見ずに
+      // 親番のみで確定している。距離ガードを入れるかを実データで判断するための材料。
+      // ここでは記録するだけで、採否の判定には一切使わない（挙動を変えない）。
+      const nearestInfo = (items) => {
+        const best = (items || [])
+          .filter((x) => typeof x.distance === "number")
+          .sort((a, b) => a.distance - b.distance)[0];
+        return best ? {
+          nearestAll: Math.round(best.distance * 10) / 10,
+          nearestAllOyaban: norm(best.address_detail2),
+          nearestAllBranch: norm(best.address_branch2),
+        } : {};
+      };
       // 住居表示地区/地番未確定点用: bm最近傍筆の地番(detail2-branch2)を参考地番として返す。
       // reverse検証なし・号は使わない(筆自身のdetail2を使う)ので号→地番の事故は起きない。
       // 閾値内なら {chiban}、圏外/失敗はnull。
@@ -1252,23 +1276,42 @@
           const bmRes = await fetch(
             `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`
           );
+          if (!bmRes.ok) {
+            chibanDiag = { reason: "bm_http", step: "bm", status: bmRes.status };
+            return null;
+          }
           const items = (await bmRes.json()).result?.item;
-          if (!Array.isArray(items) || !items.length) return null;
+          if (!Array.isArray(items) || !items.length) {
+            chibanDiag = { reason: "bm_empty", step: "bm", detail: { hit: 0 } };
+            return null;
+          }
           const best = items
             .filter((x) => typeof x.distance === "number")
             .sort((a, b) => a.distance - b.distance)[0];
-          if (!best || best.distance > REF_MAX_DIST) return null;
+          if (!best || best.distance > REF_MAX_DIST) {
+            chibanDiag = { reason: "ref_too_far", step: "bm",
+                           detail: { hit: items.length, ...nearestInfo(items) } };
+            return null;
+          }
           const ban = norm(best.address_detail2);
-          if (!ban) return null;
+          if (!ban) {
+            chibanDiag = { reason: "bm_no_detail2", step: "bm",
+                           detail: { hit: items.length, ...nearestInfo(items) } };
+            return null;
+          }
           const eda = norm(best.address_branch2);
           return { chiban: eda ? `${ban}-${eda}` : ban };
-        } catch { return null; }
+        } catch { chibanDiag = { reason: "bm_error", step: "bm" }; return null; }
       };
       try {
         // --- 親番: reverse（地番レベル TBN のときのみ有効）---
         const revRes = await fetch(
           `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`
         );
+        if (!revRes.ok) {
+          chibanDiag = { reason: "reverse_http", step: "reverse", status: revRes.status };
+          return;
+        }
         const revJson = await revRes.json();
         const revItem = revJson.result?.item?.[0];
         // 方針B: reverseで親番が出せない点は近傍筆を参考地番(要確認)に倒す。
@@ -1283,7 +1326,7 @@
         }
         // 親番のみ採用：reverse が付ける枝番は誤り得る（例③ 196-2/213-2）ので "-" 以降を捨てる。
         const oyaban = norm(revItem.address_detail2).split("-")[0];
-        if (!oyaban) return;
+        if (!oyaban) { chibanDiag = { reason: "reverse_no_oyaban", step: "reverse" }; return; }
 
         // --- 枝番: bm の「同一親番」候補（bare親番＋枝番すべて）から最近傍で確定 ---
         //   点に最も近い筆を採用。bare最寄り→親番のみ(例③#1300:196) / 枝番最寄り→親番-枝番(例 正常#649:59-2)。
@@ -1292,24 +1335,40 @@
           const bmRes = await fetch(
             `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`
           );
-          const bmJson = await bmRes.json();
-          const items = bmJson.result?.item;
-          if (Array.isArray(items)) {
-            const best = items
-              .filter((x) => norm(x.address_detail2) === oyaban)   // 同一親番（bare/枝番とも）
-              .sort((a, b) => a.distance - b.distance)[0];
-            if (best) {
-              const eda = norm(best.address_branch2);
-              result = eda ? `${oyaban}-${eda}` : oyaban;
+          if (!bmRes.ok) {
+            chibanDiag = { reason: "bm_http", step: "bm", status: bmRes.status, detail: { oyaban } };
+          } else {
+            const bmJson = await bmRes.json();
+            const items = bmJson.result?.item;
+            if (!Array.isArray(items) || !items.length) {
+              chibanDiag = { reason: "bm_empty", step: "bm", detail: { hit: 0, oyaban } };
+            } else {
+              const best = items
+                .filter((x) => norm(x.address_detail2) === oyaban)   // 同一親番（bare/枝番とも）
+                .sort((a, b) => a.distance - b.distance)[0];
+              if (best) {
+                const eda = norm(best.address_branch2);
+                result = eda ? `${oyaban}-${eda}` : oyaban;
+              } else {
+                // 同一親番の筆が1つも無い＝距離を見ずに親番のみで確定する経路。
+                // 成功に見えるため今まで完全に不可視だった（実測: 枝番が落ちたまま確定 64件）。
+                // reverse の親番(oyaban)と bm 最近傍の親番(nearestAllOyaban)が食い違っていないかも
+                // ここで初めて分かる＝両者が別の筆を見ている可能性の検証材料。
+                chibanDiag = { reason: "bm_no_match", step: "bm",
+                               detail: { hit: items.length, oyaban, ...nearestInfo(items) } };
+              }
             }
           }
         } catch {
           // bm 失敗時は親番のみで確定（result=oyaban のまま）
+          chibanDiag = { reason: "bm_error", step: "bm", detail: { oyaban } };
         }
         pendingChiban = result;
       } catch {
         // オフライン・取得失敗時は地番なしで保存
+        chibanDiag = { reason: "reverse_error", step: "reverse" };
       } finally {
+        chibanState = "done";
         // 新規追加時のみ自動値を入力欄へ反映（編集中は手入力値を保持）。
         if (!editingPinId && input) {
           input.value = pendingChiban;
@@ -1353,6 +1412,10 @@
       btn.textContent = "保存中…";
 
       const chiban = document.getElementById("chibanInput").value.trim();
+      // 診断は chiban を読んだのと同じ時点で控える（保存値と対応が取れるようにするため）。
+      // ※この下の住所待ち(1.5秒)の間に取得が完了しても、上の chiban には反映されない。
+      const chibanStateAtRead = chibanState;
+      const chibanDiagAtRead  = chibanDiag;
 
       if (editingPinId) {
         try {
@@ -1386,6 +1449,14 @@
         }
         const addrPending = (pendingAddress === null);
         const address = pendingAddress || "";
+        // 未完了のまま保存されたか。判定は必ず「chiban を読んだ時点」の状態で行う。
+        let chibanDiagToSave = (chibanStateAtRead !== "done")
+          ? { reason: "pending", step: "none" }
+          : chibanDiagAtRead;
+        // 住所待ちの間に完了していた＝保存レースが実際に起きた証拠。直接の実測値になる。
+        if (chibanStateAtRead !== "done" && chibanState === "done") {
+          chibanDiagToSave = { ...(chibanDiagToSave || {}), raceDetected: true };
+        }
         const pinData = {
           uid: currentUser.uid,
           email: currentUser.email,
@@ -1405,6 +1476,8 @@
           branch: myBranch,   // ログイン調査員の所属店（loadMyBranchで確定。名古屋員は"名古屋"のまま）
           createdAt: new Date().toISOString(),
         };
+        // 成功時は chibanDiagToSave が null ＝ フィールドを増やさない。
+        if (chibanDiagToSave) pinData.chibanDiag = chibanDiagToSave;
         console.log("[debug] pinData before save:", pinData);
         // 参考地番(近傍筆・住居表示地区)を現場でそのまま採用＝要確認フラグを立てる。
         // 手修正して確定した場合(chibanManual=true)は対象外＝確定扱い。

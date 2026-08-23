@@ -65,7 +65,37 @@ exports.zenrin = onRequest({ cors: true, secrets: [ZENRIN_KEY] }, async (req, re
         "Referer": "https://inuishingo.github.io/",
       },
     });
-    const data = await response.json();
+    // 【重要】上流のステータスを握り潰さないこと。
+    // 以前は response.ok を見ずに res.json(data) していたため、ZENRIN の 429/500/503 が
+    // すべて 200＋中身なしに化け、クライアントは「該当なし(0件)」と解釈していた。
+    // 現地で地番が取れない事象の原因究明に3便かかったのは、この握り潰しでログも痕跡も
+    // 残らなかったため。ステータスは必ずそのまま返す。
+    //
+    // ただし本文は「常にJSON」を保証する。呼び出し側（index.html 4箇所 / admin.html 1箇所）は
+    // いずれも res.ok を見ずに await res.json() しており、非JSONを流すと例外に化けて
+    // ステータスが読めなくなる＝この修正の目的が失われる。
+    const text = await response.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch { /* 上流がJSONを返さなかった */ }
+
+    if (!response.ok) {
+      // Cloud Logging に残す。ピン側の chibanDiag と突き合わせて事後追跡できるようにする。
+      console.error("zenrin upstream error", {
+        type, status: response.status, body: text.slice(0, 300),
+      });
+      res.status(response.status).json(
+        (data && typeof data === "object")
+          ? { ...data, error: "upstream_error", _upstreamStatus: response.status }
+          : { error: "upstream_error", _upstreamStatus: response.status, _body: text.slice(0, 300) }
+      );
+      return;
+    }
+    if (!data) {
+      // 200 なのに JSON でない＝上流の仕様外。502 にして中身を残す。
+      console.error("zenrin upstream non-json", { type, body: text.slice(0, 300) });
+      res.status(502).json({ error: "upstream_non_json", _upstreamStatus: 200, _body: text.slice(0, 300) });
+      return;
+    }
 
     // reverse は住所レベルの粒度順に並べ替える（TBN=地番が先頭に来るように）
     if (type === "reverse" && data.result?.item) {
@@ -75,8 +105,9 @@ exports.zenrin = onRequest({ cors: true, secrets: [ZENRIN_KEY] }, async (req, re
       );
     }
 
-    res.json(data);
+    res.status(200).json(data);
   } catch (e) {
+    console.error("zenrin fetch failed", { type, message: e.message });
     res.status(500).json({ error: e.message });
   }
 });
