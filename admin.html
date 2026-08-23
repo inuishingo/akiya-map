@@ -1407,7 +1407,7 @@
           <label class="oc-toggle" onclick="event.stopPropagation()">
             <input type="checkbox" ${p.otherCompany ? "checked" : ""} onchange="toggleOtherCompany('${p.id}',this.checked)"> 🏢 他社物件（他社看板）
           </label>
-          ${p.chibanDiag ? `<div class="chiban-diag">⚠ 地番：${escAttr(chibanDiagText(p.chibanDiag))}</div>` : ""}
+          ${p.chibanDiag?.reason ? `<div class="chiban-diag">⚠ 地番：${escAttr(chibanDiagText(p.chibanDiag))}</div>` : ""}
           ${exported ? `<div class="export-line">✓ Excel出力済 ${exportedMD}${exportedByName ? ` ・ ${exportedByName}` : ""}</div>` : ""}
         </div>`;
       }).join("") + listFooterHTML(shown.length, pins.length);

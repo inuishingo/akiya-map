@@ -74,6 +74,8 @@
     // "idle" | "loading" | "done"。保存時に未完了だったかの判定と、
     // 住所待ち(1.5秒)の間に完了したか＝保存レースの実測に使う。
     let chibanState = "idle";
+    // 直近の地番取得の所要時間 { reverseMs, bmMs }。reverse は速いのに bm だけ遅い、を測るため。
+    let chibanTiming = null;
     let pendingAreaCode = null;     // 直近reverseのareaCode(JIS5桁)。ピン保存で使う（reverse失敗時null）
     let pendingAreaName = null;     // 直近reverseのareaName(市区町村名／政令市は区)。失敗時null
     // 保存する住所は「ラベルの表示文字列」ではなくこの変数から取る。ラベルは
@@ -1196,12 +1198,78 @@
       pendingChibanRef = false;
       chibanDiag = null;
       chibanState = "idle";
+      chibanTiming = null;
       pendingAddress = null;
       pendingReverse = null;
       document.getElementById("chibanRefNote").style.display = "none";
       editingPinId = null;
       editingPinData = null;
     };
+
+    // ===== 端末・回線の採取（記録のみ。挙動には一切使わない）=====
+    // 個人を特定できる情報は入れない（UA・画面サイズ・コア数・メモリ量まで）。
+    // ⚠️ Firestore は undefined を含むオブジェクトを拒否し addDoc が例外になる。
+    //    取れなかった項目は「キーごと作らない」こと。iOS には navigator.connection が無く
+    //    ほぼ全端末がこの経路を踏むため、ここを間違えると保存自体が壊れる。
+
+    // 全ピンに入れる短縮版の端末文字列（例 "iOS17.5/Safari17/390x844@3"）。
+    // 目的は機種別の「分母」を数えること。生UAは失敗時にだけ別途残す（1ピンあたり約180Bの節約）。
+    // iOS は UA に機種名を出さない（X も 15 も "iPhone"）ため、画面サイズ＋dprで世代を絞る。
+    // パースに失敗しても保存は止めない（"unknown" を入れて先に進む）。
+    function deviceShort() {
+      try {
+        const ua = navigator.userAgent || "";
+        const s = window.screen;
+        const scr = (s && s.width)
+          ? `/${s.width}x${s.height}@${Math.round((window.devicePixelRatio || 1) * 100) / 100}` : "";
+        let os = "other", m;
+        if (/iPhone|iPad|iPod/.test(ua)) {
+          m = ua.match(/(?:iPhone )?OS (\d+)[._](\d+)/);
+          os = "iOS" + (m ? `${m[1]}.${m[2]}` : "") + (/iPad/.test(ua) ? "(iPad)" : "");
+        } else if (/Android/.test(ua)) {
+          m = ua.match(/Android (\d+(?:\.\d+)?)/); os = "Android" + (m ? m[1] : "");
+        } else if (/Windows NT/.test(ua)) {
+          m = ua.match(/Windows NT ([\d.]+)/); os = "Win" + (m ? m[1] : "");
+        } else if (/Mac OS X/.test(ua)) { os = "macOS"; }
+        let br = "other";
+        if ((m = ua.match(/CriOS\/(\d+)/))) br = "Chrome" + m[1];
+        else if ((m = ua.match(/FxiOS\/(\d+)/))) br = "Firefox" + m[1];
+        else if (/EdgiOS\/|Edg\//.test(ua)) br = "Edge";
+        else if ((m = ua.match(/SamsungBrowser\/(\d+)/))) br = "Samsung" + m[1];
+        else if ((m = ua.match(/Chrome\/(\d+)/))) br = "Chrome" + m[1];
+        else if ((m = ua.match(/Firefox\/(\d+)/))) br = "Firefox" + m[1];
+        else if ((m = ua.match(/Version\/(\d+)[\d.]*.*Safari/))) br = "Safari" + m[1];
+        else if (/Safari/.test(ua)) br = "Safari";
+        return `${os}/${br}${scr}`;
+      } catch { return "unknown"; }
+    }
+
+    // 回線状態。navigator.connection は iOS(Safari/iOS版Chrome)未対応＝取れないのが正常。
+    // 取れたキーだけを生やす（undefined を絶対に入れない）。
+    function chibanNet() {
+      const net = { online: navigator.onLine === true };
+      try {
+        const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        if (c) {
+          if (c.effectiveType) net.effectiveType = c.effectiveType;
+          if (typeof c.downlink === "number") net.downlink = c.downlink;
+          if (typeof c.rtt === "number") net.rtt = c.rtt;
+        }
+      } catch { /* 未対応端末。キーを作らないことが重要 */ }
+      return net;
+    }
+
+    // 失敗時にだけ足す詳細。想定外の切り口で掘りたくなるのは失敗側で、
+    // 成功側は件数（分母）を数えられれば足りる。
+    function chibanEnvFull() {
+      const env = {};
+      try {
+        env.ua = navigator.userAgent;
+        if (typeof navigator.hardwareConcurrency === "number") env.cores = navigator.hardwareConcurrency;
+        if (typeof navigator.deviceMemory === "number") env.memGB = navigator.deviceMemory;  // Androidのみ
+      } catch { /* 取れなくても保存は止めない */ }
+      return env;
+    }
 
     // ===== GEOCODE（ZENRIN）=====
     // reverse プロキシから点/セルの item を取得（ピン・グリッド共通）。失敗時は例外。
@@ -1249,6 +1317,7 @@
       pendingChibanRef = false;
       chibanDiag = null;
       chibanState = "loading";
+      chibanTiming = {};
       let manualReason = "";   // 自動取得できない理由（UI表示用）
       const REF_MAX_DIST = 15; // 参考地番(近傍筆)を採用する最大距離(m)。実ピン9点(最大13.4m)で確定。
       const norm = (s) => (typeof s === "string" ? s.normalize("NFKC").trim() : "");
@@ -1268,13 +1337,28 @@
           nearestAllBranch: norm(best.address_branch2),
         } : {};
       };
+      // 所要時間つき fetch。挙動は素の fetch と同じ（リトライもタイムアウトも入れない）。
+      // 失敗・例外の場合も「投げてから失敗が返るまで」を測る。
+      // reverse が速く bm だけ遅い→クエリの重さ / 両方遅い→回線 /
+      // bm が数十msで失敗→回線ではなく上流の拒否、を切り分けるため。
+      const timedFetch = async (url, key) => {
+        const t0 = performance.now();
+        try {
+          const res = await fetch(url);
+          chibanTiming[key] = Math.round(performance.now() - t0);
+          return res;
+        } catch (e) {
+          chibanTiming[key] = Math.round(performance.now() - t0);
+          throw e;
+        }
+      };
       // 住居表示地区/地番未確定点用: bm最近傍筆の地番(detail2-branch2)を参考地番として返す。
       // reverse検証なし・号は使わない(筆自身のdetail2を使う)ので号→地番の事故は起きない。
       // 閾値内なら {chiban}、圏外/失敗はnull。
       const refFromNearestParcel = async () => {
         try {
-          const bmRes = await fetch(
-            `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`
+          const bmRes = await timedFetch(
+            `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`, "bmMs"
           );
           if (!bmRes.ok) {
             chibanDiag = { reason: "bm_http", step: "bm", status: bmRes.status };
@@ -1305,8 +1389,8 @@
       };
       try {
         // --- 親番: reverse（地番レベル TBN のときのみ有効）---
-        const revRes = await fetch(
-          `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`
+        const revRes = await timedFetch(
+          `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`, "reverseMs"
         );
         if (!revRes.ok) {
           chibanDiag = { reason: "reverse_http", step: "reverse", status: revRes.status };
@@ -1332,8 +1416,8 @@
         //   点に最も近い筆を採用。bare最寄り→親番のみ(例③#1300:196) / 枝番最寄り→親番-枝番(例 正常#649:59-2)。
         let result = oyaban;   // 既定は親番のみ（bm に同一親番が無い/失敗時）
         try {
-          const bmRes = await fetch(
-            `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`
+          const bmRes = await timedFetch(
+            `https://zenrin-ptddjpvgeq-an.a.run.app?type=bm&lat=${latlng.lat}&lon=${latlng.lng}`, "bmMs"
           );
           if (!bmRes.ok) {
             chibanDiag = { reason: "bm_http", step: "bm", status: bmRes.status, detail: { oyaban } };
@@ -1416,6 +1500,7 @@
       // ※この下の住所待ち(1.5秒)の間に取得が完了しても、上の chiban には反映されない。
       const chibanStateAtRead = chibanState;
       const chibanDiagAtRead  = chibanDiag;
+      const chibanTimingAtRead = chibanTiming;
 
       if (editingPinId) {
         try {
@@ -1452,11 +1537,19 @@
         // 未完了のまま保存されたか。判定は必ず「chiban を読んだ時点」の状態で行う。
         let chibanDiagToSave = (chibanStateAtRead !== "done")
           ? { reason: "pending", step: "none" }
-          : chibanDiagAtRead;
+          : (chibanDiagAtRead ? { ...chibanDiagAtRead } : {});
         // 住所待ちの間に完了していた＝保存レースが実際に起きた証拠。直接の実測値になる。
         if (chibanStateAtRead !== "done" && chibanState === "done") {
-          chibanDiagToSave = { ...(chibanDiagToSave || {}), raceDetected: true };
+          chibanDiagToSave.raceDetected = true;
         }
+        // 端末(短縮)・所要時間・回線は成功/失敗を問わず載せる。
+        // 失敗件数だけでは「機種の問題か件数の問題か」を判別できず、
+        // 分母（その機種が何件立てたか）は成功ピンにしか無いため。
+        chibanDiagToSave.device = deviceShort();
+        chibanDiagToSave.detail = { ...(chibanDiagToSave.detail || {}),
+                                    ...(chibanTimingAtRead || {}), ...chibanNet() };
+        // 生UA・コア数・メモリ量は失敗時のみ（成功側は件数が数えられれば足りる）。
+        if (chibanDiagToSave.reason) Object.assign(chibanDiagToSave, chibanEnvFull());
         const pinData = {
           uid: currentUser.uid,
           email: currentUser.email,
@@ -1476,8 +1569,8 @@
           branch: myBranch,   // ログイン調査員の所属店（loadMyBranchで確定。名古屋員は"名古屋"のまま）
           createdAt: new Date().toISOString(),
         };
-        // 成功時は chibanDiagToSave が null ＝ フィールドを増やさない。
-        if (chibanDiagToSave) pinData.chibanDiag = chibanDiagToSave;
+        // 成功時も書く（案B-2）。成功ピンは reason を持たない＝admin の琥珀行は出ない。
+        pinData.chibanDiag = chibanDiagToSave;
         console.log("[debug] pinData before save:", pinData);
         // 参考地番(近傍筆・住居表示地区)を現場でそのまま採用＝要確認フラグを立てる。
         // 手修正して確定した場合(chibanManual=true)は対象外＝確定扱い。
