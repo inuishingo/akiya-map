@@ -41,9 +41,27 @@
     let myBranch = "名古屋";   // ログイン調査員の所属店(displayNames[email].branch)。読取前は名古屋を既定に。
     let pinWidgetMap = new Map();
     let pinsUnsub = null;   // pins onSnapshot の解除関数（多重購読防止）
+    // ===== 追従・測位のチューニング定数（発熱対策。現場で調整するのはここだけ）=====
+    // iPhone X で「熱くなる→動作が落ちる→タブが落ちてログイン画面に戻る」の起点が、
+    // ①止まらない高精度GPS ②測位のたびの setCenter（ZENRINタイル再描画＋idleで全ピン走査）だった。
+    const FOLLOW_CENTER_MIN_MS = 2000;   // setCenter の最小間隔(ms)
+    const FOLLOW_CENTER_MIN_M  = 15;     // これ以上動いたら間隔を待たずに寄せる(m)
+    const GPS_STOP_GRACE_MS    = 20000;  // 追従OFF後、測位を止めるまでの猶予(ms)。パンのたびに止めない
+    const MY_LOCATION_STALE_OPACITY = 0.35;  // 測位停止中の青ドットの不透明度（古い位置と分かる濃さ）
+    // ※ #boot の保険タイマー(8秒)は body 末尾の素の<script>側にある。
+    //    module 側に置くと、gstatic の取得に失敗した時にブロックごと実行されず保険が動かないため。
+    const GPS_OPTS_FOLLOW = { enableHighAccuracy: true,  timeout: 8000, maximumAge: 5000 };
+    const GPS_OPTS_IDLE   = { enableHighAccuracy: false, timeout: 8000, maximumAge: 5000 };
+
     let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（listenPinsで消さない）
+    let lastFixLL = null;        // 直近に青ドットを描いた位置。測位停止中も薄く残すため保持する
+    let myLocationStale = false; // 測位停止中＝青ドットが古い（薄色＋パルス停止で明示）
     let followMode = true;       // 追従モード（カーナビ式）。既定ON。手動パンでOFF、📍でON復帰
     let watchId = null;          // watchPosition のID（二重起動防止）
+    let watchHighAccuracy = null; // 現在のwatchが高精度か。精度を変える時だけ張り替えるための記録
+    let watchStopTimer = null;    // 追従OFF後、猶予をおいて停止するためのタイマー
+    let lastCenterAt = 0;         // 最後に setCenter した時刻（間引き判定）
+    let lastCenterLL = null;      // 最後に setCenter した中心（移動距離の判定）
     // 進行方向↑（ヘディングアップ）。起動時は必ず北固定＝false。詳細は「進行方向↑」ブロック参照
     let headingUpMode = false;   // ユーザーの意思（トグルの状態）
     let headingUpPaused = false; // 手動ひねりによる一時解除。モードは保持したまま追従だけ止める
@@ -393,8 +411,12 @@
     window.addEventListener("online", syncOfflineQueue);
 
     // ===== AUTH =====
+    // 起動直後は #boot だけを出し、認証が確定してから振り分ける（ログイン画面のチラつき防止）。
     onAuthStateChanged(auth, async user => {
       currentUser = user;
+      // 待機表示の保険タイマーを解除する（タイマー本体は body 末尾の素の<script>側にある）。
+      if (window.__bootTimer != null) { clearTimeout(window.__bootTimer); window.__bootTimer = null; }
+      document.getElementById("boot").style.display = "none";   // 認証が確定＝待機表示は不要
       if (user) {
         document.getElementById("loginScreen").style.display = "none";
         document.getElementById("mapScreen").style.display = "flex";
@@ -1515,6 +1537,7 @@
     // ピン用ウィジェット管理Mapには入れない＝listenPins()の消去ループで消えず、現在地は出しっぱなし。
     function showMyLocation(lat, lng) {
       if (!map) return;
+      lastFixLL = { lat, lng };   // 測位停止中も「直前にどこにいたか」を薄く出せるよう保持する
       if (myLocationMarker) { map.removeWidget(myLocationMarker); myLocationMarker = null; }
       // 正常表示の seqLabel と同じ作法：横中央寄せは transform:translateX(-50%)、縦位置は offset で調整。
       // 18pxドットを点に重ねるため offset Y=-9（高さ半分ぶん上げて中心を点に合わせる）。
@@ -1526,8 +1549,11 @@
             '<div style="transform:translateX(-50%);'
             + 'width:18px;height:18px;border-radius:50%;'
             + 'background:#2563EB;border:2px solid #fff;'
-            + 'box-shadow:0 0 0 0 rgba(37,99,235,.5);'
-            + 'animation:locPulse 1.6s ease-out infinite;'
+            // 測位停止中は薄く＋パルス停止。20秒前の位置が「現在地の顔」で残ると、
+            // 調査員が隣家を対象と誤認する事故につながるため、見た目で必ず区別する。
+            + (myLocationStale
+                ? 'opacity:' + MY_LOCATION_STALE_OPACITY + ';'
+                : 'box-shadow:0 0 0 0 rgba(37,99,235,.5);animation:locPulse 1.6s ease-out infinite;')
             + 'pointer-events:none;"></div>',
           offset: new ZDC.Point(0, -9),
           propagation: true,
@@ -1536,28 +1562,83 @@
       map.addWidget(myLocationMarker);
     }
 
+    // 測位の停止/再開で青ドットの見た目だけ描き直す（位置は最後の測位のまま）。
+    // 復帰は「実際に位置が入った時点」で行うため、ここでは false を明示的には使わない。
+    function setMyLocationStale(stale) {
+      if (myLocationStale === stale) return;
+      myLocationStale = stale;
+      if (lastFixLL) showMyLocation(lastFixLL.lat, lastFixLL.lng);
+    }
+
     // ===== 追従モード（カーナビ式）=====
     // followMode=true: 現在地に地図を追従。手動で地図を動かすと解除、📍で復帰。
     function setFollow(on) {
       if (followMode === on) return;
       followMode = on;
       updateLocateBtn();
+      if (on) {
+        lastCenterAt = 0; lastCenterLL = null;   // 復帰直後は間隔を待たずに寄せる
+        startLocationWatch();                    // 高精度へ張り替え（停止予約も取り消される）
+      } else if (needsLocationWatch()) {
+        startLocationWatch();                    // 進行方向↑がONの間は低精度で継続
+      } else {
+        scheduleLocationWatchStop();             // 猶予後もOFFのままなら測位を止める
+      }
     }
+
+    // 画面が隠れている間は測位を止める（バックグラウンドでの発熱・電池消費を断つ）。
+    // ここだけは猶予なしの即時停止でよい＝ユーザーが画面を見ていないため。
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) stopLocationWatch();
+      else if (needsLocationWatch()) startLocationWatch();
+    });
     function updateLocateBtn() {
       const b = document.querySelector(".locate-btn");
       if (b) b.classList.toggle("following", followMode); // ON=青塗り / OFF=グレー
     }
 
     // watchPosition で継続追跡。位置更新ごとに青ドットを更新し、追従中のみ地図も寄せる。
+    // 測位が要るのは「追従中」か「進行方向↑がON」のときだけ。どちらもOFFなら止める。
+    // 進行方向↑を条件に含めないと、地図をパンした瞬間にGPS進行方向が失われて自動回転が静かに壊れる。
+    function needsLocationWatch() { return followMode || headingUpMode; }
+
+    // 測位の停止。青ドットは消さずに薄くする（消すと直前にどこにいたかも失われるため）。
+    // markStale=false は「精度を変えるための張り替え」用。測位は途切れないので薄色にしない。
+    function stopLocationWatch(markStale = true) {
+      if (watchStopTimer != null) { clearTimeout(watchStopTimer); watchStopTimer = null; }
+      if (watchId == null) return;
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null; watchHighAccuracy = null;
+      if (markStale) setMyLocationStale(true);
+    }
+
+    // 停止は必ず猶予経由にする。手動パンは8px超えで毎回 setFollow(false) を呼ぶため、
+    // 即時停止にすると「止める→📍で再開」が頻発して、かえって測位の再取得を繰り返す。
+    function scheduleLocationWatchStop() {
+      if (watchId == null || watchStopTimer != null) return;
+      watchStopTimer = setTimeout(() => {
+        watchStopTimer = null;
+        if (!needsLocationWatch()) stopLocationWatch();
+      }, GPS_STOP_GRACE_MS);
+    }
+
     function startLocationWatch() {
-      if (watchId != null) return;             // 二重起動防止
       if (!navigator.geolocation) return;
+      if (watchStopTimer != null) { clearTimeout(watchStopTimer); watchStopTimer = null; }  // 停止予約を取り消す
+      if (!needsLocationWatch()) return;
+      const hi = followMode;                   // 高精度は追従中だけ（発熱の主因）
+      if (watchId != null) {
+        if (watchHighAccuracy === hi) return;  // 同条件なら張り替えない＝多重watchを防ぐ
+        stopLocationWatch(false);              // 精度が変わる時だけ張り替える（薄色にはしない）
+      }
+      watchHighAccuracy = hi;
       watchId = navigator.geolocation.watchPosition(
         pos => {
           if (pos.coords.accuracy > 1000) return;  // 既存ガード踏襲（粗い測位は無視）
           const lat = pos.coords.latitude, lng = pos.coords.longitude;
+          setMyLocationStale(false);               // 実際に位置が入った時点で復帰（watch開始時点ではない）
           showMyLocation(lat, lng);                // 青ドットは常に現在地へ（followの有無に関係なく）
-          if (followMode) { map.setCenter(new ZDC.LatLng(lat, lng)); } // 追従中のみ地図も追従
+          if (followMode) maybeRecenter(lat, lng); // 追従中のみ地図も追従（毎回は寄せない）
           // 進行方向↑用：移動中はGPSの進行方向を優先する。停止時は heading が null になるためコンパスへ戻す。
           // ON/OFFで別のしきい値を使う＝ヒステリシス（境界の速度で方位源をバタつかせない）。
           const sp = pos.coords.speed;
@@ -1574,8 +1655,29 @@
           if (headingUpMode) requestHeadingApply();
         },
         () => { /* 取得失敗は無視（前回位置を維持） */ },
-        { enableHighAccuracy: true, timeout: 8000, maximumAge: 5000 }
+        hi ? GPS_OPTS_FOLLOW : GPS_OPTS_IDLE
       );
+    }
+
+    // 測位のたびに setCenter すると、ZENRINタイルの再描画と idle(=全ピン走査) が毎秒走る。
+    // 「2秒経過」または「15m移動」のどちらかを満たした時だけ寄せる。
+    function maybeRecenter(lat, lng) {
+      if (!map) return;
+      const now = Date.now();
+      const moved = lastCenterLL ? distanceM(lastCenterLL.lat, lastCenterLL.lng, lat, lng) : Infinity;
+      if (now - lastCenterAt < FOLLOW_CENTER_MIN_MS && moved < FOLLOW_CENTER_MIN_M) {
+        return;
+      }
+      map.setCenter(new ZDC.LatLng(lat, lng));
+      lastCenterAt = now; lastCenterLL = { lat, lng };
+    }
+
+    // 15m程度の判定に十分な近似。度→mの換算はグリッド(GRID_DLAT/GRID_DLNG)と同じ 111000 に揃える
+    // （同じアプリ内で換算値を2つ持たないため。111320 との差は15mで約4.5cm＝判定に影響しない）。
+    function distanceM(lat1, lng1, lat2, lng2) {
+      const dy = (lat2 - lat1) * 111000;
+      const dx = (lng2 - lng1) * 111000 * Math.cos(lat1 * Math.PI / 180);
+      return Math.hypot(dx, dy);
     }
 
     // 地図の手動パン検出：地図DOMへのタッチ/マウスのドラッグだけを「手動操作」とみなす。
@@ -1788,6 +1890,9 @@
         stopOrientationWatch();
         useGpsHeading = false;
         resetHeadingNorth();      // 北固定へ
+        // 追従もOFFなら測位を止める。停止は setFollow 側と同じく必ず猶予経由に揃える
+        // （ここだけ即時停止だと、自動回転を切った瞬間にGPSが落ちて挙動が食い違う）。
+        if (!needsLocationWatch()) scheduleLocationWatchStop();
       }
       updateCompassState();
     }
@@ -1966,15 +2071,21 @@
       startLocationWatch();     // 追跡が未開始/停止なら再開（watchIdで二重起動防止）
       if (!navigator.geolocation || !map) return;
       navigator.geolocation.getCurrentPosition(pos => {
-        map.setCenter(new ZDC.LatLng(pos.coords.latitude, pos.coords.longitude));
+        const lat = pos.coords.latitude, lng = pos.coords.longitude;
+        map.setCenter(new ZDC.LatLng(lat, lng));
         map.setZoom(getDefaultZoom());   // 起動時の初期表示と同一の縮尺（従来は17固定で起動時16とズレていた）
-        showMyLocation(pos.coords.latitude, pos.coords.longitude);
+        // 📍は明示操作なので間引きを通さず即寄せる。基準を更新しないと直後の測位で二重に寄る。
+        lastCenterAt = Date.now(); lastCenterLL = { lat, lng };
+        setMyLocationStale(false);       // これも実測位。watchの初回を待たずに青ドットを戻す
+        showMyLocation(lat, lng);
       });
     };
 
     // ===== ENTER KEY LOGIN =====
     window.addEventListener("keydown", e => {
-      if (e.key === "Enter" && document.getElementById("loginScreen").style.display !== "none") {
+      // 起動直後(#boot表示中)はインラインstyleが未設定＝"" になる。!=="none" のままだと
+      // 待機中のEnterで空ログインが走るため、"flex"（表示中）を明示的に判定する。
+      if (e.key === "Enter" && document.getElementById("loginScreen").style.display === "flex") {
         doLogin();
       }
     });
@@ -1992,9 +2103,15 @@
       100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); }
     }
 
+    /* 起動直後は #boot だけを出す。Firebaseの認証復帰は非同期で、従来はその間ずっと
+       ログイン画面が見えていた（毎回のリロードで「ログイン画面に戻った」ように見える原因）。 */
     #loginScreen {
-      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      display: none; flex-direction: column; align-items: center; justify-content: center;
       height: 100dvh; background: #0f1117; gap: 16px; padding: 24px;
+    }
+    #boot {
+      display: flex; align-items: center; justify-content: center;
+      height: 100dvh; background: #0f1117; color: #6b7280; font-size: 14px;
     }
     .login-logo { font-size: 13px; font-weight: 700; letter-spacing: 0.15em; color: #6b7280; text-transform: uppercase; margin-bottom: 4px; }
     .login-title { font-size: 22px; font-weight: 700; color: #f9fafb; margin-bottom: 16px; }
@@ -2206,6 +2323,7 @@
 </head>
 <body>
 
+<div id="boot">読み込み中…</div>
 <div id="loginScreen">
   <div class="login-logo">HOUSE MARKET</div>
   <div class="login-title">空家マップ｜現地調査</div>
@@ -2283,6 +2401,61 @@
 <div class="toast" id="toast"></div>
 
 <script>
+  // 【重要】このブロックは type="module" にしないこと。
+  // 待機表示(#boot)を解除する保険をここに置く。module 側に置くと、gstatic から
+  // Firebase の取得に失敗した時にブロックごと実行されず、保険自体が登録されない
+  // （＝「読み込み中…」のまま操作不能。保険が防ごうとしている場面そのもの）。
+  // module 側の onAuthStateChanged が発火したら window.__bootTimer を clearTimeout する。
+  window.__BOOT_TIMEOUT_MS = 8000;
+  window.__bootTimer = setTimeout(function () {
+    window.__bootTimer = null;
+    var boot  = document.getElementById('boot');
+    var login = document.getElementById('loginScreen');
+    if (!boot || !login || boot.style.display === 'none') return;   // 既に認証が確定していれば何もしない
+    boot.style.display  = 'none';
+    login.style.display = 'flex';
+    // ここに来た＝Firebase SDK に到達できていない＝module が実行されていない。
+    // つまり onclick の doLogin() は存在せず、押しても無反応になる。
+    // 文言だけだと「壊れている」としか見えないので、押せないことまで見せる。
+    // 要素が欠けていてもこの保険自体が落ちないよう、すべて存在チェックを挟む。
+    var title = document.querySelector('.login-title');
+    var btn   = document.getElementById('loginBtn');
+    var em    = document.getElementById('email');
+    var pw    = document.getElementById('pass');
+    var box   = document.querySelector('.login-box');
+    // 復旧時に書き戻すため、上書きする前の状態を退避する。
+    // 文言をハードコードで戻すと、将来ログイン画面の文言を変えた時にここだけ古い値に戻る。
+    var prev = {
+      title: title ? title.textContent : null,
+      btn:   btn ? btn.disabled : null,
+      em:    em ? em.disabled : null,
+      pw:    pw ? pw.disabled : null,
+      opacity: box ? box.style.opacity : null
+    };
+    if (title) title.textContent = '通信できませんでした。電波の良い場所で再読み込みしてください';
+    if (btn) btn.disabled = true;                       // #loginBtn:disabled のCSSでグレーアウトする
+    if (em) em.disabled = true;                         // 打つだけ無駄なので入力欄も止める
+    if (pw) pw.disabled = true;
+    if (box) box.style.opacity = '0.5';                 // 入力欄まとめて不活性に見せる
+
+    // 「到達不可」ではなく「低速」だった場合、module は遅れて起動する。そのとき無効化したままだと
+    // 未ログインの調査員が二度とログインできない（電波の悪い現場では普通に起きる）。
+    // module 側には触れず、window.doLogin が生えたかどうかだけを見て元の状態へ戻す。
+    var tries = 0;
+    var recover = setInterval(function () {
+      if (typeof window.doLogin === 'function') {
+        clearInterval(recover);
+        if (title && prev.title !== null) title.textContent = prev.title;
+        if (btn) btn.disabled = prev.btn;
+        if (em) em.disabled = prev.em;
+        if (pw) pw.disabled = prev.pw;
+        if (box) box.style.opacity = prev.opacity === null ? '' : prev.opacity;
+      } else if (++tries > 60) {
+        clearInterval(recover);   // 60秒で打ち切り（本当に到達不可＝無効化したままにする）
+      }
+    }, 1000);
+  }, window.__BOOT_TIMEOUT_MS);
+
   function updateOnlineStatus() {
     document.getElementById('offlineBadge').style.display = navigator.onLine ? 'none' : 'block';
   }
