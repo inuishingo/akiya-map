@@ -1,11 +1,12 @@
 /**
  * akiya-map Cloud Functions（asia-northeast1）
  *
- * ┌─ zenrin : ZENRIN Web API のプロキシ（逆ジオ / 地番検索 / ジオコード）
- * └─ youto  : 不動産情報ライブラリ XKT002（用途地域）のプロキシ
+ * ┌─ zenrin      : ZENRIN Web API のプロキシ（逆ジオ / 地番検索 / ジオコード）
+ * ├─ areaPolygon : ZENRIN 住所検索APIのプロキシ（行政界ポリゴン＝大字(OAZ)の面）
+ * └─ youto       : 不動産情報ライブラリ XKT002（用途地域）のプロキシ
  *
- * 【重要】この2つは必ず同じ codebase に置くこと。
- *   片方だけをローカルに置いた状態で `firebase deploy --only functions` を打つと、
+ * 【重要】この3つは必ず同じ codebase に置くこと。
+ *   一部だけをローカルに置いた状態で `firebase deploy --only functions` を打つと、
  *   ローカルに存在しない関数は「不要」と判定されて削除される。
  *   （2026-07-14 に zenrin を実際に消す事故が発生。GCSのバージョニングから復旧）
  *   関数を個別にデプロイしたい場合は `firebase deploy --only functions:youto` のように名指しする。
@@ -111,6 +112,103 @@ exports.zenrin = onRequest({ cors: true, secrets: [ZENRIN_KEY] }, async (req, re
     res.status(500).json({ error: e.message });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════
+// areaPolygon : 行政界ポリゴン（大字＝OAZ）取得プロキシ
+//
+//   GET ?cityCode=23114          その市区町村の大字を「行政界ポリゴン付き」で返す
+//   GET ?cityCode=23114&count=1  件数だけ返す（ポリゴンなし＝軽い。取込前のdry-run表示用）
+//
+//   ZENRIN 住所検索API の address_code 前方一致(code_match_type=2)で JIS5桁配下を丸ごと引く。
+//   word 検索と違い曖昧一致が構造的に起きない（word だと無関係な語でも別県を返す実績あり）。
+//
+//   【実測 2026-08-28】
+//     23114 名古屋市緑区 / OAZ / ポリゴンあり … 105件 5.4〜6.0秒 789KB（1件平均5.9KB・最大93.8KB）
+//     同             / ポリゴンなし          … 0.1秒 1.6KB
+//     対象21市区町村の最大は岐阜市848件（→ limit=0,1000 の1回取得で足りる。docs/area-polygon-hit-count.md）
+//   【タイムアウトの根拠】
+//     取得時間は件数にほぼ比例する（105件＝6.0秒 ≒ 57ms/件）。最大の岐阜市848件なら40〜50秒の
+//     見込みで、既定値のままではマージンが5秒しかない。上限いっぱいの1000件（≒1分）を引いても
+//     構造的に当たらないよう、timeoutSeconds=300 / 上流の自前打ち切り280秒と実測の5倍以上を取る。
+//     待たされるのは管理者が押した取込操作のときだけなので、長くても現場（index.html）には影響しない。
+// ═══════════════════════════════════════════════════════════════
+exports.areaPolygon = onRequest(
+  { cors: true, secrets: [ZENRIN_KEY], timeoutSeconds: 300, memory: "512MiB" },
+  async (req, res) => {
+    const cityCode = String(req.query.cityCode || "");
+    const countOnly = req.query.count === "1";
+    // JIS5桁以外は上流に投げない。前方一致なので桁が短いと県まるごとを引いてしまう。
+    if (!/^\d{5}$/.test(cityCode)) {
+      res.status(400).json({ error: "cityCode は JIS5桁で指定してください" });
+      return;
+    }
+
+    const BASE = "https://test-web.zmaps-api.com";
+    const url = `${BASE}/search/address`
+      + `?address_code=${cityCode}&code_match_type=2`
+      + `&address_level=OAZ`                                  // 本段階は大字のみ（AZCは次段階）
+      + `&address_polygon=${countOnly ? "false" : "true"}`
+      + `&datum=JGD&limit=0,1000`;
+
+    // Cloud Run の打ち切り(300秒)に食われて 504 になると本文が残らず、原因が追えなくなる。
+    // 手前(280秒)で自分から打ち切り、必ず JSON で理由を返す。
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 280000);
+    const t0 = Date.now();
+    try {
+      const response = await fetch(url, {
+        signal: ac.signal,
+        headers: {
+          "x-api-key": ZENRIN_KEY.value(),
+          "Authorization": "referer",
+          "Referer": "https://inuishingo.github.io/",
+        },
+      });
+      // zenrin と同じ方針：上流ステータスは握り潰さない。ただし本文は常にJSONを保証する。
+      const text = await response.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* 上流がJSONを返さなかった */ }
+
+      if (!response.ok) {
+        console.error("areaPolygon upstream error", {
+          cityCode, status: response.status, body: text.slice(0, 300),
+        });
+        res.status(response.status).json({
+          error: "upstream_error", _upstreamStatus: response.status, _body: text.slice(0, 300),
+        });
+        return;
+      }
+      if (!data) {
+        console.error("areaPolygon upstream non-json", { cityCode, body: text.slice(0, 300) });
+        res.status(502).json({ error: "upstream_non_json", _upstreamStatus: 200, _body: text.slice(0, 300) });
+        return;
+      }
+
+      const items = (data.result && data.result.item) || [];
+      res.status(200).json({
+        cityCode,
+        level: "OAZ",
+        hit: (data.result && data.result.info && data.result.info.hit) || items.length,
+        count: items.length,
+        bytes: Buffer.byteLength(text, "utf8"),
+        elapsedMs: Date.now() - t0,
+        // count=1 は件数確認が目的。中身を返さない（無駄に数百KBを流さない）。
+        // 通常時は ZENRIN の item をそのまま透過する。address_polygon には一切手を加えない
+        // ＝クライアントが受け取る GeoJSON は上流と完全に同一（座標の並べ替えもしない）。
+        item: countOnly ? [] : items,
+      });
+    } catch (e) {
+      const aborted = e.name === "AbortError";
+      console.error("areaPolygon fetch failed", { cityCode, aborted, message: e.message });
+      res.status(aborted ? 504 : 500).json({
+        error: aborted ? "upstream_timeout" : e.message,
+        _hint: aborted ? "件数が多く280秒で取得しきれなかった。分割取得が必要。" : undefined,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════
 // youto : 不動産情報ライブラリ XKT002（都市計画決定GISデータ＝用途地域）プロキシ

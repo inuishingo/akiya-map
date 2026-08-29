@@ -11,3 +11,18 @@ tmp/
 functions/node_modules/
 functions/.env
 firebase-debug.log
+
+# Firebase エミュレータが吐くログ（ローカル実行の副産物。コミットしない）
+firestore-debug.log
+ui-debug.log
+pglite-debug.log
+dataconnect-debug.log
+
+# ルールのデプロイ時バックアップ（scripts/deploy-rules.mjs が作る）
+firestore.rules.*.bak
+
+# ルート package.json は依存ゼロだが、npm i を打った場合に備えて
+/node_modules/
+
+# 本番接続固定の確認用コピー（npm run prod-preview が作る。確認が終わったら消す）
+admin.prod.html

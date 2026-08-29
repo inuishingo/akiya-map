@@ -17,7 +17,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getFirestore, collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, orderBy, runTransaction, serverTimestamp, setDoc, writeBatch, arrayUnion }
+    import { getFirestore, connectFirestoreEmulator, collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, where, orderBy, runTransaction, serverTimestamp, setDoc, writeBatch, arrayUnion }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
     const firebaseConfig = {
@@ -32,6 +32,43 @@
     const app = initializeApp(firebaseConfig);
     const auth = getAuth(app);
     const db = getFirestore(app);
+
+    // ═══════════════════════════════════════════════════════════════
+    // ローカル開発：Firebase エミュレータ接続（admin.html のみ。index.html は本番のまま）
+    //
+    // 【安全装置】切替条件は location.hostname ただ1つ。
+    //   URLパラメータ・localStorage・クエリフラグ等、「本番URLでも成立しうる条件」は
+    //   絶対に足さないこと。本番は https://inuishingo.github.io/... で配信されるため、
+    //   この分岐は本番では構造的に発火しない。
+    //
+    // Auth は本番のまま使う（＝実アカウントでログインする）。エミュレータに向くのは Firestore だけ。
+    //   エミュレータの Firestore は空なので、管理者判定に使う admins/{uid} を
+    //   Emulator UI（http://localhost:4000）で1件作っておくこと。手順は docs/local-dev.md。
+    //
+    // Cloud Functions は areaPolygon だけをエミュレータに向ける（AREAPOLY_API の定義箇所を参照）。
+    //   zenrin / youto は本番のまま。既にデプロイ済みで動いており、localhost は CORS 許可済み。
+    //   エミュレータに寄せると REINFOLIB_KEY まで用意が要るので、必要のない範囲を広げない。
+    // ═══════════════════════════════════════════════════════════════
+    const IS_EMULATOR = location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    const EMU_FIRESTORE_PORT = 8080;   // firebase.json の emulators.firestore.port と一致させること
+    const EMU_FUNCTIONS_PORT = 5001;   // 同 emulators.functions.port
+    if (IS_EMULATOR) {
+      connectFirestoreEmulator(db, location.hostname, EMU_FIRESTORE_PORT);
+      console.warn(`[emulator] Firestore -> ${location.hostname}:${EMU_FIRESTORE_PORT}（本番DBには書き込みません）`);
+      // 本番データを触っていると誤認する事故を防ぐため、画面に必ず出す。
+      // このスクリプトは <head> にあるので body 未生成のことがある。DOM確定後に挿す。
+      const showEmuBanner = () => {
+        if (document.getElementById("emuBanner")) return;
+        document.documentElement.classList.add("emu-on");   // 画面を26px下げる（CSS側で定義）
+        const bar = document.createElement("div");
+        bar.id = "emuBanner";
+        bar.textContent = `🧪 エミュレータ接続中（Firestore :${EMU_FIRESTORE_PORT} / Functions :${EMU_FUNCTIONS_PORT}）— 本番データではありません`;
+        document.body.appendChild(bar);
+        document.title = "🧪[EMU] " + document.title;       // タブを何枚も開いたときの取り違え防止
+      };
+      if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", showEmuBanner);
+      else showEmuBanner();
+    }
 
     let map = null;
     let allPins = [];
@@ -347,6 +384,8 @@
         // 周回管理ボタンは既定 display:none。管理者確定後にのみ開示（リダイレクト失敗時の二重防御）。
         const rmBtn = document.getElementById("roundMgrBtn");
         if (rmBtn && isAdminUser) rmBtn.style.display = "";
+        const apBtn = document.getElementById("areaPolyBtn");
+        if (apBtn && isAdminUser) apBtn.style.display = "";
         initStatusFilter();       // ステータスDDの選択肢を構築（1回）
         updateStatsHighlight();   // カウンター初期ハイライト（総件数=全表示）
         // 自店は initMap より前に確定させる。初期中心の拠点駅分岐は mapOptions 段階で myBranch を読むため、
@@ -1174,6 +1213,263 @@
         console.error("execRoundStart", e);
       } finally {
         roundExecBusy = false; btn.disabled = false; btn.textContent = "実行する";
+      }
+    };
+
+    // ===== 行政界ポリゴン取込（E-1）— areaPolygons =====
+    // 「エリア＝大字(OAZ)」を面として持つためのキャッシュを作る。周回機能本体はまだ触らない。
+    // 流れ：①件数確認（ポリゴンなし・軽い／DBに書かない）→ ②取込実行（ポリゴンあり／batchで書込）。
+    // doc ID = ZENRIN の address_code(8桁) なので、同じ区を何度実行しても doc は増えない（上書き）。
+    // Cloud Functions areaPolygon プロキシ。localhost のときだけ Functions エミュレータへ向ける
+    // （本番デプロイ前にここの検証を回せるようにするため）。判定は IS_EMULATOR＝hostname のみ。
+    const AREAPOLY_API = IS_EMULATOR
+      ? `http://${location.hostname}:${EMU_FUNCTIONS_PORT}/housemarket-map/asia-northeast1/areaPolygon`
+      : "https://areapolygon-ptddjpvgeq-an.a.run.app";
+    const AREAPOLY_AVG_BYTES = 5893;   // 概算サイズ表示用。1件あたりの geometry 実測平均（23114 緑区105件）
+    const AREAPOLY_HIT_LIMIT = 1000;   // プロキシは limit=0,1000 の1回取得。超える区は分割取得が要る＝ここで止める
+    let areaPolyBusy = false;
+    let areaPolyPlan = null;           // ①の結果。②はこれを消費する
+
+    // ── ここから E-1 純ロジック ──────────────────────────────────────────
+    // DOM も Firestore も参照しない。scripts/verify-e1-batching.js が admin.html から
+    // この区間をそのまま抜き出して単体検証するので、マーカー行を消さないこと。
+    const AREAPOLY_MAX_DOC_BYTES   = 900000;          // Firestore の 1MiB/doc に対する安全弁
+    const AREAPOLY_BATCH_MAX_DOCS  = 400;             // writeBatch の 500件上限に対する余裕
+    const AREAPOLY_BATCH_MAX_BYTES = 4 * 1024 * 1024; // 同 10MiB ペイロード上限に対する余裕
+
+    function areaPolyCountPoints(geom) {
+      let n = 0;
+      const walk = (c) => {
+        if (!Array.isArray(c)) return;
+        if (typeof c[0] === "number" && typeof c[1] === "number") { n++; return; }
+        for (const x of c) walk(x);
+      };
+      walk(geom && geom.coordinates);
+      return n;
+    }
+
+    // ZENRIN の item 配列 →「保存する行」と「スキップ（理由つき）」に仕分ける。書き込みはしない。
+    function areaPolyBuildRows(items, cityCode) {
+      const rows = [], skipped = [];
+      for (const it of (items || [])) {
+        const code = String(it.address_code || "");
+        const name = it.address4 || it.address || code;
+        if (code.length !== 8) { skipped.push({ code, name, reason: "住所コードが8桁でない" }); continue; }
+        const g = it.address_polygon;
+        if (!g) { skipped.push({ code, name, reason: "行政界ポリゴンが未整備(null)" }); continue; }
+        // ★座標には一切触らない。Firestore が配列の入れ子を持てないための文字列化だけ。
+        //   読み出し側は JSON.parse(geometryJson) をそのまま L.geoJSON() に渡せる（往復の完全一致を実測済み）。
+        const geometryJson = JSON.stringify(g);
+        const bytes = new TextEncoder().encode(geometryJson).length;
+        if (bytes > AREAPOLY_MAX_DOC_BYTES) {
+          skipped.push({ code, name, reason: "1docの上限超過（" + Math.round(bytes / 1000) + "KB）" });   // 閾値900,000Bと桁を揃える
+          continue;
+        }
+        rows.push({
+          code, bytes,
+          data: {
+            code, level: "OAZ", cityCode,
+            parentCode: null,                  // OAZは最上位。AZCを足す段階で先頭8桁を入れる
+            name, fullAddress: it.address || "",
+            geometryJson, pointCount: areaPolyCountPoints(g),
+          },
+        });
+      }
+      return { rows, skipped };
+    }
+
+    // 400件 or 4MB の早い方でバッチを切る。1件94KB級（鳴海町）が並ぶと件数だけでは
+    // writeBatch のペイロード上限に当たるため、バイト数でも切る。
+    function areaPolySplitBatches(rows) {
+      const batches = [];
+      let cur = [], curBytes = 0;
+      for (const r of rows) {
+        if (cur.length && (cur.length >= AREAPOLY_BATCH_MAX_DOCS
+                           || curBytes + r.bytes > AREAPOLY_BATCH_MAX_BYTES)) {
+          batches.push(cur); cur = []; curBytes = 0;
+        }
+        cur.push(r); curBytes += r.bytes;
+      }
+      if (cur.length) batches.push(cur);
+      return batches;
+    }
+    // ── ここまで E-1 純ロジック ──────────────────────────────────────────
+
+    const areaPolyMB = (bytes) => (bytes / 1048576).toFixed(2) + "MB";
+    function setAreaPolyBar(ratio) {
+      const bar = document.getElementById("areaPolyBar");
+      bar.firstElementChild.style.width = Math.round(Math.max(0, Math.min(1, ratio)) * 100) + "%";
+    }
+    function areaPolyResolveCode() {
+      return String(document.getElementById("areaPolyCode").value || "").trim();
+    }
+    // ①の結果を捨てる。エリアを変えた直後に古いプレビューのまま②を押せてしまうのを防ぐ。
+    function resetAreaPolyPreview() {
+      areaPolyPlan = null;
+      document.getElementById("areaPolyPreview").style.display = "none";
+      document.getElementById("areaPolyResult").style.display = "none";
+      document.getElementById("areaPolyBar").style.display = "none";
+      document.getElementById("areaPolyProg").textContent = "";
+    }
+
+    // エリアDD：ピンが存在する areaCode を areaName で列挙。
+    // 周回管理と違い自店では絞らない（行政界は地図データで、店ごとに変わるものではないため）。
+    window.openAreaPolyModal = () => {
+      if (!isAdminUser) return;   // fail-closed（rules 側でも write=isAdmin で二重に守られる）
+      const nameByCode = {};
+      allPins.forEach(p => { const c = areaKey(p); if (c) nameByCode[c] = p.areaName || c; });
+      const codes = Object.keys(nameByCode).sort((a, b) => nameByCode[a].localeCompare(nameByCode[b], "ja"));
+      const sel = document.getElementById("areaPolySel");
+      sel.innerHTML = `<option value="">（直接入力する）</option>`
+        + codes.map(c => `<option value="${c}">${escAttr(nameByCode[c])}（${c}）</option>`).join("");
+      document.getElementById("areaPolyCode").value = "";
+      document.getElementById("areaPolyNote").textContent =
+        codes.length ? "" : "ピンのあるエリアがありません。コードを直接入力してください。";
+      resetAreaPolyPreview();
+      document.getElementById("areaPolyModal").style.display = "flex";
+    };
+    window.closeAreaPolyModal = () => {
+      if (areaPolyBusy) return;   // 書込中は閉じさせない（進捗が見えなくなるだけで中断はできないため）
+      resetAreaPolyPreview();
+      document.getElementById("areaPolyModal").style.display = "none";
+    };
+    window.onAreaPolySelChange = () => {
+      const v = document.getElementById("areaPolySel").value;
+      if (v) document.getElementById("areaPolyCode").value = v;
+      resetAreaPolyPreview();
+    };
+    window.onAreaPolyCodeInput = () => {
+      const el = document.getElementById("areaPolyCode");
+      const cleaned = el.value.replace(/[^0-9]/g, "").slice(0, 5);   // 全角や記号が混ざっても黙って落とす
+      if (el.value !== cleaned) el.value = cleaned;
+      resetAreaPolyPreview();
+    };
+
+    // ① 件数確認（dry-run）。ポリゴンなしで hit だけ取り、既存docと突き合わせて見込みを出す。
+    //    ZENRINへの重い取得も Firestore への書き込みも、ここでは行わない。
+    window.previewAreaPoly = async () => {
+      const cityCode = areaPolyResolveCode();
+      if (!/^[0-9]{5}$/.test(cityCode)) { showToast("市区町村コードは5桁で指定してください", "error"); return; }
+      const btn = document.getElementById("areaPolyPreviewBtn");
+      const prog = document.getElementById("areaPolyProg");
+      btn.disabled = true; btn.textContent = "確認中…";
+      resetAreaPolyPreview();
+      prog.textContent = "件数を確認中…";
+      try {
+        const res = await fetch(`${AREAPOLY_API}?cityCode=${cityCode}&count=1`);
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
+        const hit = Number(j.hit || 0);
+        const sel = document.getElementById("areaPolySel");
+        const cityName = (sel.value === cityCode && sel.selectedOptions[0])
+          ? sel.selectedOptions[0].textContent : cityCode;
+        const body = document.getElementById("areaPolyPreview");
+        const pv = document.getElementById("areaPolyPreviewBody");
+        prog.textContent = "";
+
+        if (hit === 0) {
+          pv.innerHTML = `<div class="areapoly-warn">${escAttr(cityCode)} に大字(OAZ)が1件もありません。コードを確認してください。</div>`;
+          document.getElementById("areaPolyExecActions").style.display = "none";
+          body.style.display = "block";
+          return;
+        }
+        if (hit > AREAPOLY_HIT_LIMIT) {
+          // 1回取得の上限を超える＝取りこぼしが出るので、黙って途中まで入れずにここで止める。
+          pv.innerHTML = `<div class="areapoly-warn">大字が ${hit}件 あり、1回で取得できる上限（${AREAPOLY_HIT_LIMIT}件）を超えています。</div>`
+            + `<div class="round-pv-note">分割取得の実装が必要です。この区の取込は行えません。</div>`;
+          document.getElementById("areaPolyExecActions").style.display = "none";
+          body.style.display = "block";
+          return;
+        }
+        // 既存docの件数＝更新見込み。cityCode で引くので他の区には触れない。
+        const snap = await getDocs(query(collection(db, "areaPolygons"), where("cityCode", "==", cityCode)));
+        const existing = new Set(snap.docs.map(d => d.id));
+        const est = hit * AREAPOLY_AVG_BYTES;
+        areaPolyPlan = { cityCode, cityName, hit, existing };
+        pv.innerHTML = `
+          <div class="round-pv-title">【${escAttr(cityName)} の大字を取り込みます】</div>
+          <div class="round-pv-row"><span>取り込む大字</span><b>${hit}件</b></div>
+          <div class="round-pv-row"><span>概算サイズ</span><b>約${areaPolyMB(est)}</b></div>
+          <div class="round-pv-row"><span>既存のdoc（更新になる見込み）</span><b>${existing.size}件</b></div>
+          <div class="round-pv-row"><span>新規になる見込み</span><b>${Math.max(hit - existing.size, 0)}件</b></div>
+          <div class="round-pv-note">※概算は実測平均（1件約${(AREAPOLY_AVG_BYTES / 1024).toFixed(1)}KB）からの推定です。確定値は実行後に出ます。<br>
+          ※ここまでで Firestore には一切書き込んでいません。書き込み先は areaPolygons（doc ID＝住所コード8桁）。<br>
+          ※取得に数十秒かかります（緑区105件で約6秒の実測）。</div>`;
+        document.getElementById("areaPolyExecActions").style.display = "";
+        body.style.display = "block";
+      } catch (e) {
+        prog.textContent = "";
+        showToast("件数の確認に失敗しました（" + e.message + "）", "error");
+        console.error("previewAreaPoly", e);
+      } finally {
+        btn.disabled = false; btn.textContent = "① 件数を確認";
+      }
+    };
+
+    // ② 取込実行。ポリゴン付きで取得 → 仕分け → batch で書込。
+    window.execAreaPolyImport = async () => {
+      if (areaPolyBusy || !areaPolyPlan) return;
+      if (!isAdminUser) { showToast("権限がありません", "error"); return; }
+      const plan = areaPolyPlan;
+      const btn = document.getElementById("areaPolyExecBtn");
+      const prog = document.getElementById("areaPolyProg");
+      const result = document.getElementById("areaPolyResult");
+      areaPolyBusy = true; btn.disabled = true; btn.textContent = "実行中…";
+      document.getElementById("areaPolyBar").style.display = "";
+      setAreaPolyBar(0);
+      try {
+        // 目安は実測（105件＝6.0秒）からの件数比例。最大の岐阜市848件でも40〜50秒に収まる。
+        const estSec = Math.max(5, Math.round(plan.hit * 0.057));
+        prog.textContent = `ゼンリンから取得中…（${plan.hit}件・目安 約${estSec}秒）`;
+        const t0 = Date.now();
+        const res = await fetch(`${AREAPOLY_API}?cityCode=${plan.cityCode}`);
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
+        const fetchMs = Date.now() - t0;
+        setAreaPolyBar(0.05);
+
+        const { rows, skipped } = areaPolyBuildRows(j.item, plan.cityCode);
+        const batches = areaPolySplitBatches(rows);
+        const totalBytes = rows.reduce((n, r) => n + r.bytes, 0);
+        const created = rows.filter(r => !plan.existing.has(r.code)).length;
+
+        let done = 0;
+        for (const b of batches) {
+          const batch = writeBatch(db);
+          b.forEach(r => {
+            // 【純キャッシュ】ここに周回ステータス・調査進捗などの運用データを足さないこと。
+            //   set(merge なし)＝毎回まるごと上書きなので、同居させると再取込のたびに消える。
+            //   周回まわりの状態は survey_rounds 側に置く（同じ制約を firestore.rules にも書いてある）。
+            batch.set(doc(db, "areaPolygons", r.code), { ...r.data, fetchedAt: serverTimestamp() });
+          });
+          await batch.commit();
+          done += b.length;
+          prog.textContent = `Firestoreへ書込中… ${done}/${rows.length}`;
+          setAreaPolyBar(0.05 + 0.95 * (done / Math.max(rows.length, 1)));
+        }
+
+        prog.textContent = `完了（取得 ${(fetchMs / 1000).toFixed(1)}秒）`;
+        const skipHtml = skipped.length
+          ? skipped.map(k => `<div class="areapoly-skip">・${escAttr(k.name)}（${escAttr(k.code)}）… ${escAttr(k.reason)}</div>`).join("")
+          : `<div class="round-pv-note">スキップなし</div>`;
+        result.innerHTML = `
+          <div class="round-pv-title">【${escAttr(plan.cityName)} 取込完了】</div>
+          <div class="round-pv-row"><span>取り込んだ大字</span><b>${rows.length}件</b></div>
+          <div class="round-pv-row"><span>　うち新規</span><b>${created}件</b></div>
+          <div class="round-pv-row"><span>　うち更新（fetchedAt を更新）</span><b>${rows.length - created}件</b></div>
+          <div class="round-pv-row"><span>スキップ</span><b>${skipped.length}件</b></div>
+          <div class="round-pv-row"><span>書き込み量 / バッチ回数</span><b>${areaPolyMB(totalBytes)} / ${batches.length}回</b></div>
+          ${skipHtml}`;
+        result.style.display = "block";
+        showToast(`${plan.cityName} の行政界ポリゴンを ${rows.length}件 取り込みました`);
+        areaPolyPlan = null;   // 同じプレビューで二重実行させない（再実行は①からやり直し）
+        document.getElementById("areaPolyExecActions").style.display = "none";
+      } catch (e) {
+        prog.textContent = "";
+        showToast("取込に失敗しました（" + e.message + "）", "error");
+        console.error("execAreaPolyImport", e);
+      } finally {
+        areaPolyBusy = false; btn.disabled = false; btn.textContent = "② 取込を実行";
       }
     };
 
@@ -2049,6 +2345,21 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Noto Sans JP', sans-serif; background: #f1f5f9; color: #1e293b; height: 100vh; overflow: hidden; }
 
+    /* ===== エミュレータ接続バー =====
+       .emu-on は localhost のときだけ <html> に付く（付与箇所は先頭の <script type="module">）。
+       本番では 1バイトも効かない。画面を26px下げるのは、上に固定バーを出しても
+       ヘッダーのボタンが隠れないようにするため（レイアウトは他に一切いじらない）。 */
+    #emuBanner {
+      position: fixed; top: 0; left: 0; right: 0; height: 26px; z-index: 99999;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 700; letter-spacing: 0.02em;
+      color: #431407; background: repeating-linear-gradient(
+        45deg, #fdba74 0 12px, #fb923c 12px 24px);
+      border-bottom: 1px solid #c2410c;
+      pointer-events: none;   /* 何があっても操作を邪魔しない */
+    }
+    .emu-on #loginScreen, .emu-on #adminScreen { height: calc(100vh - 26px); margin-top: 26px; }
+
     #loginScreen {
       display: flex; flex-direction: column; align-items: center; justify-content: center;
       height: 100vh; background: #0f172a; gap: 16px; padding: 24px;
@@ -2368,6 +2679,17 @@
     .round-exec { padding:7px 16px; border-radius:6px; background:#EA580C; border:1px solid #c2410c;
       color:#fff; font-size:13px; font-weight:700; cursor:pointer; font-family:inherit; }
 
+    /* 行政界ポリゴン取込（E-1）。モーダル外枠・プレビュー行は .kouzu-modal / .round-pv-* を流用する */
+    .areapoly-btn { border-color:#0D9488; color:#2DD4BF; }
+    .areapoly-code { display:flex; gap:8px; align-items:flex-end; }
+    .areapoly-code > * { flex:1 1 auto; }
+    .areapoly-prog { font-size:12px; color:#0e7490; font-weight:700; margin-top:8px; min-height:18px; }
+    .areapoly-bar { height:6px; border-radius:3px; background:#e2e8f0; overflow:hidden; margin-top:4px; }
+    .areapoly-bar > i { display:block; height:100%; width:0; background:#0D9488; transition:width .2s; }
+    .areapoly-result { border-top:1px solid #e2e8f0; margin-top:10px; padding-top:8px; max-height:240px; overflow:auto; }
+    .areapoly-skip { font-size:11px; color:#b45309; padding:1px 0; }
+    .areapoly-warn { font-size:12px; color:#7f1d1d; font-weight:700; }
+
     .toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
       padding: 10px 20px; border-radius: 20px; font-size: 13px; font-weight: 500;
@@ -2421,6 +2743,8 @@
     </select>
     <!-- 周回管理（管理者専用）。既定 display:none で、admins 判定が通った時だけ開示する -->
     <button class="layer-btn round-mgr" id="roundMgrBtn" style="display:none" onclick="openRoundManager()" title="エリアごとに新しい周回を開始（管理者専用）">🔄 周回管理</button>
+    <!-- 行政界ポリゴン取込（E-1・管理者専用）。周回管理と同じく既定 display:none。 -->
+    <button class="layer-btn areapoly-btn" id="areaPolyBtn" style="display:none" onclick="openAreaPolyModal()" title="大字(OAZ)の行政界ポリゴンをゼンリンから取り込む（管理者専用）">🗾 行政界取込</button>
     <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
     <button class="layer-btn youto" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋クリックで属性">用途地域</button>
     <button class="layer-btn" id="chibanBtn" onclick="toggleChiban()" title="地番（ブルーマップ）重畳">地番</button>
@@ -2550,6 +2874,37 @@
         <button class="round-exec" id="roundExecBtn" onclick="execRoundStart()">実行する</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- 行政界ポリゴン取込（E-1・管理者専用）。①件数確認 → ②取込実行 の2段構え。
+     ①はポリゴンなしの軽いリクエスト（実測0.1秒）で件数だけ見る。この時点ではFirestoreに一切書かない。
+     ②で初めてポリゴン付き取得（実測：緑区105件で約6秒）→ Firestoreへ書き込む。 -->
+<div id="areaPolyModal" class="kouzu-modal" style="display:none">
+  <div class="kouzu-modal-box">
+    <div class="kouzu-modal-title">🗾 行政界ポリゴン（大字）を取り込む</div>
+    <label class="kouzu-field">市区町村（ピンのあるエリアから選択）
+      <select id="areaPolySel" onchange="onAreaPolySelChange()"></select>
+    </label>
+    <label class="kouzu-field">市区町村コード（JIS5桁・直接入力可）
+      <input id="areaPolyCode" type="text" inputmode="numeric" maxlength="5" placeholder="例：23114"
+        autocomplete="off" oninput="onAreaPolyCodeInput()">
+    </label>
+    <div class="round-none-note" id="areaPolyNote"></div>
+    <div class="kouzu-modal-actions">
+      <button class="kouzu-cancel" onclick="closeAreaPolyModal()">閉じる</button>
+      <button class="kouzu-save" id="areaPolyPreviewBtn" onclick="previewAreaPoly()">① 件数を確認</button>
+    </div>
+    <div class="round-preview" id="areaPolyPreview" style="display:none">
+      <div id="areaPolyPreviewBody"></div>
+      <div class="kouzu-modal-actions" id="areaPolyExecActions">
+        <button class="kouzu-cancel" onclick="closeAreaPolyModal()">やめる</button>
+        <button class="round-exec" id="areaPolyExecBtn" onclick="execAreaPolyImport()">② 取込を実行</button>
+      </div>
+    </div>
+    <div class="areapoly-prog" id="areaPolyProg"></div>
+    <div class="areapoly-bar" id="areaPolyBar" style="display:none"><i></i></div>
+    <div class="areapoly-result" id="areaPolyResult" style="display:none"></div>
   </div>
 </div>
 

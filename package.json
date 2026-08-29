@@ -1,0 +1,11 @@
+{
+  "name": "akiya-map",
+  "version": "0.0.0",
+  "private": true,
+  "description": "空家調査マッピングシステム。ここは開発用のコマンド置き場で、配信物（index.html / admin.html）はビルド不要の単体HTML。",
+  "scripts": {
+    "emu": "firebase emulators:start --only firestore,functions",
+    "deploy:rules": "node scripts/deploy-rules.mjs",
+    "prod-preview": "node scripts/make-prod-preview.mjs"
+  }
+}
