@@ -46,20 +46,29 @@
     // ①止まらない高精度GPS ②測位のたびの setCenter（ZENRINタイル再描画＋idleで全ピン走査）だった。
     const FOLLOW_CENTER_MIN_MS = 2000;   // setCenter の最小間隔(ms)
     const FOLLOW_CENTER_MIN_M  = 15;     // これ以上動いたら間隔を待たずに寄せる(m)
-    const GPS_STOP_GRACE_MS    = 20000;  // 追従OFF後、測位を止めるまでの猶予(ms)。パンのたびに止めない
-    const MY_LOCATION_STALE_OPACITY = 0.35;  // 測位停止中の青ドットの不透明度（古い位置と分かる濃さ）
+    // 【2026-08-29 廃止】追従OFF後20秒で測位を止めていた猶予（GPS_STOP_GRACE_MS）。
+    //   「歩きながら地図をパンする」＝現場の基本操作でGPSが止まり、現在地を見失っていた。
+    //   停止は visibilitychange（画面が隠れたとき）だけに絞る。経緯は docs/gps-tracking-design.md。
+    // 「位置情報が古い」ときの青ドットの不透明度（古い位置と分かる濃さ）。
+    //   ※測位はもう止めない。薄い＝「60秒間まったく位置が更新されていない」の意味。
+    const MY_LOCATION_STALE_OPACITY = 0.35;
+    // 最終測位からこれを過ぎたら「位置が古い」表示にする。測位の停止とは切り離した純粋な時間判定。
+    //   20秒だとビル影・屋内で一瞬途切れただけで薄くなり「薄い＝いつものこと」と無視される。
+    const MY_LOCATION_STALE_MS = 60000;
     // ※ #boot の保険タイマー(8秒)は body 末尾の素の<script>側にある。
     //    module 側に置くと、gstatic の取得に失敗した時にブロックごと実行されず保険が動かないため。
     const GPS_OPTS_FOLLOW = { enableHighAccuracy: true,  timeout: 8000, maximumAge: 5000 };
-    const GPS_OPTS_IDLE   = { enableHighAccuracy: false, timeout: 8000, maximumAge: 5000 };
+    // 追従OFF中はキャッシュ許容を広げて測位回数を減らす。15秒＝徒歩で最大約20m（住宅地1〜2軒分）。
+    // 30秒は約40m＝3〜4軒分ずれ、showMyLocation の「隣家を対象と誤認する」懸念に自分から抵触する。
+    const GPS_OPTS_IDLE   = { enableHighAccuracy: false, timeout: 8000, maximumAge: 15000 };
 
     let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（listenPinsで消さない）
-    let lastFixLL = null;        // 直近に青ドットを描いた位置。測位停止中も薄く残すため保持する
-    let myLocationStale = false; // 測位停止中＝青ドットが古い（薄色＋パルス停止で明示）
+    let lastFixLL = null;        // 直近に青ドットを描いた位置。位置が古くなっても薄く残すため保持する
+    let myLocationStale = false; // 位置情報が古い＝60秒間更新なし（薄色＋パルス停止で明示）
     let followMode = true;       // 追従モード（カーナビ式）。既定ON。手動パンでOFF、📍でON復帰
     let watchId = null;          // watchPosition のID（二重起動防止）
     let watchHighAccuracy = null; // 現在のwatchが高精度か。精度を変える時だけ張り替えるための記録
-    let watchStopTimer = null;    // 追従OFF後、猶予をおいて停止するためのタイマー
+    let staleTimer = null;        // 最終測位から MY_LOCATION_STALE_MS 後に薄化するタイマー
     let lastCenterAt = 0;         // 最後に setCenter した時刻（間引き判定）
     let lastCenterLL = null;      // 最後に setCenter した中心（移動距離の判定）
     // 進行方向↑（ヘディングアップ）。起動時は必ず北固定＝false。詳細は「進行方向↑」ブロック参照
@@ -735,7 +744,7 @@
               showMapLoading(false);   // 現在地中心で描けた時点で覆いを外す
 
               // 初期測位が取れていれば青ドットも出す（中心＝現在地なので位置は一致する）
-              if (fix) showMyLocation(fix.lat, fix.lng);
+              if (fix) { noteFix(); showMyLocation(fix.lat, fix.lng); }
               // モバイルは継続追跡を開始（青ドット更新＋追従）。二重起動はwatchIdで防止。
               // 初期測位に失敗していても開始する（歩き出して取れるようになるケースを拾う＝従来どおり）。
               if (isMobileUA() && navigator.geolocation) startLocationWatch();
@@ -1703,7 +1712,7 @@
     // ピン用ウィジェット管理Mapには入れない＝listenPins()の消去ループで消えず、現在地は出しっぱなし。
     function showMyLocation(lat, lng) {
       if (!map) return;
-      lastFixLL = { lat, lng };   // 測位停止中も「直前にどこにいたか」を薄く出せるよう保持する
+      lastFixLL = { lat, lng };   // 更新が途絶えても「直前にどこにいたか」を薄く出せるよう保持する
       if (myLocationMarker) { map.removeWidget(myLocationMarker); myLocationMarker = null; }
       // 正常表示の seqLabel と同じ作法：横中央寄せは transform:translateX(-50%)、縦位置は offset で調整。
       // 18pxドットを点に重ねるため offset Y=-9（高さ半分ぶん上げて中心を点に合わせる）。
@@ -1715,7 +1724,7 @@
             '<div style="transform:translateX(-50%);'
             + 'width:18px;height:18px;border-radius:50%;'
             + 'background:#2563EB;border:2px solid #fff;'
-            // 測位停止中は薄く＋パルス停止。20秒前の位置が「現在地の顔」で残ると、
+            // 位置が古い間は薄く＋パルス停止。1分以上前の位置が「現在地の顔」で残ると、
             // 調査員が隣家を対象と誤認する事故につながるため、見た目で必ず区別する。
             + (myLocationStale
                 ? 'opacity:' + MY_LOCATION_STALE_OPACITY + ';'
@@ -1728,11 +1737,23 @@
       map.addWidget(myLocationMarker);
     }
 
-    // 測位の停止/再開で青ドットの見た目だけ描き直す（位置は最後の測位のまま）。
-    // 復帰は「実際に位置が入った時点」で行うため、ここでは false を明示的には使わない。
+    // 測位が入った合図。薄化を解除し、次の薄化を予約し直す。
+    // ★これは「表示」だけの仕組みで、再購読はしない（ウォッチドッグは第2便）。
+    function noteFix() {
+      setMyLocationStale(false);
+      if (staleTimer != null) clearTimeout(staleTimer);
+      staleTimer = setTimeout(() => {
+        staleTimer = null;
+        setMyLocationStale(true);   // 1分間まったく更新が無い＝明確な異常。現場に知らせる
+      }, MY_LOCATION_STALE_MS);
+    }
+
+    // 「位置が古い/新しい」の切り替えで青ドットの見た目だけ描き直す（位置は最後の測位のまま）。
+    // 復帰は noteFix()＝実際に位置が入った時点で行う。ここを直接 false で呼ぶのは noteFix だけ。
     function setMyLocationStale(stale) {
       if (myLocationStale === stale) return;
       myLocationStale = stale;
+      if (stale && staleTimer != null) { clearTimeout(staleTimer); staleTimer = null; }
       if (lastFixLL) showMyLocation(lastFixLL.lat, lastFixLL.lng);
     }
 
@@ -1744,12 +1765,8 @@
       updateLocateBtn();
       if (on) {
         lastCenterAt = 0; lastCenterLL = null;   // 復帰直後は間隔を待たずに寄せる
-        startLocationWatch();                    // 高精度へ張り替え（停止予約も取り消される）
-      } else if (needsLocationWatch()) {
-        startLocationWatch();                    // 進行方向↑がONの間は低精度で継続
-      } else {
-        scheduleLocationWatchStop();             // 猶予後もOFFのままなら測位を止める
       }
+      startLocationWatch();   // ON=高精度 / OFF=低精度へ張り替える。測位そのものは止めない
     }
 
     // 画面が隠れている間は測位を止める（バックグラウンドでの発熱・電池消費を断つ）。
@@ -1764,33 +1781,24 @@
     }
 
     // watchPosition で継続追跡。位置更新ごとに青ドットを更新し、追従中のみ地図も寄せる。
-    // 測位が要るのは「追従中」か「進行方向↑がON」のときだけ。どちらもOFFなら止める。
-    // 進行方向↑を条件に含めないと、地図をパンした瞬間にGPS進行方向が失われて自動回転が静かに壊れる。
-    function needsLocationWatch() { return followMode || headingUpMode; }
+    // 測位が要るのは「画面が見えている間」。追従OFFでも青ドットは動かし続ける
+    //   （地図は追いかけないが、自分の位置は分かる＝現場の期待動作）。
+    // ※かつては followMode || headingUpMode を条件にしていた。進行方向↑を条件から落とすと
+    //   「パンした瞬間にGPS進行方向が失われて自動回転が静かに壊れる」事故があったため。
+    //   常時測位になった今はどちらも成立するが、測位を止める条件を再び足す場合はこの罠に注意。
+    function needsLocationWatch() { return !document.hidden; }
 
     // 測位の停止。青ドットは消さずに薄くする（消すと直前にどこにいたかも失われるため）。
     // markStale=false は「精度を変えるための張り替え」用。測位は途切れないので薄色にしない。
     function stopLocationWatch(markStale = true) {
-      if (watchStopTimer != null) { clearTimeout(watchStopTimer); watchStopTimer = null; }
       if (watchId == null) return;
       navigator.geolocation.clearWatch(watchId);
       watchId = null; watchHighAccuracy = null;
       if (markStale) setMyLocationStale(true);
     }
 
-    // 停止は必ず猶予経由にする。手動パンは8px超えで毎回 setFollow(false) を呼ぶため、
-    // 即時停止にすると「止める→📍で再開」が頻発して、かえって測位の再取得を繰り返す。
-    function scheduleLocationWatchStop() {
-      if (watchId == null || watchStopTimer != null) return;
-      watchStopTimer = setTimeout(() => {
-        watchStopTimer = null;
-        if (!needsLocationWatch()) stopLocationWatch();
-      }, GPS_STOP_GRACE_MS);
-    }
-
     function startLocationWatch() {
       if (!navigator.geolocation) return;
-      if (watchStopTimer != null) { clearTimeout(watchStopTimer); watchStopTimer = null; }  // 停止予約を取り消す
       if (!needsLocationWatch()) return;
       const hi = followMode;                   // 高精度は追従中だけ（発熱の主因）
       if (watchId != null) {
@@ -1802,7 +1810,7 @@
         pos => {
           if (pos.coords.accuracy > 1000) return;  // 既存ガード踏襲（粗い測位は無視）
           const lat = pos.coords.latitude, lng = pos.coords.longitude;
-          setMyLocationStale(false);               // 実際に位置が入った時点で復帰（watch開始時点ではない）
+          noteFix();                               // 実際に位置が入った時点で復帰（watch開始時点ではない）
           showMyLocation(lat, lng);                // 青ドットは常に現在地へ（followの有無に関係なく）
           if (followMode) maybeRecenter(lat, lng); // 追従中のみ地図も追従（毎回は寄せない）
           // 進行方向↑用：移動中はGPSの進行方向を優先する。停止時は heading が null になるためコンパスへ戻す。
@@ -2056,9 +2064,8 @@
         stopOrientationWatch();
         useGpsHeading = false;
         resetHeadingNorth();      // 北固定へ
-        // 追従もOFFなら測位を止める。停止は setFollow 側と同じく必ず猶予経由に揃える
-        // （ここだけ即時停止だと、自動回転を切った瞬間にGPSが落ちて挙動が食い違う）。
-        if (!needsLocationWatch()) scheduleLocationWatchStop();
+        // 測位は止めない。画面が見えている間は継続する
+        //   （青ドットは追従・進行方向↑のどちらのON/OFFとも無関係に動かす）。
       }
       updateCompassState();
     }
@@ -2242,7 +2249,7 @@
         map.setZoom(getDefaultZoom());   // 起動時の初期表示と同一の縮尺（従来は17固定で起動時16とズレていた）
         // 📍は明示操作なので間引きを通さず即寄せる。基準を更新しないと直後の測位で二重に寄る。
         lastCenterAt = Date.now(); lastCenterLL = { lat, lng };
-        setMyLocationStale(false);       // これも実測位。watchの初回を待たずに青ドットを戻す
+        noteFix();                       // これも実測位。watchの初回を待たずに青ドットを戻す
         showMyLocation(lat, lng);
       });
     };
