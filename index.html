@@ -46,6 +46,15 @@
     // ①止まらない高精度GPS ②測位のたびの setCenter（ZENRINタイル再描画＋idleで全ピン走査）だった。
     const FOLLOW_CENTER_MIN_MS = 2000;   // setCenter の最小間隔(ms)
     const FOLLOW_CENTER_MIN_M  = 15;     // これ以上動いたら間隔を待たずに寄せる(m)
+    // 追従を維持する条件＝青点が画面内にいること。マージンは「これ以上端に寄せない」内側の余白比。
+    // 下辺・右辺が大きいのは 📍/Undo ボタン（右下・右端から約124px）に青点が隠れるのを避けるため。
+    // 現場で詰めるならここだけ触る。
+    const FOLLOW_KEEP_MARGIN = { top: 0.15, right: 0.20, bottom: 0.20, left: 0.15 };
+    const FOLLOW_NO_MARGIN   = { top: 0, right: 0, bottom: 0, left: 0 };  // 「画面内か」の判定用
+    // 手動パンとタップの境目(px)。これ未満はピン追加のタップとして扱う（従来の 8px を定数化）。
+    const FOLLOW_PAN_THRESHOLD_PX = 8;
+    // ドラッグ中に画面外へ出たかを見る間隔(ms)。指を離す前にボタン表示（プレビュー）を変えるため。
+    const FOLLOW_PAN_CHECK_MS = 200;
     // 【2026-08-29 廃止】追従OFF後20秒で測位を止めていた猶予（GPS_STOP_GRACE_MS）。
     //   「歩きながら地図をパンする」＝現場の基本操作でGPSが止まり、現在地を見失っていた。
     //   停止は visibilitychange（画面が隠れたとき）だけに絞る。経緯は docs/gps-tracking-design.md。
@@ -70,7 +79,23 @@
     let watchHighAccuracy = null; // 現在のwatchが高精度か。精度を変える時だけ張り替えるための記録
     let staleTimer = null;        // 最終測位から MY_LOCATION_STALE_MS 後に薄化するタイマー
     let lastCenterAt = 0;         // 最後に setCenter した時刻（間引き判定）
-    let lastCenterLL = null;      // 最後に setCenter した中心（移動距離の判定）
+    // 最後に寄せたときの「青点の位置」。中心ではない点に注意＝オフセットがあると中心と青点はズレる。
+    // 中心と比べると、そのズレの分だけ moved が常に FOLLOW_CENTER_MIN_M を超え、間引きが効かなくなる。
+    let lastCenterLL = null;
+    // 手動パンで作ったズレ。画面座標(px・中心基準・右下が正)で持つ。null＝ズレ無し（青点=中心）。
+    //   メルカトルで持つと、進行方向↑で車が曲がった瞬間にズレの向きが画面上で回り、
+    //   「進行方向の先を見るために上へずらした」構図が右や下へ移動してしまう（仕様として誤り）。
+    //   px なら heading が変わっても画面上の位置が不変。ズーム変更にも影響されない。
+    let followOffset = null;
+    // ドラッグ中だけの見た目用。followMode とは別に持つ＝指を離すまで追従は確定させない
+    //   （走行中の揺れで一瞬行き過ぎても、離した時点で画面内なら追従は維持される）。
+    let followPreviewOff = false;
+    // 指を置いてドラッグしている最中か。この間は maybeRecenter を止める。
+    //   追従OFFの確定を「指を離した時点」に遅らせた結果、ドラッグ中も followMode は true のまま。
+    //   放っておくと測位のたびに setCenter が走って地図が指の下で中心へ引き戻され、
+    //   そもそもパンできない（＝ずらせない）。パン中だけ寄せを止めるのが正しい。
+    //   青ドット自体は showMyLocation で動き続けるので、現在地を見失うことはない。
+    let userDragging = false;
     // 進行方向↑（ヘディングアップ）。起動時は必ず北固定＝false。詳細は「進行方向↑」ブロック参照
     let headingUpMode = false;   // ユーザーの意思（トグルの状態）
     let headingUpPaused = false; // 手動ひねりによる一時解除。モードは保持したまま追従だけ止める
@@ -1759,9 +1784,20 @@
 
     // ===== 追従モード（カーナビ式）=====
     // followMode=true: 現在地に地図を追従。手動で地図を動かすと解除、📍で復帰。
+    // 手動パンのズレを捨てる唯一の場所。捨てる意味を持つのは
+    //   ①追従の状態が変わったとき（ON復帰＝中心へ戻す／OFF＝ズレを持つ意味が無くなる）
+    //   ②📍を押したとき
+    // で、②を setFollow だけに任せることはできない。setFollow は followMode が同じ値だと
+    // 早期returnするため、"追従ON中に📍" ではズレが残り、locateMe の setCenter で一度中心に
+    // 戻ってから次の測位で元のズレ位置へ飛び直す＝「押しても直らない」ように見える。
+    // だから locateMe からもここを直接呼ぶ。
+    function clearFollowOffset() { followOffset = null; }
+
     function setFollow(on) {
       if (followMode === on) return;
       followMode = on;
+      followPreviewOff = false;      // 確定したのでドラッグ中のプレビューは畳む
+      clearFollowOffset();           // ON/OFF どちらの向きでもズレは捨てる
       updateLocateBtn();
       if (on) {
         lastCenterAt = 0; lastCenterLL = null;   // 復帰直後は間隔を待たずに寄せる
@@ -1777,7 +1813,9 @@
     });
     function updateLocateBtn() {
       const b = document.querySelector(".locate-btn");
-      if (b) b.classList.toggle("following", followMode); // ON=青塗り / OFF=グレー
+      // ドラッグ中は followPreviewOff を優先＝画面外へ出た瞬間に灰色になり、指を離す前に分かる。
+      // 実際の追従ON/OFFは onDragEnd まで確定しないので、戻せばこの表示も青に戻る。
+      if (b) b.classList.toggle("following", followMode && !followPreviewOff);
     }
 
     // watchPosition で継続追跡。位置更新ごとに青ドットを更新し、追従中のみ地図も寄せる。
@@ -1833,17 +1871,92 @@
       );
     }
 
+    // ===== 画面座標ヘルパー（追従のオフセット保持・画面内判定に使う）=====
+    // getLatLngBounds は heading 非考慮＝「回転していない W×H の矩形」を返す前提で deg/px を出す。
+    // （回転時に画面四隅がその外へはみ出すことは rotationBufferRatio() のコメントのとおり）
+    // 中心は sw/ne の中点から導く＝ map.getCenter() に依存しない（このコードベースに使用実績が無い）。
+    // 緯度はメルカトルで厳密には非線形だが、1画面ぶん(数百m)での誤差はmm単位＝判定に影響しない。
+    function mapPxBasis() {
+      if (!map) return null;
+      let b, size;
+      try { b = map.getLatLngBounds(); size = map.getMapSize(); } catch (e) { return null; }
+      const W = size && size.width, H = size && size.height;
+      if (!(W > 0 && H > 0)) return null;
+      const sw = b.getSouthWest(), ne = b.getNorthEast();
+      const dLng = (ne.lng - sw.lng) / W, dLat = (ne.lat - sw.lat) / H;
+      if (!(dLng > 0) || !(dLat > 0)) return null;
+      let h = 0;
+      try { h = (typeof map.getHeading === "function" ? map.getHeading() : 0) || 0; } catch (e) { h = 0; }
+      const rad = h * Math.PI / 180;
+      return { W, H, dLng, dLat,
+               cLat: (sw.lat + ne.lat) / 2, cLng: (sw.lng + ne.lng) / 2,
+               cr: Math.cos(rad), sr: Math.sin(rad) };
+    }
+
+    // 緯度経度 → 画面中心からのpxオフセット（x=右が正 / y=下が正）。
+    // setHeading(K)=「真北から時計回りK度が画面上」⇒ 画面右は方位K+90。heading=0 なら x=東 / y=南。
+    function llToScreenPx(lat, lng, ba) {
+      const ex = (lng - ba.cLng) / ba.dLng;   // px 東
+      const ny = (lat - ba.cLat) / ba.dLat;   // px 北
+      return { x: ex * ba.cr - ny * ba.sr, y: -(ex * ba.sr + ny * ba.cr) };
+    }
+
+    // pxオフセット → 緯度経度の差分（llToScreenPx の逆変換）。
+    function screenPxToLLDelta(px, py, ba) {
+      const u = px, v = -py;                       // v = px 北
+      const ex =  u * ba.cr + v * ba.sr;
+      const ny = -u * ba.sr + v * ba.cr;
+      return { dLat: ny * ba.dLat, dLng: ex * ba.dLng };
+    }
+
+    // 青点を置いてよい画面範囲（中心基準px）。margin=0 なら画面そのもの＝「画面内か」の判定になる。
+    function followBox(ba, m) {
+      return { xMin: -ba.W * (0.5 - m.left), xMax: ba.W * (0.5 - m.right),
+               yMin: -ba.H * (0.5 - m.top),  yMax: ba.H * (0.5 - m.bottom) };
+    }
+    function clampTo(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
+
+    // 青点が画面内にいるか。判定できないときは true に倒す＝勝手に追従を切らない（安全側）。
+    function isDotOnScreen(lat, lng) {
+      const ba = mapPxBasis();
+      if (!ba) return true;
+      const p = llToScreenPx(lat, lng, ba), bx = followBox(ba, FOLLOW_NO_MARGIN);
+      return p.x >= bx.xMin && p.x <= bx.xMax && p.y >= bx.yMin && p.y <= bx.yMax;
+    }
+
+    // 手動パンの結果を「青点の画面上の位置」として覚える。以後この位置に青点が来るよう追従する。
+    // 要件の安全網：マージンを割っていても中心へ全戻しせず、収まる最小限だけ詰める。
+    function captureFollowOffset(lat, lng) {
+      const ba = mapPxBasis();
+      if (!ba) return;
+      const p = llToScreenPx(lat, lng, ba), bx = followBox(ba, FOLLOW_KEEP_MARGIN);
+      followOffset = { x: clampTo(p.x, bx.xMin, bx.xMax), y: clampTo(p.y, bx.yMin, bx.yMax) };
+    }
+
     // 測位のたびに setCenter すると、ZENRINタイルの再描画と idle(=全ピン走査) が毎秒走る。
     // 「2秒経過」または「15m移動」のどちらかを満たした時だけ寄せる。
     function maybeRecenter(lat, lng) {
       if (!map) return;
+      if (userDragging) return;   // 手動パン中は寄せない（指の下で地図が中心へ戻るのを防ぐ）
       const now = Date.now();
+      // 比較対象は前回寄せた時点の"青点"の位置。中心と比べるとズレの分だけ常に超過してしまう。
       const moved = lastCenterLL ? distanceM(lastCenterLL.lat, lastCenterLL.lng, lat, lng) : Infinity;
       if (now - lastCenterAt < FOLLOW_CENTER_MIN_MS && moved < FOLLOW_CENTER_MIN_M) {
         return;
       }
-      map.setCenter(new ZDC.LatLng(lat, lng));
-      lastCenterAt = now; lastCenterLL = { lat, lng };
+      // 寄せ先は「青点」ではなく「青点＋手動パンのズレ(px)」＝ずらした構図を保ったまま追いかける。
+      let cLat = lat, cLng = lng;
+      const ba = followOffset ? mapPxBasis() : null;
+      if (ba) {
+        // 端末の向き替え・ズーム変更で画面比が変わるとマージンを割ることがあるので適用時にも詰め直す
+        const bx = followBox(ba, FOLLOW_KEEP_MARGIN);
+        followOffset = { x: clampTo(followOffset.x, bx.xMin, bx.xMax),
+                         y: clampTo(followOffset.y, bx.yMin, bx.yMax) };
+        const d = screenPxToLLDelta(followOffset.x, followOffset.y, ba);
+        cLat = lat - d.dLat; cLng = lng - d.dLng;   // 青点がそのpx位置に来るよう中心をずらす
+      }
+      map.setCenter(new ZDC.LatLng(cLat, cLng));
+      lastCenterAt = now; lastCenterLL = { lat, lng };   // 記録するのは中心ではなく青点の位置
     }
 
     // 15m程度の判定に十分な近似。度→mの換算はグリッド(GRID_DLAT/GRID_DLNG)と同じ 111000 に揃える
@@ -1857,23 +1970,78 @@
     // 地図の手動パン検出：地図DOMへのタッチ/マウスのドラッグだけを「手動操作」とみなす。
     // プログラムからの map.setCenter は touch/mouse 入力を発生させないため、追従中の自動寄せを
     // 手動操作と誤判定しない（isAutoMovingフラグ不要）。タップ(ピン追加)は移動量しきい値で除外。
+    //
+    // 【解除条件】かつては「8px動かしたら即OFF」だった。少しずらしただけで切れ、運転中に📍を
+    //   押し直す羽目になっていた（細い道でボタンを押すのは危ない）。今は "青点が画面外に出た
+    //   ときだけ" OFF にする。画面内に残っている間は追従を維持し、ズレ(px)を followOffset に
+    //   覚えて構図ごと追いかける＝「先の道を見ながら走る」ができる。
+    // 【確定は指を離した時点】ドラッグ中は見た目(followPreviewOff)だけ先に変え、追従自体は
+    //   触らない。走行中の揺れで一瞬行き過ぎても、離した時点で画面内なら追従は維持される。
+    // 【役割の分離】ここ(手動パン)は「OFFにする / ズレを覚える」だけで地図を動かさない。
+    //   watchPosition 側は「地図を寄せる」だけで追従をOFFにしない。両者は取り違えようがない。
     function attachManualPanDetection() {
       const el = document.getElementById("map");
       if (!el) return;
-      let startXY = null, mouseDown = false;
+      let startXY = null, mouseDown = false, dragging = false, lastCheckAt = 0;
+
+      // ドラッグ中：追従は確定させず、ボタンの見た目だけ追従先取りで変える。戻せば青に戻る。
+      function onDragMove() {
+        dragging = true;
+        userDragging = true;   // この瞬間から寄せを止める（ドラッグ開始のしきい値を超えた時点）
+        if (!followMode || !lastFixLL) return;
+        const now = Date.now();
+        if (now - lastCheckAt < FOLLOW_PAN_CHECK_MS) return;
+        lastCheckAt = now;
+        const off = !isDotOnScreen(lastFixLL.lat, lastFixLL.lng);
+        if (off !== followPreviewOff) { followPreviewOff = off; updateLocateBtn(); }
+      }
+      // 指を離した時点で確定。画面内なら追従維持＋ズレを記録、画面外なら追従OFF。
+      function onDragEnd() {
+        userDragging = false;   // 何があっても必ず戻す（ここで戻さないと追従が永久に止まる）
+        if (!dragging) { startXY = null; return; }   // タップ(ピン追加)は対象外
+        dragging = false;
+        const wasPreviewOff = followPreviewOff;
+        followPreviewOff = false;
+        if (followMode && lastFixLL) {
+          if (isDotOnScreen(lastFixLL.lat, lastFixLL.lng)) {
+            captureFollowOffset(lastFixLL.lat, lastFixLL.lng);
+            if (wasPreviewOff) updateLocateBtn();   // 行き過ぎて戻した＝灰色にした見た目を青へ返す
+          } else {
+            setFollow(false);
+            // 追従OFFはパン操作でしか起きない＝本人が画面を触っている最中にしか出ない。
+            // GPS由来ではOFFにならないので、運転中に不意に出ることはない。
+            showToast("追従OFF：📍で現在地に戻ります");
+          }
+        } else if (wasPreviewOff) {
+          updateLocateBtn();
+        }
+        startXY = null;
+      }
+
       el.addEventListener("touchstart", e => {
         startXY = (e.touches && e.touches.length === 1)
           ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null;
+        dragging = false; lastCheckAt = 0;
       }, { capture: true, passive: true });
       el.addEventListener("touchmove", e => {
         if (!startXY || !e.touches || e.touches.length !== 1) return; // ピンチズームは対象外
         const dx = e.touches[0].clientX - startXY.x, dy = e.touches[0].clientY - startXY.y;
-        if (Math.hypot(dx, dy) > 8) setFollow(false);  // 8px超え＝ドラッグ＝手動操作で追従解除
+        if (Math.hypot(dx, dy) > FOLLOW_PAN_THRESHOLD_PX) onDragMove();
       }, { capture: true, passive: true });
-      // PC（マウスドラッグ）
-      el.addEventListener("mousedown", () => { mouseDown = true; }, { capture: true });
-      el.addEventListener("mousemove", () => { if (mouseDown) setFollow(false); }, { capture: true });
-      window.addEventListener("mouseup", () => { mouseDown = false; }, true);
+      el.addEventListener("touchend",    onDragEnd, { capture: true, passive: true });
+      el.addEventListener("touchcancel", onDragEnd, { capture: true, passive: true });
+
+      // PC（マウスドラッグ）。従来はしきい値が無く、押して動かした瞬間にOFFになっていた。
+      el.addEventListener("mousedown", e => {
+        mouseDown = true; dragging = false; lastCheckAt = 0;
+        startXY = { x: e.clientX, y: e.clientY };
+      }, { capture: true });
+      el.addEventListener("mousemove", e => {
+        if (!mouseDown || !startXY) return;
+        const dx = e.clientX - startXY.x, dy = e.clientY - startXY.y;
+        if (Math.hypot(dx, dy) > FOLLOW_PAN_THRESHOLD_PX) onDragMove();
+      }, { capture: true });
+      window.addEventListener("mouseup", () => { if (mouseDown) { mouseDown = false; onDragEnd(); } }, true);
     }
 
     // ===== 進行方向↑（ヘディングアップ自動回転）=====
@@ -2240,6 +2408,7 @@
     window.locateMe = () => {
       if (suppressLocateClick) { suppressLocateClick = false; return; }  // 長押しでメニューを出した直後は無視
       setFollow(true);          // 追従ON復帰
+      clearFollowOffset();      // ★既に追従ONだと setFollow が早期returnするので、ここで必ず捨てる
       resumeHeadingUp();        // 手動ひねりで一時解除していた自動回転も併せて復帰
       startLocationWatch();     // 追跡が未開始/停止なら再開（watchIdで二重起動防止）
       if (!navigator.geolocation || !map) return;
