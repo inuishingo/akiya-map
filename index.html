@@ -130,7 +130,15 @@
     let gridMode = false;             // 調査グリッド記録モード（初期OFF＝従来のピン追加のまま）
     let youtoOn = false;              // 用途地域重畳モード（初期OFF）。ON中はクリック＝属性取得でピン追加停止
     let lastPinDocs = [];             // 直近の pins スナップショット（重畳後にマーカーを最前面へ積み直す用）
-    let gridWidgets = [];             // グリッド線＋塗りのZDCウィジェット（markersとは別管理）
+    // グリッドのウィジェット。差分更新のため「罫線」と「塗り」を分けて持つ。
+    //   罫線は可視範囲いっぱいに引くので、範囲(rMin..cMax)が変わらない限り作り直さない
+    //   ＝追従の再センタリングで数m動いただけなら1本も引き直さない。
+    //   塗りはマス単位で足し引きできるので gridId(G_row_col)をキーに保持する。
+    // ※ピン(Marker)はHTMLウィジェット、グリッドはGLシェイプ(canvas)で別系統。
+    //   重ね順は常にピンが上（DOMがcanvasの上）で、作成順にもzIndexにも依存しない。
+    let gridLineWidgets = [];         // ZDC.Polyline（可視範囲が変わった時だけ引き直す）
+    let gridLineRangeKey = null;      // 罫線を引いた時の可視範囲。同じなら触らない
+    let gridCellWidgets = new Map();  // gridId -> { poly, fill }（fillは担当者色の変化検出用）
     let surveyedCells = {};           // gridId -> Firestoreミラー（調査済みマス）
     const gridToggleLock = new Set(); // 同一マスの二重トグル防止（map/polygon両クリック対策）
 
@@ -541,15 +549,32 @@
       } catch (e) { /* オフライン等は無視（再オンライン/再ログインで再取得） */ }
     }
 
+    // グリッドのウィジェットを全部捨てる。使うのは gridMode OFF と、
+    // 用途地域を描いた直後の作り直し(force)の2箇所だけ。通常の再描画では呼ばない。
     function clearGridWidgets() {
-      gridWidgets.forEach(w => { try { map.removeWidget(w); } catch (e) {} });
-      gridWidgets = [];
+      gridLineWidgets.forEach(w => { try { map.removeWidget(w); } catch (e) {} });
+      gridLineWidgets = [];
+      gridLineRangeKey = null;
+      gridCellWidgets.forEach(ent => { try { map.removeWidget(ent.poly); } catch (e) {} });
+      gridCellWidgets.clear();
     }
 
     // 可視範囲のグリッド線＋（調査済み）塗りを描画。地図移動(idle)ごとに呼ぶ。
-    function redrawGrid() {
+    //
+    // 【差分更新】ZDCの addWidget/removeWidget は1回ごとに map._shapes 全件を map→sort→map し直す
+    //   （zdc_core の requireRedraw）。以前はここで毎回すべて捨てて全部作り直しており、
+    //   京都z15（ウィジェット109個）で 1回 81.4ms・add109/remove109 を実測した。これが
+    //   毎idle（＝パンのたび・追従ONなら2秒ごと）とマスのタップごとに走り、
+    //   「グリッドを押すと固まる」の実体だった（PCで81ms＝実機では数百ms級）。
+    //   いまは「範囲外になった塗りだけ削除・新規の塗りだけ追加・既存は触らない」。
+    //   罫線は可視範囲いっぱいに伸びるので範囲が変われば引き直しが要るが、
+    //   範囲が同じなら1本も触らない（数m動いただけの再センタリングでは何も作らない）。
+    // 【force】用途地域を描いた直後だけ作り直す。詳細は redrawActiveLayers 側のコメント。
+    // ※重ね順の心配は不要。ピン(Marker)はHTMLウィジェット、グリッドはGLシェイプ(canvas)で
+    //   系統が違い、ピンが常に上になる。作成順にもzIndexにも依存しない（実測で確認済み）。
+    function redrawGrid(opts) {
       if (!map) return;
-      clearGridWidgets();
+      if (!gridMode || (opts && opts.force)) clearGridWidgets();
       if (!gridMode) return;
       const b = map.getLatLngBounds();
       let sw = b.getSouthWest(), ne = b.getNorthEast();
@@ -565,41 +590,67 @@
       const rMax = Math.floor((ne.lat - GRID.lat0) / GRID_DLAT);
       const cMin = Math.floor((sw.lng - GRID.lng0) / GRID_DLNG);
       const cMax = Math.floor((ne.lng - GRID.lng0) / GRID_DLNG);
-      // 罫線は枠が多すぎる(ズームアウトしすぎ)場合は描かない＝現場端末の負荷保護。
-      // 塗りは調査済みマスのみ(少数)なので常時描く。
-      if ((rMax - rMin) <= 60 && (cMax - cMin) <= 60) {
-        for (let r = rMin; r <= rMax + 1; r++) {
-          const lat = GRID.lat0 + r * GRID_DLAT;
-          const ln = new ZDC.Polyline(
-            [ new ZDC.LatLng(lat, GRID.lng0 + cMin * GRID_DLNG), new ZDC.LatLng(lat, GRID.lng0 + (cMax + 1) * GRID_DLNG) ],
-            { color: "#1D4ED8", width: 1, opacity: 0.25 }
-          );
-          map.addWidget(ln); gridWidgets.push(ln);
+      // ── 罫線 ──
+      // 枠が多すぎる(ズームアウトしすぎ)場合は描かない＝現場端末の負荷保護（条件は従来どおり）。
+      // 罫線は画面いっぱいに伸びるので、可視範囲が1マスでもズレると端点が変わる＝引き直しが要る。
+      // 逆に範囲が同じなら1本も触らない。追従の2秒ごとの寄せは、ほぼ毎回こちらに落ちる。
+      const inCap = (rMax - rMin) <= 60 && (cMax - cMin) <= 60;
+      const rangeKey = inCap ? (rMin + "_" + rMax + "_" + cMin + "_" + cMax) : "capped";
+      if (rangeKey !== gridLineRangeKey) {
+        gridLineWidgets.forEach(w => { try { map.removeWidget(w); } catch (e) {} });
+        gridLineWidgets = [];
+        if (inCap) {
+          for (let r = rMin; r <= rMax + 1; r++) {
+            const lat = GRID.lat0 + r * GRID_DLAT;
+            const ln = new ZDC.Polyline(
+              [ new ZDC.LatLng(lat, GRID.lng0 + cMin * GRID_DLNG), new ZDC.LatLng(lat, GRID.lng0 + (cMax + 1) * GRID_DLNG) ],
+              { color: "#1D4ED8", width: 1, opacity: 0.25 }
+            );
+            map.addWidget(ln); gridLineWidgets.push(ln);
+          }
+          for (let c = cMin; c <= cMax + 1; c++) {
+            const lng = GRID.lng0 + c * GRID_DLNG;
+            const ln = new ZDC.Polyline(
+              [ new ZDC.LatLng(GRID.lat0 + rMin * GRID_DLAT, lng), new ZDC.LatLng(GRID.lat0 + (rMax + 1) * GRID_DLAT, lng) ],
+              { color: "#1D4ED8", width: 1, opacity: 0.25 }
+            );
+            map.addWidget(ln); gridLineWidgets.push(ln);
+          }
         }
-        for (let c = cMin; c <= cMax + 1; c++) {
-          const lng = GRID.lng0 + c * GRID_DLNG;
-          const ln = new ZDC.Polyline(
-            [ new ZDC.LatLng(GRID.lat0 + rMin * GRID_DLAT, lng), new ZDC.LatLng(GRID.lat0 + (rMax + 1) * GRID_DLAT, lng) ],
-            { color: "#1D4ED8", width: 1, opacity: 0.25 }
-          );
-          map.addWidget(ln); gridWidgets.push(ln);
-        }
+        gridLineRangeKey = rangeKey;
       }
+
+      // ── 塗り（調査済みマス）──
+      // まず「描くべき集合」を作り、足りない分だけ追加・要らない分だけ削除する。
+      // 範囲外カリングの条件は従来と同一（rMin-1 / rMax+1 の余白もそのまま）。
+      const want = new Map();
       Object.values(surveyedCells).forEach(cell => {
         if (cell.row == null || cell.col == null) return;
         if (cell.row < rMin - 1 || cell.row > rMax + 1 || cell.col < cMin - 1 || cell.col > cMax + 1) return;
-        const fillCol = staffColor(cell.surveyedBy);   // 担当者色（null/未登録はdefaultにフォールバック）
+        // 担当者色（null/未登録はdefaultにフォールバック）。色が変われば作り直す必要があるので持つ。
+        want.set("G_" + cell.row + "_" + cell.col, { cell, fill: staffColor(cell.surveyedBy) });
+      });
+      // 消す分：範囲外になった／解除された／担当者色が変わった
+      for (const [id, ent] of Array.from(gridCellWidgets)) {
+        const w = want.get(id);
+        if (w && w.fill === ent.fill) continue;   // 変化なし＝触らない（ここが効果の本体）
+        try { map.removeWidget(ent.poly); } catch (e) {}
+        gridCellWidgets.delete(id);
+      }
+      // 足す分：まだ描いていないマスだけ
+      for (const [id, w] of want) {
+        if (gridCellWidgets.has(id)) continue;
         const poly = new ZDC.Polygon(
-          gridCellCorners(cell.row, cell.col),
-          { fill: fillCol, fillOpacity: 0.30, stroke: fillCol, strokeWidth: 1 }
+          gridCellCorners(w.cell.row, w.cell.col),
+          { fill: w.fill, fillOpacity: 0.30, stroke: w.fill, strokeWidth: 1 }
         );
         // 塗り済みマスのタップでも解除できるよう、polygon自身にもclickを付ける（mapクリックと二重発火はlockで吸収）。
         poly.addEventListener("click", () => {
-          const c = gridCellCenter(cell.row, cell.col);
+          const c = gridCellCenter(w.cell.row, w.cell.col);
           toggleGridCell(c.lat, c.lng);
         });
-        map.addWidget(poly); gridWidgets.push(poly);
-      });
+        map.addWidget(poly); gridCellWidgets.set(id, { poly, fill: w.fill });
+      }
     }
 
     // マスを調査済み/解除でトグル。doc ID = gridId で set/delete（重複しない）。
@@ -1021,7 +1072,9 @@
       youtoRedrawing=true;
       try{
         removeYouto();
-        if(youtoOn){ await drawYouto(); if(gridMode) redrawGrid(); renderAllMarkers(); }
+        // 用途地域レイヤ(GLシェイプ)を足した直後は、グリッドも同じGL系統なので重ね順が入れ替わる。
+        // ここだけ force で作り直して用途地域の上へ戻す（renderAllMarkers が隣にあるのも同じ理由）。
+        if(youtoOn){ await drawYouto(); if(gridMode) redrawGrid({ force: true }); renderAllMarkers(); }
         lastYoutoKey = key;
       } finally {
         youtoRedrawing=false;
