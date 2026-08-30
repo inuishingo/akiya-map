@@ -26,3 +26,7 @@ firestore.rules.*.bak
 
 # 本番接続固定の確認用コピー（npm run prod-preview が作る。確認が終わったら消す）
 admin.prod.html
+
+# 認証情報を含む運用スクリプト（追跡しない）
+scripts/
+scripts/__pycache__/
