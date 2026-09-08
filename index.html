@@ -837,6 +837,8 @@
               map.addEventListener("idle", function() { if (gridMode) redrawGrid(); });
               map.addEventListener("idle", function(){ relayoutVisiblePins(); });  // 可視範囲のピンだけ描く（範囲外は消す）
               map.addEventListener("idle", function(){ redrawActiveLayers(); }); // 用途地域ON中のみ追従再描画
+              // 市区界ON中のみ。索引の bbox で可視市区を決め、可視リングを差分更新する。
+              map.addEventListener("idle", function(){ if (areaOn) redrawAreaBorders(); });
 
               // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
               attachManualPanDetection();
@@ -1132,6 +1134,219 @@
       updateYoutoBanner();
       if(!youtoOn){ removeYouto(); closeYoutoInfo(); }
       redrawActiveLayers();
+    };
+
+    // ── 市区町村界レイヤ（E-2a'：市区の境界を赤線で描く）─────────────────────────
+    // 目的：古川さん要望②「市区町村の字界を赤線で描く」。現場が要るのは
+    //   「名古屋市南区・中川区・天白区・稲沢市・あま市・犬山市」という市区町村単位の境界で、
+    //   大字(OAZ)は細かすぎた（乾判断 2026-09-08）。OAZ のデータは Firestore に残すが、ここでは見ない。
+    //
+    // ここは読み取り専用。Firestore への書き込みは無い。ポリゴンは【描画専用】で、ピンの帰属判定には
+    // 一切使わない（帰属は従来どおり reverse の address_code。point-in-polygon は持ち込まない）。
+    //
+    // 【取り方】areaPolygonIndex/shk（bbox索引・1doc・5府県195件で約30KB）をトグルON時に1回だけ getDoc し、
+    //   表示範囲と bbox が交差した市区の areaPolygons/{JIS5桁} だけを getDoc する。
+    //   reverse は使わない（索引の bbox だけで決まるので、ピンの無いエリアでも中心の住所が無くても効く）。
+    //   行政界は年に数回しか変わらないので onSnapshot は張らない。取得済みはセッション中キャッシュ。
+    //
+    // 【描画コストの前提】ZDC の addWidget は1回ごとに map._shapes 全件を map→sort→map し直す
+    //   （zdc_core の requireRedraw。京都z15・109個で1回81.4ms の実測＝8bf0708）。公式リファレンスで
+    //   一括追加API も再描画抑止も無いことを確認済み。ただし市区界はリング数が少なく、
+    //   実測で Z12（名古屋駅中心・33市区）でも36本しかない＝addWidget は問題にならない。
+    //   効いてくるのは点数と転送量の方なので、取込時に許容1mで間引いてある（admin.html の shkSimplifyGeom）。
+    //
+    // 【用途地域との重ね順】用途地域は UserWidget の <img>（HTML）、字界は Polyline（GLシェイプ）で、
+    //   HTML は作成順にも z-index にも依存せず常に GL の上に来る（ヘッドレスで作成順を入れ替えて実測）。
+    //   したがって「用」ON中は用途地域の帯の中で赤線が沈む。用途地域は属性を見る専用モード
+    //   （ピン追加も停止中）で同時使用を想定しないため、A案としてこれを許容する（乾決定 2026-09-08）。
+    const AREA_LINE_COLOR = "#DC2626";      // 市区界＝赤。塗りは無し（ZDC.Polygon は使わない）
+    const AREA_LINE_WIDTH = 3;
+    const AREA_MIN_ZOOM   = 12;             // これ未満では描かない。Z11 は56市区・5MB になるので出さない
+    const AREA_RING_CAP   = 200;            // 可視リングがこれを超えたら描かない（保険。Z12実測36本＝通常は届かない）
+
+    let areaOn = false;                     // 「境」トグル（既定OFF・セッション内のみ。永続化しない）
+    let areaIndex = null;                   // areaPolygonIndex/shk の codes。null=未取得
+    let areaIndexLoading = false;
+    const areaRingsByCode = new Map();      // JIS5桁 -> リング配列（空配列＝「この市区は未取込」と確定）
+    const areaWidgets = new Map();          // ringId -> ZDC.Polyline（差分更新の対象）
+    const areaFetching = new Set();         // 取得中のコード（同一市区への多重 getDoc 防止）
+    let areaZoomOk    = null;               // ズーム下限を満たしていたか（跨いだ時だけ案内する）
+    let areaCapped    = false;              // 上限超過で描画を止めているか（同上）
+    let areaMissing   = false;              // 「交差する市区が0」の状態か（同上＝未取込の案内を1回だけ出す）
+    let areaRedrawQueued = false;
+    // 計測用。ON時の getDoc 件数・転送量・描画時間を Console から読めるようにする（挙動には影響しない）。
+    const areaStat = { indexMs: 0, docs: 0, bytes: 0, getDocMs: 0, buildMs: 0 };
+
+    // 取得が返るたびに描き直すと、Z12 の33市区で33回走る。80ms にまとめて1回にする。
+    function areaRedrawSoon() {
+      if (areaRedrawQueued) return;
+      areaRedrawQueued = true;
+      setTimeout(() => { areaRedrawQueued = false; if (areaOn) redrawAreaBorders(); }, 80);
+    }
+
+    // geometryJson(MultiPolygon) → 描画用リング配列。JSON.parse も LatLng 生成も bbox 計算も
+    // 取得時のこの1回だけ。以後 idle では bbox の数値比較しかしない。
+    // coordinates は [polygon][ring][point][経度,緯度] の4段。ring[0]=外周 / ring[1..]=穴。
+    // 塗らない＝外周と穴を区別する必要が無いので、どちらも同じ Polyline として引く。
+    function areaBuildRings(code, geometryJson) {
+      let g = null;
+      try { g = JSON.parse(geometryJson); } catch (e) { return []; }
+      const polys = (g && g.type === "Polygon") ? [g.coordinates]
+                  : (g && g.type === "MultiPolygon") ? g.coordinates : [];
+      const out = [];
+      polys.forEach((poly, pi) => (poly || []).forEach((ring, ri) => {
+        if (!Array.isArray(ring) || ring.length < 2) return;
+        let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+        const pts = [];
+        for (const p of ring) {
+          const lng = Number(p[0]), lat = Number(p[1]);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;   // 壊れた点は捨てる（推測しない）
+          if (lat < minLat) minLat = lat;
+          if (lat > maxLat) maxLat = lat;
+          if (lng < minLng) minLng = lng;
+          if (lng > maxLng) maxLng = lng;
+          pts.push(new ZDC.LatLng(lat, lng));
+        }
+        if (pts.length < 2) return;
+        out.push({ id: code + "#" + pi + "_" + ri, pts, minLat, maxLat, minLng, maxLng });
+      }));
+      return out;
+    }
+
+    // bbox索引を1回だけ取る。これが無いと「どの市区を取りに行けばよいか」が決まらない。
+    async function areaLoadIndex() {
+      if (areaIndex || areaIndexLoading) return;
+      areaIndexLoading = true;
+      const t0 = performance.now();
+      try {
+        const snap = await getDoc(doc(db, "areaPolygonIndex", "shk"));
+        areaIndex = (snap.exists() && snap.data().codes) || {};
+        areaStat.indexMs = Math.round(performance.now() - t0);
+        console.log("[area] index", { codes: Object.keys(areaIndex).length, ms: areaStat.indexMs });
+        if (areaOn) redrawAreaBorders();
+      } catch (e) {
+        console.error("[area] index の取得に失敗", e);   // areaIndex は null のまま＝次のONで再挑戦
+      } finally {
+        areaIndexLoading = false;
+      }
+    }
+
+    // 市区1件ぶんのポリゴンを取る。取得済み・取得中はいずれも再取得しない＝セッション中1回きり。
+    async function areaFetchCode(code) {
+      if (areaRingsByCode.has(code) || areaFetching.has(code)) return;
+      areaFetching.add(code);
+      const t0 = performance.now();
+      try {
+        const snap = await getDoc(doc(db, "areaPolygons", code));
+        const t1 = performance.now();
+        const v = snap.exists() ? snap.data() : null;
+        const gj = (v && v.geometryJson) || "";
+        const rings = gj ? areaBuildRings(code, gj) : [];
+        // 0件でも入れる＝「この市区は取れなかった」と確定させ、二度と取りに行かない。
+        areaRingsByCode.set(code, rings);
+        areaStat.docs++;
+        areaStat.bytes += gj.length;
+        areaStat.getDocMs += (t1 - t0);
+        areaStat.buildMs += (performance.now() - t1);
+        areaRedrawSoon();
+      } catch (e) {
+        console.error("[area] getDoc failed", code, e);   // 確定させない＝次のidleで再挑戦できる
+      } finally {
+        areaFetching.delete(code);
+      }
+    }
+
+    function areaClearWidgets() {
+      for (const w of areaWidgets.values()) { try { map.removeWidget(w); } catch (e) {} }
+      areaWidgets.clear();
+    }
+
+    // 可視範囲（ピンのカリングと同じ viewBounds＝VIEW_BUFFER_RATIO＋回転ぶんのバッファ込み）に
+    // bbox が交差するリングだけを描く。差分更新もピンと同じ型で、既に出ているリングには触らない。
+    function redrawAreaBorders() {
+      if (!map) return;
+      if (!areaOn) { areaClearWidgets(); return; }
+
+      // ①ズーム下限（主の歯止め）。閾値を跨いだ時だけ案内する（毎idleでは出さない）。
+      const zoomOk = map.getZoom() >= AREA_MIN_ZOOM;
+      if (zoomOk !== areaZoomOk) {
+        areaZoomOk = zoomOk;
+        if (!zoomOk) showToast("ズームすると境界が出ます（Z" + AREA_MIN_ZOOM + "以上）", "warn");
+      }
+      if (!zoomOk) { areaClearWidgets(); return; }
+
+      const vb = viewBounds();
+      // 範囲が取れない時は何もしない。ピンと違い「範囲不明なら全部描く」に倒せない
+      // （索引の全195市区を取りに行くことになり、数十MBの getDoc になる）。次の idle でやり直す。
+      if (!vb) return;
+      const hits = (b) => !(b.maxLat < vb.south || b.minLat > vb.north
+                         || b.maxLng < vb.west  || b.minLng > vb.east);
+
+      // ②索引から「表示範囲に入る市区」を決め、未取得のぶんだけ取りに行く（戻ったら areaRedrawSoon）。
+      const codes = [];
+      if (areaIndex) {
+        for (const code in areaIndex) if (hits(areaIndex[code])) codes.push(code);
+      }
+      if (areaIndex) {
+        // 交差する市区が0＝その地域は未取込。状態が変わった時だけ1回案内する。
+        const missing = codes.length === 0;
+        if (missing !== areaMissing) {
+          areaMissing = missing;
+          if (missing) showToast("この地域の境界は未取込です", "warn");
+        }
+        for (const code of codes) if (!areaRingsByCode.has(code)) areaFetchCode(code);
+      }
+
+      // ③描く。可視リングは取得済みの市区の中から選ぶ（取得待ちのぶんは戻ってきた時に足される）。
+      const want = new Map();
+      for (const code of codes) {
+        const rings = areaRingsByCode.get(code);
+        if (!rings) continue;
+        for (const r of rings) if (hits(r)) want.set(r.id, r);
+      }
+
+      // ④可視リング数の上限（保険）。ズーム下限がある通常運用では到達しない（Z12実測36本）。
+      if (want.size > AREA_RING_CAP) {
+        areaClearWidgets();
+        if (!areaCapped) { areaCapped = true; showToast("範囲が広すぎます。ズームインしてください", "warn"); }
+        return;
+      }
+      areaCapped = false;
+
+      const t0 = performance.now();
+      let added = 0, removed = 0;
+      for (const [id, w] of Array.from(areaWidgets)) {          // 範囲外になった分だけ消す
+        if (want.has(id)) continue;
+        try { map.removeWidget(w); } catch (e) {}
+        areaWidgets.delete(id); removed++;
+      }
+      for (const [id, r] of want) {                            // まだ描いていない分だけ足す
+        if (areaWidgets.has(id)) continue;
+        const ln = new ZDC.Polyline(r.pts, { color: AREA_LINE_COLOR, width: AREA_LINE_WIDTH, opacity: 1 });
+        map.addWidget(ln); areaWidgets.set(id, ln); added++;
+      }
+      if (added || removed) {
+        console.log("[area] draw", { zoom: map.getZoom(), cities: codes.length, visible: want.size,
+                                     added, removed, drawMs: Math.round(performance.now() - t0),
+                                     getDocTotal: { docs: areaStat.docs, KB: Math.round(areaStat.bytes / 1024),
+                                                    getDocMs: Math.round(areaStat.getDocMs),
+                                                    buildMs: Math.round(areaStat.buildMs),
+                                                    indexMs: areaStat.indexMs } });
+      }
+    }
+
+    // 「境」トグル。既定OFF・セッション内のみ（記憶しない）。
+    // OFF で描画オブジェクトは全部消すが、取得済みポリゴンのキャッシュは残す
+    // ＝2回目以降の ON では索引もポリゴンも取り直さない（getDoc が1回も走らない）。
+    window.toggleAreaBorders = () => {
+      areaOn = !areaOn;
+      const btn = document.getElementById("areaBtn");
+      if (btn) btn.classList.toggle("active", areaOn);
+      if (!areaOn) { areaClearWidgets(); showToast("市区界：非表示"); return; }
+      areaZoomOk = null; areaCapped = false; areaMissing = false;   // ON操作のたびに案内を1回出せる状態へ戻す
+      redrawAreaBorders();                     // ズーム不足ならこの中で案内が1回出る（＝下の行は出さない）
+      if (areaZoomOk) showToast("市区界：表示（市区町村の境界）");
+      areaLoadIndex();                         // 索引が未取得なら取る（取得済みなら何もしない）
     };
 
     // ===== LISTEN PINS（第二便：自店のピンだけ購読。全店アカウント(@housemarket.com)のみ全件）=====
@@ -2636,6 +2851,11 @@
       background:#1f2937;border:1px solid #374151;color:#9ca3af;font-size:18px;font-weight:700;
       display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.4); }
     .past-btn.active { background:#7C3AED;border-color:#7C3AED;color:#fff; } /* ON=紫 */
+    /* 市区界トグル（過去周回ボタンの上）。既定OFF＝境界は描かない。縦積みなので幅280pxでも横に重ならない */
+    .area-btn { position:fixed; bottom:288px; right:16px; z-index:100; width:48px;height:48px;border-radius:50%;
+      background:#1f2937;border:1px solid #374151;color:#9ca3af;font-size:18px;font-weight:700;
+      display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.4); }
+    .area-btn.active { background:#DC2626;border-color:#DC2626;color:#fff; } /* ON=赤（線の色と一致） */
     /* 用途地域 属性ポップアップ（上部） */
     .youto-info { display:none; position:fixed; top:130px; left:12px; right:12px; z-index:250;
       background:rgba(17,24,39,.96);color:#e5e7eb;border:1px solid #374151;border-radius:10px;
@@ -2747,6 +2967,8 @@
   <div class="youto-banner" id="youtoBanner">🏠 用途地域モード：地図タップで用途地域の属性表示（ピン追加は一時停止中）</div>
   <div class="youto-info" id="youtoInfo" style="display:none"></div>
   <button class="past-btn" id="pastBtn" onclick="togglePastRounds()" title="過去周回ピンの表示（既定OFF）">旧</button>
+  <!-- 市区町村界の赤線表示。既定OFF・セッション内のみ（記憶しない） -->
+  <button class="area-btn" id="areaBtn" onclick="toggleAreaBorders()" title="市区町村の境界を赤線で表示">境</button>
   <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド記録モード">▦</button>
   <button class="youto-btn" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋タップで属性">用</button>
   <!-- 直近に自分が立てたピンを1タップで取り消す。戻せるものが無い間は disabled -->

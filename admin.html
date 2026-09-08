@@ -36,10 +36,15 @@
     // ═══════════════════════════════════════════════════════════════
     // ローカル開発：Firebase エミュレータ接続（admin.html のみ。index.html は本番のまま）
     //
-    // 【安全装置】切替条件は location.hostname ただ1つ。
-    //   URLパラメータ・localStorage・クエリフラグ等、「本番URLでも成立しうる条件」は
-    //   絶対に足さないこと。本番は https://inuishingo.github.io/... で配信されるため、
-    //   この分岐は本番では構造的に発火しない。
+    // 【切替条件】localhost であること「かつ」?emu=1 が付いていること。AND であって OR ではない。
+    //   ・hostname の判定は安全装置として残す。本番は https://inuishingo.github.io/... で配信されるので、
+    //     ?emu=1 を付けられても構造的に発火しない。URLパラメータは条件を「狭める」ためだけに足しており、
+    //     本番URLで成立しうる条件を増やしてはいない（この禁止事項は E-1 から変えていない）。
+    //   ・逆に localhost で自動的にエミュレータへ向けるのはやめた（2026-09-08）。
+    //     localhost での目視検証は本番Firestoreで行う運用（本番データを見るのが前提）なのに、
+    //     admin.html だけ黙って空のエミュレータに繋がり「数十秒固まって index へ飛ばされる」
+    //     （エミュレータに admins/{uid} が無く非管理者と判定される）状態になっていた。
+    //   ・エミュレータを使うときだけ  http://localhost:8000/admin.html?emu=1  で開く。
     //
     // Auth は本番のまま使う（＝実アカウントでログインする）。エミュレータに向くのは Firestore だけ。
     //   エミュレータの Firestore は空なので、管理者判定に使う admins/{uid} を
@@ -49,7 +54,8 @@
     //   zenrin / youto は本番のまま。既にデプロイ済みで動いており、localhost は CORS 許可済み。
     //   エミュレータに寄せると REINFOLIB_KEY まで用意が要るので、必要のない範囲を広げない。
     // ═══════════════════════════════════════════════════════════════
-    const IS_EMULATOR = location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    const IS_LOCALHOST = location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    const IS_EMULATOR = IS_LOCALHOST && new URLSearchParams(location.search).get("emu") === "1";
     const EMU_FIRESTORE_PORT = 8080;   // firebase.json の emulators.firestore.port と一致させること
     const EMU_FUNCTIONS_PORT = 5001;   // 同 emulators.functions.port
     if (IS_EMULATOR) {
@@ -1221,7 +1227,7 @@
     // 流れ：①件数確認（ポリゴンなし・軽い／DBに書かない）→ ②取込実行（ポリゴンあり／batchで書込）。
     // doc ID = ZENRIN の address_code(8桁) なので、同じ区を何度実行しても doc は増えない（上書き）。
     // Cloud Functions areaPolygon プロキシ。localhost のときだけ Functions エミュレータへ向ける
-    // （本番デプロイ前にここの検証を回せるようにするため）。判定は IS_EMULATOR＝hostname のみ。
+    // （本番デプロイ前にここの検証を回せるようにするため）。判定は IS_EMULATOR＝localhost かつ ?emu=1。
     const AREAPOLY_API = IS_EMULATOR
       ? `http://${location.hostname}:${EMU_FUNCTIONS_PORT}/housemarket-map/asia-northeast1/areaPolygon`
       : "https://areapolygon-ptddjpvgeq-an.a.run.app";
@@ -1326,11 +1332,17 @@
       document.getElementById("areaPolyNote").textContent =
         codes.length ? "" : "ピンのあるエリアがありません。コードを直接入力してください。";
       resetAreaPolyPreview();
+      // SHK（都道府県まとめて）側のDD。定数 SHK_PREFS から作る＝ピンの有無に依存しない。
+      const ps = document.getElementById("shkPrefSel");
+      ps.innerHTML = `<option value="">（選択してください）</option>`
+        + Object.keys(SHK_PREFS).map(p => `<option value="${escAttr(p)}">${escAttr(p)}（${SHK_PREFS[p].length}件）</option>`).join("");
+      resetShkPreview();
       document.getElementById("areaPolyModal").style.display = "flex";
     };
     window.closeAreaPolyModal = () => {
-      if (areaPolyBusy) return;   // 書込中は閉じさせない（進捗が見えなくなるだけで中断はできないため）
+      if (areaPolyBusy || shkBusy) return;   // 書込中は閉じさせない（進捗が見えなくなるだけで中断はできないため）
       resetAreaPolyPreview();
+      resetShkPreview();
       document.getElementById("areaPolyModal").style.display = "none";
     };
     window.onAreaPolySelChange = () => {
@@ -1472,6 +1484,359 @@
         areaPolyBusy = false; btn.disabled = false; btn.textContent = "② 取込を実行";
       }
     };
+
+
+    // ===== 市区町村界(SHK)の都道府県まとめて取込（E-2a'）— areaPolygons + areaPolygonIndex =====
+    // E-1（大字OAZ）と同じ areaPolygons に、level="SHK" の面を入れる。doc ID = JIS5桁そのもの
+    // （ZENRIN の address_code が SHK では5桁で返るのを実測確認済み）。
+    //
+    // 【なぜ OAZ ではなく SHK か】現場が要るのは「名古屋市南区・中川区…」という市区町村単位の境界で、
+    //   大字は細かすぎた（乾判断 2026-09-08）。副次的に、OAZ の一括取得が上流の約29秒制限に当たる問題
+    //   （伏見区701件で504）も消える。SHK は1市区=1件・実測0.16〜0.26秒。
+    //
+    // 【純キャッシュの制約は不変】ここに周回ステータス等の運用データを同居させないこと。
+    //   取込は setDoc の上書きなので、同居させると再取込のたびに消える（firestore.rules にも同じ記載）。
+    const SHK_LEVEL = "SHK";
+    const SHK_FETCH_WAIT_MS = 300;    // ゼンリン指定の間隔。直列で1件ずつ空ける
+    const SHK_SIMPLIFY_TOL_M = 1;     // Douglas-Peucker の許容(m)。下のコメント参照
+
+    // 対象5府県の JIS5桁一覧（政令市の親コード 23100/26100 は除外＝区単位で取る）。
+    // scripts/muni_master.json（総務省コード1,916件）から対象分だけ抜き出した定数。
+    // muni_master.json 自体はアプリから読まない（133KB・areaCode 移行専用）ので、ここへ埋め込む。
+    const SHK_PREFS = {
+      "愛知県": [
+        ["23101","名古屋市千種区"], ["23102","名古屋市東区"], ["23103","名古屋市北区"],
+        ["23104","名古屋市西区"], ["23105","名古屋市中村区"], ["23106","名古屋市中区"],
+        ["23107","名古屋市昭和区"], ["23108","名古屋市瑞穂区"], ["23109","名古屋市熱田区"],
+        ["23110","名古屋市中川区"], ["23111","名古屋市港区"], ["23112","名古屋市南区"],
+        ["23113","名古屋市守山区"], ["23114","名古屋市緑区"], ["23115","名古屋市名東区"],
+        ["23116","名古屋市天白区"], ["23201","豊橋市"], ["23202","岡崎市"],
+        ["23203","一宮市"], ["23204","瀬戸市"], ["23205","半田市"],
+        ["23206","春日井市"], ["23207","豊川市"], ["23208","津島市"],
+        ["23209","碧南市"], ["23210","刈谷市"], ["23211","豊田市"],
+        ["23212","安城市"], ["23213","西尾市"], ["23214","蒲郡市"],
+        ["23215","犬山市"], ["23216","常滑市"], ["23217","江南市"],
+        ["23219","小牧市"], ["23220","稲沢市"], ["23221","新城市"],
+        ["23222","東海市"], ["23223","大府市"], ["23224","知多市"],
+        ["23225","知立市"], ["23226","尾張旭市"], ["23227","高浜市"],
+        ["23228","岩倉市"], ["23229","豊明市"], ["23230","日進市"],
+        ["23231","田原市"], ["23232","愛西市"], ["23233","清須市"],
+        ["23234","北名古屋市"], ["23235","弥富市"], ["23236","みよし市"],
+        ["23237","あま市"], ["23238","長久手市"], ["23302","東郷町"],
+        ["23342","豊山町"], ["23361","大口町"], ["23362","扶桑町"],
+        ["23424","大治町"], ["23425","蟹江町"], ["23427","飛島村"],
+        ["23441","阿久比町"], ["23442","東浦町"], ["23445","南知多町"],
+        ["23446","美浜町"], ["23447","武豊町"], ["23501","幸田町"],
+        ["23561","設楽町"], ["23562","東栄町"], ["23563","豊根村"],
+      ],
+      "岐阜県": [
+        ["21201","岐阜市"], ["21202","大垣市"], ["21203","高山市"],
+        ["21204","多治見市"], ["21205","関市"], ["21206","中津川市"],
+        ["21207","美濃市"], ["21208","瑞浪市"], ["21209","羽島市"],
+        ["21210","恵那市"], ["21211","美濃加茂市"], ["21212","土岐市"],
+        ["21213","各務原市"], ["21214","可児市"], ["21215","山県市"],
+        ["21216","瑞穂市"], ["21217","飛騨市"], ["21218","本巣市"],
+        ["21219","郡上市"], ["21220","下呂市"], ["21221","海津市"],
+        ["21302","岐南町"], ["21303","笠松町"], ["21341","養老町"],
+        ["21361","垂井町"], ["21362","関ケ原町"], ["21381","神戸町"],
+        ["21382","輪之内町"], ["21383","安八町"], ["21401","揖斐川町"],
+        ["21403","大野町"], ["21404","池田町"], ["21421","北方町"],
+        ["21501","坂祝町"], ["21502","富加町"], ["21503","川辺町"],
+        ["21504","七宗町"], ["21505","八百津町"], ["21506","白川町"],
+        ["21507","東白川村"], ["21521","御嵩町"], ["21604","白川村"],
+      ],
+      "三重県": [
+        ["24201","津市"], ["24202","四日市市"], ["24203","伊勢市"],
+        ["24204","松阪市"], ["24205","桑名市"], ["24207","鈴鹿市"],
+        ["24208","名張市"], ["24209","尾鷲市"], ["24210","亀山市"],
+        ["24211","鳥羽市"], ["24212","熊野市"], ["24214","いなべ市"],
+        ["24215","志摩市"], ["24216","伊賀市"], ["24303","木曽岬町"],
+        ["24324","東員町"], ["24341","菰野町"], ["24343","朝日町"],
+        ["24344","川越町"], ["24441","多気町"], ["24442","明和町"],
+        ["24443","大台町"], ["24461","玉城町"], ["24470","度会町"],
+        ["24471","大紀町"], ["24472","南伊勢町"], ["24543","紀北町"],
+        ["24561","御浜町"], ["24562","紀宝町"],
+      ],
+      "京都府": [
+        ["26101","京都市北区"], ["26102","京都市上京区"], ["26103","京都市左京区"],
+        ["26104","京都市中京区"], ["26105","京都市東山区"], ["26106","京都市下京区"],
+        ["26107","京都市南区"], ["26108","京都市右京区"], ["26109","京都市伏見区"],
+        ["26110","京都市山科区"], ["26111","京都市西京区"], ["26201","福知山市"],
+        ["26202","舞鶴市"], ["26203","綾部市"], ["26204","宇治市"],
+        ["26205","宮津市"], ["26206","亀岡市"], ["26207","城陽市"],
+        ["26208","向日市"], ["26209","長岡京市"], ["26210","八幡市"],
+        ["26211","京田辺市"], ["26212","京丹後市"], ["26213","南丹市"],
+        ["26214","木津川市"], ["26303","大山崎町"], ["26322","久御山町"],
+        ["26343","井手町"], ["26344","宇治田原町"], ["26364","笠置町"],
+        ["26365","和束町"], ["26366","精華町"], ["26367","南山城村"],
+        ["26407","京丹波町"], ["26463","伊根町"], ["26465","与謝野町"],
+      ],
+      "滋賀県": [
+        ["25201","大津市"], ["25202","彦根市"], ["25203","長浜市"],
+        ["25204","近江八幡市"], ["25206","草津市"], ["25207","守山市"],
+        ["25208","栗東市"], ["25209","甲賀市"], ["25210","野洲市"],
+        ["25211","湖南市"], ["25212","高島市"], ["25213","東近江市"],
+        ["25214","米原市"], ["25383","日野町"], ["25384","竜王町"],
+        ["25425","愛荘町"], ["25441","豊郷町"], ["25442","甲良町"],
+        ["25443","多賀町"],
+      ],
+    };
+
+    // ── ここから SHK 純ロジック ────────────────────────────────────────
+    // DOM も Firestore も参照しない。scripts/verify-e2a-shk.mjs がここを抜き出して単体検証する。
+
+    // Douglas-Peucker（線の簡略化）。
+    // 【なぜ簡略化するか】生データだと Z12（名古屋駅中心・33市区）で getDoc 合計 2,092KB・55,683点になる。
+    //   許容1m なら 愛知69市区町村の実データで 点数61%減・最大ずれ1.0m。Z18（約0.49m/px）でも
+    //   ずれは約2px＝線幅3pxの内側に収まるので、最大ズームでも見た目が変わらない。
+    //   （許容5mだと Z18 で約10pxずれて市境が目視でずれるので採らない）
+    // 再帰ではなくスタックで回す（1リング2万点級があるため、深い再帰を積まない）。
+    const SHK_M_PER_DEG_LAT = 111320;
+    function shkPerpDistM(p, a, b, kx) {
+      const px = (p[0] - a[0]) * kx, py = (p[1] - a[1]) * SHK_M_PER_DEG_LAT;
+      const bx = (b[0] - a[0]) * kx, by = (b[1] - a[1]) * SHK_M_PER_DEG_LAT;
+      const L2 = bx * bx + by * by;
+      if (L2 === 0) return Math.hypot(px, py);
+      const t = Math.max(0, Math.min(1, (px * bx + py * by) / L2));
+      return Math.hypot(px - bx * t, py - by * t);
+    }
+    function shkSimplifyRing(ring, tolM, kx) {
+      const n = ring.length;
+      if (n < 3) return ring.slice();
+      const keep = new Uint8Array(n); keep[0] = keep[n - 1] = 1;
+      const stack = [[0, n - 1]];
+      while (stack.length) {
+        const [i, j] = stack.pop();
+        let maxD = -1, idx = -1;
+        for (let k = i + 1; k < j; k++) {
+          const d = shkPerpDistM(ring[k], ring[i], ring[j], kx);
+          if (d > maxD) { maxD = d; idx = k; }
+        }
+        if (maxD > tolM && idx > 0) { keep[idx] = 1; stack.push([i, idx], [idx, j]); }
+      }
+      const out = [];
+      for (let k = 0; k < n; k++) if (keep[k]) out.push(ring[k]);
+      return out;
+    }
+    // MultiPolygon をリングごとに簡略化する。座標の順序も入れ子の形も変えない（点を間引くだけ）。
+    // 3点未満になったリングは線として引けないので捨てる（面積ゼロの塵で、境界の見た目に影響しない）。
+    function shkSimplifyGeom(g, tolM) {
+      if (!g || !g.coordinates) return g;
+      const polys = (g.type === "Polygon") ? [g.coordinates] : g.coordinates;
+      const lat0 = (((polys[0] || [])[0] || [])[0] || [0, 35])[1];
+      const kx = 111320 * Math.cos(lat0 * Math.PI / 180);
+      const outPolys = [];
+      for (const poly of polys) {
+        const rings = [];
+        for (const ring of (poly || [])) {
+          const s = shkSimplifyRing(ring, tolM, kx);
+          if (s.length >= 3) rings.push(s);
+        }
+        if (rings.length) outPolys.push(rings);
+      }
+      return { type: "MultiPolygon", coordinates: outPolys };
+    }
+
+    // ZENRIN の item 1件 → 保存する行 or スキップ理由。書き込みはしない。
+    function shkBuildRow(item, code, name) {
+      const g = item && item.address_polygon;
+      if (!g) return { skip: "行政界ポリゴンが未整備(null)" };
+      const acode = String(item.address_code || "");
+      if (acode && acode !== code) return { skip: `住所コード不一致（返り値 ${acode}）` };
+      const pointCountRaw = areaPolyCountPoints(g);
+      const simp = shkSimplifyGeom(g, SHK_SIMPLIFY_TOL_M);
+      const geometryJson = JSON.stringify(simp);
+      const bytes = new TextEncoder().encode(geometryJson).length;
+      if (bytes > AREAPOLY_MAX_DOC_BYTES) {
+        return { skip: "1docの上限超過（" + Math.round(bytes / 1000) + "KB）" };
+      }
+      return {
+        row: {
+          code, bytes,
+          data: {
+            code, level: SHK_LEVEL, cityCode: code,
+            parentCode: null,                       // SHK は最上位（OAZ の親になる側）
+            name, fullAddress: item.address || "",
+            geometryJson,
+            pointCount: areaPolyCountPoints(simp),  // 実際に保存した点数
+            pointCountRaw,                          // 簡略化する前の点数（効きを後から検証できるように）
+            simplifyToleranceM: SHK_SIMPLIFY_TOL_M, // 何メートル許容で間引いたか
+          },
+        },
+      };
+    }
+
+    // geometryJson から bbox を出す。索引(areaPolygonIndex/shk)の再計算に使う。
+    function shkBBoxOf(geometryJson) {
+      let g = null;
+      try { g = JSON.parse(geometryJson); } catch (e) { return null; }
+      const polys = (g && g.type === "Polygon") ? [g.coordinates]
+                  : (g && g.type === "MultiPolygon") ? g.coordinates : [];
+      let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+      for (const poly of polys) for (const ring of (poly || [])) for (const p of ring) {
+        const lng = Number(p[0]), lat = Number(p[1]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+        if (lng < minLng) minLng = lng;
+        if (lng > maxLng) maxLng = lng;
+      }
+      return Number.isFinite(minLat) ? { minLat, maxLat, minLng, maxLng } : null;
+    }
+    // ── ここまで SHK 純ロジック ────────────────────────────────────────
+
+    let shkBusy = false;
+    let shkPlan = null;   // ①の結果。②はこれを消費する
+
+    function resetShkPreview() {
+      shkPlan = null;
+      document.getElementById("shkPreview").style.display = "none";
+      document.getElementById("shkResult").style.display = "none";
+      document.getElementById("shkBar").style.display = "none";
+      document.getElementById("shkProg").textContent = "";
+    }
+    window.onShkPrefChange = () => resetShkPreview();
+
+    function setShkBar(ratio) {
+      document.getElementById("shkBar").firstElementChild.style.width
+        = Math.round(Math.max(0, Math.min(1, ratio)) * 100) + "%";
+    }
+
+    // ① 対象確認（dry-run）。ZENRIN も Firestore の書き込みも触らない。
+    //    既存doc の照合だけ読み取りで行い、「新規に取りに行く件数」を出す。
+    window.previewShkImport = async () => {
+      const pref = document.getElementById("shkPrefSel").value;
+      const list = SHK_PREFS[pref];
+      if (!list) { showToast("都道府県を選んでください", "error"); return; }
+      const btn = document.getElementById("shkPreviewBtn");
+      const prog = document.getElementById("shkProg");
+      btn.disabled = true; btn.textContent = "確認中…";
+      resetShkPreview();
+      prog.textContent = "既存docを確認中…";
+      try {
+        // 既存の SHK doc（全県ぶん）を1回読んで、この県のコードと突き合わせる。
+        const snap = await getDocs(query(collection(db, "areaPolygons"), where("level", "==", SHK_LEVEL)));
+        const existing = new Set(snap.docs.map(d => d.id));
+        const todo = list.filter(([c]) => !existing.has(c));
+        const skip = list.length - todo.length;
+        // 実測 1件あたり 0.16〜0.26秒 ＋ 待機300ms ＝ 概ね 0.5秒/件
+        const estSec = Math.max(3, Math.round(todo.length * 0.5));
+        shkPlan = { pref, list, todo, skip };
+        prog.textContent = "";
+        document.getElementById("shkPreviewBody").innerHTML = `
+          <div class="round-pv-title">【${escAttr(pref)} の市区町村界を取り込みます】</div>
+          <div class="round-pv-row"><span>対象の市区町村</span><b>${list.length}件</b></div>
+          <div class="round-pv-row"><span>　取得する（未取込）</span><b>${todo.length}件</b></div>
+          <div class="round-pv-row"><span>　スキップ（取込済み）</span><b>${skip}件</b></div>
+          <div class="round-pv-row"><span>所要の目安</span><b>約${estSec}秒</b></div>
+          <div class="round-pv-note">
+          ※ここまでで Firestore には一切書き込んでいません。書き込み先は areaPolygons（doc ID＝JIS5桁）。<br>
+          ※直列・1件ごとに${SHK_FETCH_WAIT_MS}ms空けて取得します（ゼンリンの指定）。<br>
+          ※取込時に許容${SHK_SIMPLIFY_TOL_M}mで線を簡略化します（実測で点数61%減・最大ずれ1.0m＝最大ズームでも線幅の内側）。<br>
+          ※既に取り込んだ市区町村は取り直しません。入れ直したい場合は先に該当docを消してください。<br>
+          ※最後に索引 areaPolygonIndex/shk を全SHK docから作り直します。</div>`;
+        document.getElementById("shkExecActions").style.display = todo.length ? "" : "none";
+        document.getElementById("shkPreview").style.display = "block";
+      } catch (e) {
+        prog.textContent = "";
+        showToast("対象の確認に失敗しました（" + e.message + "）", "error");
+        console.error("previewShkImport", e);
+      } finally {
+        btn.disabled = false; btn.textContent = "① 対象を確認";
+      }
+    };
+
+    // ② 取込実行。1件ずつ取得→簡略化→setDoc。失敗しても止めずに続け、最後に一覧で見せる。
+    //    ここだけが Firestore への書き込み。
+    window.execShkImport = async () => {
+      if (shkBusy || !shkPlan) return;
+      if (!isAdminUser) { showToast("権限がありません", "error"); return; }
+      const plan = shkPlan;
+      const btn = document.getElementById("shkExecBtn");
+      const prog = document.getElementById("shkProg");
+      const result = document.getElementById("shkResult");
+      shkBusy = true; btn.disabled = true; btn.textContent = "実行中…";
+      document.getElementById("shkBar").style.display = "";
+      setShkBar(0);
+      const done = [], failed = [];
+      let bytes = 0, rawPts = 0, pts = 0;
+      const t0 = Date.now();
+      try {
+        for (let i = 0; i < plan.todo.length; i++) {
+          const [code, name] = plan.todo[i];
+          prog.textContent = `取得中… ${i + 1}/${plan.todo.length}　${name}`;
+          try {
+            const res = await fetch(`${AREAPOLY_API}?cityCode=${code}&level=${SHK_LEVEL}`);
+            const j = await res.json().catch(() => ({}));
+            if (!res.ok || j.error) throw new Error(j.error || `HTTP ${res.status}`);
+            const item = (j.item || [])[0];
+            if (!item) throw new Error("該当なし(hit 0)");
+            const built = shkBuildRow(item, code, name);
+            if (built.skip) { failed.push({ code, name, reason: built.skip }); }
+            else {
+              // 【純キャッシュ】運用データを足さないこと（set＝まるごと上書きなので再取込で消える）。
+              await setDoc(doc(db, "areaPolygons", code), { ...built.row.data, fetchedAt: serverTimestamp() });
+              done.push({ code, name });
+              bytes += built.row.bytes;
+              rawPts += built.row.data.pointCountRaw;
+              pts += built.row.data.pointCount;
+            }
+          } catch (e) {
+            failed.push({ code, name, reason: e.message });   // 1件の失敗で県全体を止めない
+          }
+          setShkBar((i + 1) / plan.todo.length * 0.9);
+          if (i < plan.todo.length - 1) await new Promise(r => setTimeout(r, SHK_FETCH_WAIT_MS));
+        }
+
+        // 索引を作り直す。取込済みの全SHK docから毎回まるごと計算して上書き＝何度実行しても同じ結果。
+        prog.textContent = "索引 areaPolygonIndex/shk を作り直し中…";
+        const idx = await shkRebuildIndex();
+        setShkBar(1);
+
+        prog.textContent = `完了（${((Date.now() - t0) / 1000).toFixed(1)}秒）`;
+        const failHtml = failed.length
+          ? failed.map(f => `<div class="areapoly-skip">・${escAttr(f.name)}（${escAttr(f.code)}）… ${escAttr(f.reason)}</div>`).join("")
+          : `<div class="round-pv-note">失敗・スキップなし</div>`;
+        result.innerHTML = `
+          <div class="round-pv-title">【${escAttr(plan.pref)} 取込完了】</div>
+          <div class="round-pv-row"><span>取り込んだ市区町村</span><b>${done.length}件</b></div>
+          <div class="round-pv-row"><span>失敗・スキップ</span><b>${failed.length}件</b></div>
+          <div class="round-pv-row"><span>書き込み量</span><b>${areaPolyMB(bytes)}</b></div>
+          <div class="round-pv-row"><span>点数（簡略化前 → 後）</span><b>${rawPts.toLocaleString()} → ${pts.toLocaleString()}（${rawPts ? (100 - pts / rawPts * 100).toFixed(0) : 0}%減）</b></div>
+          <div class="round-pv-row"><span>索引 areaPolygonIndex/shk</span><b>${idx.count}件・${(idx.bytes / 1024).toFixed(1)}KB</b></div>
+          ${failHtml}`;
+        result.style.display = "block";
+        showToast(`${plan.pref} の市区町村界を ${done.length}件 取り込みました`);
+        shkPlan = null;   // 同じプレビューで二重実行させない（再実行は①からやり直し）
+        document.getElementById("shkExecActions").style.display = "none";
+      } catch (e) {
+        prog.textContent = "";
+        showToast("取込に失敗しました（" + e.message + "）", "error");
+        console.error("execShkImport", e);
+      } finally {
+        shkBusy = false; btn.disabled = false; btn.textContent = "② 取込を実行";
+      }
+    };
+
+    // 取込済みの SHK doc 全件から bbox 索引を作り直して1docに書く（冪等）。
+    // index.html はこの1docだけを見て「表示範囲に入る市区町村」を決め、
+    // 交差した市区の areaPolygons/{code} だけを取りに行く（全件は読まない）。
+    async function shkRebuildIndex() {
+      const snap = await getDocs(query(collection(db, "areaPolygons"), where("level", "==", SHK_LEVEL)));
+      const codes = {};
+      snap.forEach(d => {
+        const v = d.data();
+        if (!v || !v.geometryJson) return;
+        const b = shkBBoxOf(v.geometryJson);
+        if (!b) return;
+        codes[d.id] = { name: v.name || d.id, pointCount: v.pointCount || 0, ...b };
+      });
+      const count = Object.keys(codes).length;
+      const bytes = new TextEncoder().encode(JSON.stringify(codes)).length;
+      await setDoc(doc(db, "areaPolygonIndex", "shk"),
+                   { level: SHK_LEVEL, count, codes, updatedAt: serverTimestamp() });
+      return { count, bytes };
+    }
 
     // カウンターのハイライト。activeGroupFilter に対応する1枚だけ .active。
     // 総件数は「グループ絞りなし(all)」時にハイライト＝現在“全グループ表示”を示す。
@@ -2689,6 +3054,9 @@
     .areapoly-result { border-top:1px solid #e2e8f0; margin-top:10px; padding-top:8px; max-height:240px; overflow:auto; }
     .areapoly-skip { font-size:11px; color:#b45309; padding:1px 0; }
     .areapoly-warn { font-size:12px; color:#7f1d1d; font-weight:700; }
+    /* 1つのモーダルに SHK(まとめて) と OAZ(1件ずつ) の2系統が並ぶので、見出しで区切る */
+    .areapoly-sec { font-size:12px; font-weight:700; color:#0f766e; background:#f0fdfa;
+      border-left:3px solid #0D9488; padding:5px 8px; margin:14px 0 8px; border-radius:0 4px 4px 0; }
 
     .toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -2882,7 +3250,25 @@
      ②で初めてポリゴン付き取得（実測：緑区105件で約6秒）→ Firestoreへ書き込む。 -->
 <div id="areaPolyModal" class="kouzu-modal" style="display:none">
   <div class="kouzu-modal-box">
-    <div class="kouzu-modal-title">🗾 行政界ポリゴン（大字）を取り込む</div>
+    <div class="kouzu-modal-title">🗾 行政界ポリゴンを取り込む</div>
+    <div class="areapoly-sec">■ 市区町村界（SHK）— 都道府県まとめて（現場の「境」表示はこちら）</div>
+    <label class="kouzu-field">都道府県
+      <select id="shkPrefSel" onchange="onShkPrefChange()"></select>
+    </label>
+    <div class="kouzu-modal-actions">
+      <button class="kouzu-save" id="shkPreviewBtn" onclick="previewShkImport()">① 対象を確認</button>
+    </div>
+    <div class="round-preview" id="shkPreview" style="display:none">
+      <div id="shkPreviewBody"></div>
+      <div class="kouzu-modal-actions" id="shkExecActions">
+        <button class="round-exec" id="shkExecBtn" onclick="execShkImport()">② 取込を実行</button>
+      </div>
+    </div>
+    <div class="areapoly-prog" id="shkProg"></div>
+    <div class="areapoly-bar" id="shkBar" style="display:none"><i></i></div>
+    <div class="areapoly-result" id="shkResult" style="display:none"></div>
+
+    <div class="areapoly-sec">■ 大字界（OAZ）— 1市区町村ずつ（E-1。現場の表示には使っていない）</div>
     <label class="kouzu-field">市区町村（ピンのあるエリアから選択）
       <select id="areaPolySel" onchange="onAreaPolySelChange()"></select>
     </label>

@@ -116,8 +116,9 @@ exports.zenrin = onRequest({ cors: true, secrets: [ZENRIN_KEY] }, async (req, re
 // ═══════════════════════════════════════════════════════════════
 // areaPolygon : 行政界ポリゴン（大字＝OAZ）取得プロキシ
 //
-//   GET ?cityCode=23114          その市区町村の大字を「行政界ポリゴン付き」で返す
-//   GET ?cityCode=23114&count=1  件数だけ返す（ポリゴンなし＝軽い。取込前のdry-run表示用）
+//   GET ?cityCode=23114              その市区町村の大字(OAZ)を「行政界ポリゴン付き」で返す
+//   GET ?cityCode=23114&level=SHK    その市区町村そのものの面を返す（1件。E-2a' の市区境用）
+//   GET ?cityCode=23114&count=1      件数だけ返す（ポリゴンなし＝軽い。取込前のdry-run表示用）
 //
 //   ZENRIN 住所検索API の address_code 前方一致(code_match_type=2)で JIS5桁配下を丸ごと引く。
 //   word 検索と違い曖昧一致が構造的に起きない（word だと無関係な語でも別県を返す実績あり）。
@@ -137,6 +138,13 @@ exports.areaPolygon = onRequest(
   async (req, res) => {
     const cityCode = String(req.query.cityCode || "");
     const countOnly = req.query.count === "1";
+    // 取得する住所レベル。OAZ=大字（E-1）／SHK=市区町村そのもの（E-2a'）。
+    // 上流にそのまま渡す値なので、想定外の文字列は素通しさせない。
+    const level = String(req.query.level || "OAZ").toUpperCase();
+    if (level !== "OAZ" && level !== "SHK") {
+      res.status(400).json({ error: "level は OAZ か SHK を指定してください" });
+      return;
+    }
     // JIS5桁以外は上流に投げない。前方一致なので桁が短いと県まるごとを引いてしまう。
     if (!/^\d{5}$/.test(cityCode)) {
       res.status(400).json({ error: "cityCode は JIS5桁で指定してください" });
@@ -146,7 +154,7 @@ exports.areaPolygon = onRequest(
     const BASE = "https://test-web.zmaps-api.com";
     const url = `${BASE}/search/address`
       + `?address_code=${cityCode}&code_match_type=2`
-      + `&address_level=OAZ`                                  // 本段階は大字のみ（AZCは次段階）
+      + `&address_level=${level}`                             // OAZ=大字 / SHK=市区町村そのもの（AZCは対象外）
       + `&address_polygon=${countOnly ? "false" : "true"}`
       + `&datum=JGD&limit=0,1000`;
 
@@ -187,7 +195,7 @@ exports.areaPolygon = onRequest(
       const items = (data.result && data.result.item) || [];
       res.status(200).json({
         cityCode,
-        level: "OAZ",
+        level,
         hit: (data.result && data.result.info && data.result.info.hit) || items.length,
         count: items.length,
         bytes: Buffer.byteLength(text, "utf8"),

@@ -88,6 +88,18 @@ service cloud.firestore {
       allow read:  if isSignedIn();
       allow write: if isAdmin();
     }
+
+    // 行政界ポリゴンの索引（areaPolygonIndex）。doc ID = "shk"（市区町村界の索引・1docのみ）。
+    //   中身は { codes: { "23114": {name, minLat, maxLat, minLng, maxLng, pointCount} , ... } }。
+    //   index.html は「表示範囲に入る市区町村」をこの索引の bbox だけで判定し、
+    //   交差した市区の areaPolygons/{code} だけを getDoc する（全件は読まない）。
+    //   これも areaPolygons と同じ純キャッシュで、取込のたびに全SHK docから作り直して上書きする。
+    //   運用データを置かないこと（再取込で消える）。
+    //   read/write の境界は areaPolygons と揃える（読み＝ログイン全員／書き＝管理者のみ）。
+    match /areaPolygonIndex/{docId} {
+      allow read:  if isSignedIn();
+      allow write: if isAdmin();
+    }
     // ───────────────────────────────────────────────────────────────
   }
 }
