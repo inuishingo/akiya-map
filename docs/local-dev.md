@@ -90,7 +90,13 @@ npm run emu
 python -m http.server 8000
 ```
 
-→ ブラウザで **http://localhost:8000/admin.html**
+→ ブラウザで **http://localhost:8000/admin.html?emu=1**
+
+> **`?emu=1` は必須。** 2026-09-08 から、エミュレータに向くのは `localhost` **かつ** `?emu=1` の時だけになった
+> （opt-in）。付けずに開くと**本番 Firestore** に繋がる。以前は localhost なら自動でエミュレータだったが、
+> 「本番データを目視したいのに空のエミュレータに繋がり、`admins/{uid}` が無くて index.html へ飛ばされる」
+> 事故が起きたため既定を本番へ戻した。本番URL（GitHub Pages）では hostname 判定が残るので、
+> `?emu=1` を付けてもエミュレータには向かない。
 
 ---
 
@@ -129,7 +135,7 @@ node scripts/verify-emu-guard.mjs admin.html
 エミュレータの Firestore は**空**なので、そのままログインすると
 `admins/{uid}` が無い＝管理者と判定されず `index.html` に飛ばされる。
 
-1. 一度 http://localhost:8000/admin.html でログインを試す（`index.html` に飛ばされてよい）
+1. 一度 http://localhost:8000/admin.html?emu=1 でログインを試す（`index.html` に飛ばされてよい）
 2. ブラウザの DevTools コンソールで自分の uid を出す
 
    ```js
@@ -336,7 +342,7 @@ firebase deploy --only functions:areaPolygon
 | 症状 | 原因と対処 |
 |---|---|
 | `npm run emu` が Java で落ちる | JDK 未インストール、または PowerShell を開き直していない（0-1） |
-| 橙色のバーが出ない | `127.0.0.1:8000` や `localhost:8000` 以外で開いている。**本番に繋がっているので書き込まない** |
+| 橙色のバーが出ない | `?emu=1` を付けていない、または `localhost:8000` / `127.0.0.1:8000` 以外で開いている。**本番に繋がっているので書き込まない** |
 | ログインすると `index.html` に飛ばされる | エミュレータに `admins/{uid}` が無い（手順3）。エミュレータを再起動すると消えるので都度必要 |
 | `areaPolygon` が `upstream_error` | ZENRIN_KEY を解決できていない（手順5） |
 | ポートが使用中 | `firebase.json` の `emulators` を直す。**直したら `admin.html` の `EMU_FIRESTORE_PORT` / `EMU_FUNCTIONS_PORT` も合わせる** |
