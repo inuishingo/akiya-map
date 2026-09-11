@@ -30,3 +30,15 @@ admin.prod.html
 # 認証情報を含む運用スクリプト（追跡しない）
 scripts/
 scripts/__pycache__/
+
+# 勤怠K便の設計メモ。従業員の待遇（時給・通勤手当）と実名を扱う前提の文書なので
+# public リポジトリには置かない。設計書はプロジェクト側で管理する。
+# ※docs/ ごとは無視しない（公開してよい資料を将来ここに置くため）。
+docs/attendance-design.md
+
+# ローカルの作業ファイル（追跡しない）
+# firestore.rules.bak は上の firestore.rules.*.bak に一致しない（中間セグメントが無い）ため個別指定。
+firestore.rules.bak
+index.mock.html
+inspect_lines.py
+validate_script.py
