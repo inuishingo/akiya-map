@@ -2017,8 +2017,11 @@
         // 「拾った情報(発見日/担当者)」と「出力した情報」を分けるためカード末尾に独立行で出す。
         const exported = !!p.exportedAt;
         const exportedByName = p.exportedBy ? staffName(p.exportedBy) : "";
-        const exportedMD = p.exportedAt
-          ? `${Number(p.exportedAt.slice(5,7))}/${Number(p.exportedAt.slice(8,10))}` : "";
+        // exportedAt は純UTCのISO文字列。直接sliceするとJST 00:00〜08:59 の出力が前日になる
+        // （京都の事務員は始業が9時前で、毎朝1本目が必ずズレていた）。日付の入口は jstYmd() 一本に統一。
+        const exportedYmd = p.exportedAt ? jstYmd(p.exportedAt) : "";
+        const exportedMD = exportedYmd
+          ? `${Number(exportedYmd.slice(5,7))}/${Number(exportedYmd.slice(8,10))}` : "";
         // Googleマップの通常マップ表示で開く。座標があれば座標(ズレない)、無ければ住所でフォールバック。
         const gmapUrl = (p.lat != null && p.lng != null)
           ? `https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lng}`
@@ -2658,7 +2661,8 @@
       ];
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "空家マップ");
-      XLSX.writeFile(wb, `空家マップ_${new Date().toISOString().slice(0,10)}.xlsx`);
+      // ファイル名の日付もJST固定。UTCのままだと 9時前の出力が前日名のファイルになる（バッジと同型のズレ）。
+      XLSX.writeFile(wb, `空家マップ_${jstYmd(new Date().toISOString())}.xlsx`);
       // 出力対象に exportedAt を記録（一覧で出力済みグレーアウト表示に使う）。
       // ファイルは既にDL済みなので書き込み失敗は握りつぶし、出力自体は止めない。
       const exportedAt = new Date().toISOString();
