@@ -190,6 +190,14 @@
     let gridCellWidgets = new Map(); // gridId -> { poly, fill }（fillは年色の変化検出用）
     let surveyedCells = {};          // gridId -> Firestoreミラー（調査済みマス）
 
+    // ===== グリッド編集（事務員の代理入力）=====
+    // ★localStorage に保存しない。開き直すたび必ず OFF から始める（触るつもりが無い時に触れる事故を防ぐ）。
+    let gridEditMode = false;
+    const gridToggleLock = new Set(); // 同一タップの二重処理防止（index から移植）。
+                                      // 塗りポリゴンの click と map の click は両方発火するため必須。
+    let gridUndoStack = [];           // 編集操作の履歴（LIFO）
+    const GRID_UNDO_MAX = 50;         // index の UNDO_MAX と同じ
+
     // 全12種。index.html と同一のキー・ラベル・色で統一。
     // ※他社所有/媒介は STATUS ではなく pin.otherCompany(boolean) で持つ（状態と独立の属性）。
     const STATUS = {
@@ -427,6 +435,9 @@
       } else {
         document.getElementById("loginScreen").style.display = "flex";
         document.getElementById("adminScreen").style.display = "none";
+        // 共有端末で担当が入れ替わったとき、前の人の操作が取消対象に残らないよう捨てる。
+        gridUndoStack = [];
+        setGridEditMode(false);
       }
     });
 
@@ -454,6 +465,17 @@
       const s = GRID.lat0 + row * GRID_DLAT, n = GRID.lat0 + (row + 1) * GRID_DLAT;
       const w = GRID.lng0 + col * GRID_DLNG, e = GRID.lng0 + (col + 1) * GRID_DLNG;
       return [ new ZDC.LatLng(s, w), new ZDC.LatLng(n, w), new ZDC.LatLng(n, e), new ZDC.LatLng(s, e) ];
+    }
+    // 座標→マス／マス→中心座標。index.html と同一実装。
+    // 塗りポリゴンのクリックは「中心座標を出して gridCellOf に戻す」経路を通るので、
+    // この2つは必ず往復で同じ gridId に戻ること（row/col が負の京都エリアでも成立が必要）。
+    function gridCellOf(lat, lng) {
+      const row = Math.floor((lat - GRID.lat0) / GRID_DLAT);
+      const col = Math.floor((lng - GRID.lng0) / GRID_DLNG);
+      return { row, col, id: "G_" + row + "_" + col };
+    }
+    function gridCellCenter(row, col) {
+      return { lat: GRID.lat0 + (row + 0.5) * GRID_DLAT, lng: GRID.lng0 + (col + 0.5) * GRID_DLNG };
     }
 
     // 調査済みマスをリアルタイム購読（現場の記録が即・管理画面に反映）。
@@ -559,9 +581,12 @@
         //   確認ダイアログに古い担当者・古い調査日が出る（消す対象の doc ID はズレない）。
         //   実行時に surveyedCells から引き直すことで、常に最新を渡す。
         poly.addEventListener("click", () => {
+          if (!gridEditMode) return;             // 編集OFF では無反応（従来の「常時 confirm 削除」は廃止）
           const latest = surveyedCells[id];
           if (!latest) return;                   // 既に解除済み＝無反応（ウィジェット削除待ちの保険）
-          resetGridCell(latest);
+          // 中心座標に戻してから toggleGridCell へ。map の click も同時に来るが gridToggleLock が吸収する。
+          const c = gridCellCenter(latest.row, latest.col);
+          toggleGridCell(c.lat, c.lng);
         });
         map.addWidget(poly); gridCellWidgets.set(id, { poly, fill: w.fill });
       }
@@ -580,7 +605,145 @@
       el.style.display = "flex";
     }
 
+    // ===== グリッド編集（塗る／消す）=====
+    // 事務員の代理入力を admin だけで完結させるための導線。従来は index.html（現場用）を
+    // 開いて代理入力していた（2026-08-23 に115マス）。編集モードONの間だけマスがタップに反応する。
+    //
+    // 【確認ダイアログは出さない】連続作業では形骸化して押すだけになるため。
+    //   代わりに Undo（↩ グリッド取消）で直前の1操作を戻せるようにしてある。
+    // 【書き込む内容は index.html の toggleGridCell と同一】片方だけ形が変わると
+    //   同じコレクションに2種類の構造が混ざる。surveyedDate の UTC バグ（JST 00:00〜08:59 が
+    //   前日になる）も、ここで直すと index と挙動が割れるので別便で両ファイル同時に直す。
+    async function toggleGridCell(lat, lng) {
+      if (!gridEditMode) return;
+      const cell = gridCellOf(lat, lng);
+      if (gridToggleLock.has(cell.id)) return;        // 同一タップの二重処理防止（polygon+map の二重発火）
+      gridToggleLock.add(cell.id);
+      setTimeout(() => gridToggleLock.delete(cell.id), 350);
+      const exist = surveyedCells[cell.id];
+      // 【他店ガード】記録済みのマスだけ自店チェックできる。
+      //   未記録の白いマスは「そのマスがどの拠点のエリアか」を判定する手段が無い
+      //   （エリアポリゴンとの point-in-polygon が要る＝C-3の範囲）。
+      //   誤って塗っても余分なマスが1つ増えるだけ＝安全側なので、白いマスは制限しない。
+      //   rules 側では縛っていない（deploy を避けるため。防ぎたいのは破壊ではなく誤操作）。
+      if (exist && exist.branch !== myBranch) {
+        showToast(`他店のエリアのマスです（${exist.branch}店）`, "error");
+        return;
+      }
+      const ref = doc(db, "survey_grids", cell.id);
+      const myEmail = auth.currentUser?.email || "";
+      if (exist) {
+        const prev = { ...exist };                    // 復元用スナップショット兼ロールバック用
+        delete surveyedCells[cell.id];
+        redrawGrid();                                 // 楽観更新（差分更新なので1マスぶんしか動かない）
+        try {
+          await deleteDoc(ref);
+          // 自分が塗ったマスだけ復元できる（rules: create は surveyedBy == token.email 固定）。
+          // 他人のマスは復元用データをあえて持たない＝「復元できそう」に見せない。
+          gridUndoPush(prev.surveyedBy === myEmail
+            ? { kind: "erase", gid: cell.id, data: prev }
+            : { kind: "erase-foreign", gid: cell.id, who: prev.surveyedBy });
+          showToast("調査済みを解除：" + cell.id);
+        } catch (e) {
+          surveyedCells[cell.id] = prev; redrawGrid();
+          showToast("解除の保存に失敗しました", "error");
+        }
+      } else {
+        const data = {
+          gridId: cell.id, row: cell.row, col: cell.col,
+          surveyedDate: new Date().toISOString().slice(0, 10), // 調査日（※UTCバグ既知・別便で index と同時に直す）
+          surveyedBy: myEmail,                                  // rules の token.email と一致必須
+          recordedAt: new Date().toISOString(),                 // 記録日時（年色の判定元）
+          branch: myBranch,                                     // ログイン管理者の所属店（loadMyBranchで確定）
+          gridVersion: GRID.version,
+        };
+        surveyedCells[cell.id] = data;
+        redrawGrid();
+        try {
+          await setDoc(ref, data);
+          gridUndoPush({ kind: "paint", gid: cell.id });
+          showToast("調査済みに記録：" + cell.id);
+        } catch (e) {
+          delete surveyedCells[cell.id]; redrawGrid();
+          showToast("記録の保存に失敗しました", "error");
+        }
+      }
+    }
+
+    // ===== グリッド編集の Undo =====
+    // 積むのは3種類。
+    //   {kind:"paint",         gid}        … 塗った   → 取消は delete（自分のマスなので必ず通る）
+    //   {kind:"erase",         gid, data}  … 自分のマスを消した → 取消は元の値のまま setDoc で完全復元
+    //   {kind:"erase-foreign", gid, who}   … 他人のマスを消した → 復元不可（rules の create で弾かれる）
+    // erase の data は削除直前のスナップショット。recordedAt を元のまま書き戻すのが肝で、
+    // 新しい時刻で作り直すと年色が変わる（年跨ぎだと別の色になる）。
+    function gridUndoPush(entry) {
+      gridUndoStack.push(entry);
+      if (gridUndoStack.length > GRID_UNDO_MAX) gridUndoStack.shift();   // 古い方から捨てる
+      updateGridUndoBtn();
+    }
+    function updateGridUndoBtn() {
+      const b = document.getElementById("gridUndoBtn");
+      if (b) b.disabled = gridUndoStack.length === 0;
+    }
+    // 直前の1操作だけを戻す。復元できないエントリに当たったら、そこで止めてトーストを出す。
+    // ※index のピンUndoは「既に消えたピンを飛ばす」ために次へ連鎖するが、ここで連鎖すると
+    //   「取消を1回押したら別のマスが変わった」になりユーザーの予測を裏切るので連鎖させない。
+    window.undoGridEdit = async () => {
+      const top = gridUndoStack.pop();
+      updateGridUndoBtn();
+      if (!top) { showToast("戻せる操作がありません", "warn"); return; }
+      if (top.kind === "erase-foreign") {
+        showToast("他の人が記録したマスは元に戻せません。塗り直すと記録者が変わります", "warn");
+        return;
+      }
+      const ref = doc(db, "survey_grids", top.gid);
+      try {
+        if (top.kind === "paint") {
+          await deleteDoc(ref);
+          delete surveyedCells[top.gid];
+        } else {
+          await setDoc(ref, top.data);      // 元の値をそのまま書き戻す（recordedAt も surveyedDate も不変）
+          surveyedCells[top.gid] = top.data;
+        }
+        redrawGrid();
+        showToast("1件戻しました：" + top.gid);
+      } catch (e) {
+        gridUndoStack.push(top);            // 失敗したら積み直す（押し直せば再試行できる）
+        updateGridUndoBtn();
+        showToast("取消に失敗しました（権限/通信）", "error");
+      }
+    };
+
+    // ===== グリッド編集モードの ON/OFF =====
+    // グリッドが見えていないのに触れるのは事故のもとなので、gridMode OFF では入れない。
+    // 反社/NG登録・公図取得とは排他（地図クリックの奪い合いになるため）。
+    // 用途地域は排他にしない＝編集が先勝ちして属性取得を抑止する（index の gridMode と同じ扱い）。
+    function applyGridEditUI() {
+      const btn = document.getElementById("gridEditBtn");
+      if (btn) {
+        btn.classList.toggle("active", gridEditMode);
+        btn.textContent = gridEditMode ? "✏ 編集中" : "✏ グリッド編集";
+      }
+      const banner = document.getElementById("gridEditBanner");
+      if (banner) banner.style.display = gridEditMode ? "block" : "none";
+      const undoBtn = document.getElementById("gridUndoBtn");
+      if (undoBtn) undoBtn.style.display = gridEditMode ? "" : "none";
+      const mapEl = document.getElementById("map");
+      if (mapEl) mapEl.style.cursor = (gridEditMode || kouzuMode || regMode) ? "crosshair" : "";
+      updateGridUndoBtn();
+    }
+    function setGridEditMode(on) {
+      if (on && !gridMode) { showToast("先に「▦ グリッド」をONにしてください", "warn"); return; }
+      gridEditMode = !!on;
+      if (gridEditMode) { setRegMode(false); setKouzuMode(false); }   // 反社/NG登録・公図取得と排他
+      applyGridEditUI();
+    }
+    window.toggleGridEditMode = () => setGridEditMode(!gridEditMode);
+
     // ===== グリッド色リセット（admin専用・1マス）=====
+    // ★編集便で toggleGridCell に置き換え済み・現在どこからも呼ばれていない。
+    //   撤去は staffColor 一式と同じ便で（編集モードを戻す判断が出たときに1行で復旧できるよう残す）。
     // 色付き＝調査済みマスの survey_grids doc を削除＝色を未調査に戻す。
     // 枠は GRID から計算描画なので doc 削除でも残る。現場 index 側も onSnapshot で色が追従消去。
     // admin は塗る側ではないので「消す」専用（無色マスにはハンドラを付けていない）。
@@ -606,6 +769,8 @@
         btn.classList.toggle("active", gridMode);
         btn.textContent = gridMode ? "▦ グリッドON" : "▦ グリッド";
       }
+      // マスが見えないのに触れる状態を作らない：グリッドを消したら編集も必ず終わる。
+      if (!gridMode && gridEditMode) setGridEditMode(false);
       redrawGrid();
     };
 
@@ -650,6 +815,7 @@
             map.addEventListener("idle", function(){ redrawActiveLayers(); });
             map.addEventListener("click", function(e){
               if (!e || !e.latlng) return;
+              if (gridEditMode) { toggleGridCell(e.latlng.lat, e.latlng.lng); return; }   // 編集が最優先（用途地域より先勝ち）
               if (regMode) { registerFromClick(e.latlng); return; }   // 反社/NG登録モード優先
               if (kouzuMode) { openKouzuModal(e.latlng); return; }    // 公図取得モード（regModeと排他）
               if (youtoOn) queryYouto(e.latlng);
@@ -2589,6 +2755,7 @@
     function setRegMode(on) {
       regMode = !!on;
       if (regMode && kouzuMode) setKouzuMode(false);   // 公図取得モードと排他（同時ONにしない）
+      if (regMode && gridEditMode) setGridEditMode(false);   // グリッド編集とも排他（地図クリックの奪い合い）
       applyRegModeUI();
     }
     // ボタンから呼ぶトグル。旧: onclick="toggleRegMode(!regMode)" は regMode が module スコープ変数のため
@@ -2621,6 +2788,7 @@
     function setKouzuMode(on) {
       kouzuMode = !!on;
       if (kouzuMode && regMode) setRegMode(false);   // 反社/NG登録モードと排他
+      if (kouzuMode && gridEditMode) setGridEditMode(false);   // グリッド編集とも排他
       applyKouzuModeUI();
     }
     window.toggleKouzuMode = () => setKouzuMode(!kouzuMode);
@@ -2877,6 +3045,12 @@
       border: 1px solid #334155; color: #94a3b8; font-size: 13px; font-weight: 700; cursor: pointer;
     }
     .grid-btn.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+    /* 編集モードは「押せる状態」と一目で区別が要るので、表示ONの青とは別の琥珀色にする */
+    .grid-btn.grid-edit.active { background: #d97706; border-color: #d97706; color: #fff; }
+    /* 編集中の帯。ボタンの色変化だけに頼らず、地図の上端に常時出す */
+    .grid-edit-banner { position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:25;
+      background:rgba(217,119,6,.96);color:#fff;border-radius:8px;padding:6px 14px;
+      font-size:13px;font-weight:700;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,.4); }
     /* データ重畳トグル（用途地域/地番）。グリッドボタンと同系。ON時に色付け */
     .layer-btn { padding:7px 14px;border-radius:6px;background:transparent;border:1px solid #334155;
       color:#94a3b8;font-size:13px;font-weight:700;cursor:pointer; }
@@ -3211,6 +3385,10 @@
     <!-- 行政界ポリゴン取込（E-1・管理者専用）。周回管理と同じく既定 display:none。 -->
     <button class="layer-btn areapoly-btn" id="areaPolyBtn" style="display:none" onclick="openAreaPolyModal()" title="大字(OAZ)の行政界ポリゴンをゼンリンから取り込む（管理者専用）">🗾 行政界取込</button>
     <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
+    <!-- グリッド編集（代理入力）。既定OFF・localStorageに保存しない＝開き直すたびOFFから始まる。 -->
+    <button class="grid-btn grid-edit" id="gridEditBtn" onclick="toggleGridEditMode()" title="ONの間だけマスをタップで記録／解除（確認ダイアログなし・↩で取消）">✏ グリッド編集</button>
+    <!-- 「↩ 出力取消」(Excel) と取り違えると被害の種類が違うので名前を分ける。編集中のみ表示。 -->
+    <button class="csv-btn undo-btn" id="gridUndoBtn" style="display:none" onclick="undoGridEdit()" title="直前のマス操作を1つ戻す" disabled>↩ グリッド取消</button>
     <button class="layer-btn youto" id="youtoBtn" onclick="toggleYouto()" title="用途地域 色分け＋クリックで属性">用途地域</button>
     <button class="layer-btn" id="chibanBtn" onclick="toggleChiban()" title="地番（ブルーマップ）重畳">地番</button>
     <!-- 公図取得済みマークの表示切替。既定OFF（active を付けない＝kouzuOn の初期値と揃える） -->
@@ -3293,6 +3471,7 @@
       </div>
     </div>
     <div id="map"></div>
+    <div id="gridEditBanner" class="grid-edit-banner" style="display:none">✏ グリッド編集中：マスをタップで記録／解除</div>
     <div id="gridLegend" class="grid-legend" style="display:none"></div>
     <div id="youtoInfo" class="youto-info" style="display:none"></div>
     <div id="kouzuInfo" class="kouzu-info" style="display:none"></div>
