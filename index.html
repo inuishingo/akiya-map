@@ -138,7 +138,7 @@
     //   重ね順は常にピンが上（DOMがcanvasの上）で、作成順にもzIndexにも依存しない。
     let gridLineWidgets = [];         // ZDC.Polyline（可視範囲が変わった時だけ引き直す）
     let gridLineRangeKey = null;      // 罫線を引いた時の可視範囲。同じなら触らない
-    let gridCellWidgets = new Map();  // gridId -> { poly, fill }（fillは担当者色の変化検出用）
+    let gridCellWidgets = new Map();  // gridId -> { poly, fill }（fillは年色の変化検出用）
     let surveyedCells = {};           // gridId -> Firestoreミラー（調査済みマス）
     const gridToggleLock = new Set(); // 同一マスの二重トグル防止（map/polygon両クリック対策）
 
@@ -215,6 +215,28 @@
     function staffColor(email) {
       return staffColorMap[email] || STAFF_DEFAULT_COLOR;
     }
+
+    // ===== マスの年色（グリッド専用）=====
+    // マスの色は「いつ調査したか」の年で決める。誰が塗ったかでは決めない
+    // （事務員の代理入力があり「塗った人」≠「回った人」。グリッドの目的は抜けの把握）。
+    // 年の入口は jstYmd() 一本。surveyedDate は使わない：UTCのまま保存されており
+    // JST 00:00〜08:59 の記録が前日になる＝年跨ぎで前年に化ける。
+    // ※この4関数は admin.html と同一実装（差分で一致を確認できるようにしている）。
+    function jstDate(v) {
+      if (!v) return null;
+      const t = (typeof v.toDate === "function") ? v.toDate().getTime() : Date.parse(v);
+      if (Number.isNaN(t)) return null;
+      return new Date(t + 9 * 3600 * 1000);
+    }
+    function jstYmd(v) {
+      const d = jstDate(v);
+      return d ? d.toISOString().slice(0, 10) : "";
+    }
+    // 年が取れないマス（recordedAt 無し/不正）は "" を返す。呼び出し側で塗らない。
+    function jstYear(v) { return jstYmd(v).slice(0, 4); }
+    // 年→色は Number(year) % 10 の固定割当。年が変わっても既存マスの色は動かない。
+    // 10年周期（2026と2036が同色）だが、10年前のマスが残る運用はない。2026 = #4D7C0F。
+    function yearColor(year) { return STAFF_PALETTE[Number(year) % 10]; }
 
     // ===== 調査周回（round）— C-1 基盤 =====
     // 周回はエリア（市区町村）ごとに独立管理。areaKey は pins.areaCode(JIS5桁)を使う（旧cityWardKey正規表現は不使用）。
@@ -627,10 +649,13 @@
       Object.values(surveyedCells).forEach(cell => {
         if (cell.row == null || cell.col == null) return;
         if (cell.row < rMin - 1 || cell.row > rMax + 1 || cell.col < cMin - 1 || cell.col > cMax + 1) return;
-        // 担当者色（null/未登録はdefaultにフォールバック）。色が変われば作り直す必要があるので持つ。
-        want.set("G_" + cell.row + "_" + cell.col, { cell, fill: staffColor(cell.surveyedBy) });
+        // 年色。recordedAt が読めないマスは塗らない（未記録と同じ扱いになるので warn を出す）。
+        // 色が変われば作り直す必要があるので fill を持つ（差分更新の判定に使う）。
+        const y = jstYear(cell.recordedAt);
+        if (!y) { console.warn("[grid] recordedAt が読めないマスをスキップ:", cell.gridId || `G_${cell.row}_${cell.col}`); return; }
+        want.set("G_" + cell.row + "_" + cell.col, { cell, fill: yearColor(y) });
       });
-      // 消す分：範囲外になった／解除された／担当者色が変わった
+      // 消す分：範囲外になった／解除された／年色が変わった
       for (const [id, ent] of Array.from(gridCellWidgets)) {
         const w = want.get(id);
         if (w && w.fill === ent.fill) continue;   // 変化なし＝触らない（ここが効果の本体）

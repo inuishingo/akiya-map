@@ -262,6 +262,19 @@
       return staffColorMap[email] || STAFF_DEFAULT_COLOR;
     }
 
+    // ===== マスの年色（グリッド専用）=====
+    // マスの色は「いつ調査したか」の年で決める。誰が塗ったかでは決めない
+    // （事務員の代理入力があり「塗った人」≠「回った人」。グリッドの目的は抜けの把握）。
+    // 年の入口は jstYmd() 一本。surveyedDate は使わない：UTCのまま保存されており
+    // JST 00:00〜08:59 の記録が前日になる＝年跨ぎで前年に化ける。
+    // ※この2関数は index.html と同一実装（差分で一致を確認できるようにしている）。
+    //   jstDate / jstYmd は admin では既存の定義（下方）をそのまま使う。
+    // 年が取れないマス（recordedAt 無し/不正）は "" を返す。呼び出し側で塗らない。
+    function jstYear(v) { return jstYmd(v).slice(0, 4); }
+    // 年→色は Number(year) % 10 の固定割当。年が変わっても既存マスの色は動かない。
+    // 10年周期（2026と2036が同色）だが、10年前のマスが残る運用はない。2026 = #4D7C0F。
+    function yearColor(year) { return STAFF_PALETTE[Number(year) % 10]; }
+
     // ===== 調査周回（round）— C-1 基盤 =====
     function areaKey(p){ return (p && p.areaCode) || null; }   // areaCode(JIS5桁)ベース。旧cityWardKey(正規表現)は不使用
     let roundState = {};      // `${branch}__${areaKey}` -> {currentRound, rounds}
@@ -455,7 +468,7 @@
     function redrawGrid() {
       if (!map) return;
       clearGridWidgets();
-      if (!gridMode) return;
+      if (!gridMode) { renderGridLegend(null); return; }   // グリッドOFFでは凡例も消す
       const b = map.getLatLngBounds();
       const sw = b.getSouthWest(), ne = b.getNorthEast();
       const rMin = Math.floor((sw.lat - GRID.lat0) / GRID_DLAT);
@@ -480,10 +493,15 @@
           map.addWidget(ln); gridWidgets.push(ln);
         }
       }
+      const yearsInView = new Set();                   // 凡例に出す「いま見えている年」
       Object.values(surveyedCells).forEach(cell => {
         if (cell.row == null || cell.col == null) return;
         if (cell.row < rMin - 1 || cell.row > rMax + 1 || cell.col < cMin - 1 || cell.col > cMax + 1) return;
-        const fillCol = staffColor(cell.surveyedBy);   // 担当者色（null/未登録はdefaultにフォールバック）
+        // 年色。recordedAt が読めないマスは塗らない（未記録と同じ扱いになるので warn を出す）。
+        const y = jstYear(cell.recordedAt);
+        if (!y) { console.warn("[grid] recordedAt が読めないマスをスキップ:", cell.gridId || `G_${cell.row}_${cell.col}`); return; }
+        yearsInView.add(y);
+        const fillCol = yearColor(y);
         const poly = new ZDC.Polygon(
           gridCellCorners(cell.row, cell.col),
           { fill: fillCol, fillOpacity: 0.30, stroke: fillCol, strokeWidth: 1 }
@@ -492,6 +510,19 @@
         poly.addEventListener("click", () => resetGridCell(cell));
         map.addWidget(poly); gridWidgets.push(poly);
       });
+      renderGridLegend(yearsInView);
+    }
+
+    // 表示範囲に実在する年だけを出す最小の凡例。新しい年が左。
+    // 色が急に変わると問い合わせが来るので「何色が何年か」だけ示す。
+    // 年の並び順・多年レイアウトの作り込みは C便で作り直す前提（ここでは折り返すだけ）。
+    function renderGridLegend(years) {
+      const el = document.getElementById("gridLegend");
+      if (!el) return;
+      const ys = years ? [...years].sort().reverse() : [];
+      if (!gridMode || ys.length === 0) { el.style.display = "none"; return; }
+      el.innerHTML = ys.map(y => `<span><i style="background:${yearColor(y)}"></i>${y}</span>`).join("");
+      el.style.display = "flex";
     }
 
     // ===== グリッド色リセット（admin専用・1マス）=====
@@ -2798,6 +2829,11 @@
     .youto-info { position:absolute;top:10px;right:10px;max-width:300px;z-index:20;
       background:rgba(15,23,42,.94);color:#e2e8f0;border:1px solid #334155;border-radius:8px;
       padding:10px 12px;font-size:12px;line-height:1.6;box-shadow:0 4px 14px rgba(0,0,0,.4); }
+    /* グリッドの年色凡例（最小版）。本格版は C便で作り直す前提なので作り込まない。 */
+    .grid-legend { position:absolute;left:10px;bottom:10px;z-index:20;display:flex;flex-wrap:wrap;gap:8px;max-width:60%;
+      background:rgba(15,23,42,.94);color:#e2e8f0;border:1px solid #334155;border-radius:8px;
+      padding:6px 10px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.4); }
+    .grid-legend i { display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px; }
     .youto-info .yi-close { float:right;cursor:pointer;color:#94a3b8;font-weight:700;margin-left:8px; }
     .youto-info b { color:#fbbf24; }
     .logout-btn {
@@ -3200,6 +3236,7 @@
       </div>
     </div>
     <div id="map"></div>
+    <div id="gridLegend" class="grid-legend" style="display:none"></div>
     <div id="youtoInfo" class="youto-info" style="display:none"></div>
     <div id="kouzuInfo" class="kouzu-info" style="display:none"></div>
   </div>
