@@ -61,6 +61,75 @@ service cloud.firestore {
     }
     // ───────────────────────────────────────────────────────────────
 
+    // ───────────────────────────────────────────────────────────────
+    // 勤怠打刻（attendance・K便 K-1）。doc ID = `${branch}__${email}__${YYYY-MM-DD}`（date は JST）。
+    //   事務所のタイムカードを index.html の「開始／終了」チップに置き換える第1段。
+    //   K-1 が持つのは打刻2つ（開始・終了）だけ。休憩・修正UIは K-2、給与計算/Excel は K-3。
+    //   データ構造と経緯は docs/attendance-design.md。
+    //
+    //   read   : 本人（メール一致）または管理者。
+    //            ※ 本人は自分の doc を getDoc するだけで、list（クエリ）は投げない。
+    //              メール一致条件は list では docごとに評価できないため、一覧を引けるのは admin だけ。
+    //   create : 打刻できるのは調査員アカウントのみ（isSurveyor）。当日(JST)・自分のメール・inAt だけ。
+    //   update : 本人は「outAt がまだ null のときに outAt を1回だけ入れる」のみ。
+    //            触れてよいのは outAt / outLoc / updatedAt の3つだけ＝inAt・date・email・branch は不変。
+    //            admin は全フィールド可（打刻忘れの修正＝K-2）。
+    //   delete : K-1 の間だけ admin に許す（本番で行うテスト打刻の後始末用）。
+    //            ★K-2 で修正UI（理由必須・履歴 corrections）が入った時点で `if false` に戻すこと。
+    //
+    //   時刻は必ず serverTimestamp()。端末時計は使わせない（request.time との一致で構造的に強制する）。
+    match /attendance/{docId} {
+      // JSTの「今日」(YYYY-MM-DD)。rules に日付整形が無いので +9h してから桁を組み立てる。
+      function jstNow()   { return request.time + duration.value(9, 'h'); }
+      function pad2(n)    { return n < 10 ? '0' + string(n) : string(n); }
+      function todayJst() {
+        return string(jstNow().year()) + '-' + pad2(jstNow().month()) + '-' + pad2(jstNow().day());
+      }
+
+      // 打刻できる人＝調査員（K-1 の暫定判定）。
+      //   @hm.com / @kyoto-hm.com のうち、営業共有アカウントを個別に除外する。
+      //   事務・営業・管理（@housemarket.com / @kyoto.com / @nagoya.com）はドメインで落ちる。
+      //   ※ K-3 で staff マスタができたら「staff/{email} に登録がある人」判定へ切り替え、
+      //     このメール判定は削除する（ドメインの増減を rules 改訂で追いかけない）。
+      //   ※ index.html 側の canPunch() と同じ条件。片方だけ変えないこと。
+      function isSurveyor() {
+        return request.auth.token.email.matches('.*@(hm|kyoto-hm)\\.com')
+               && !(request.auth.token.email in ['kyotoman@kyoto-hm.com']);
+      }
+
+      allow read: if isSignedIn()
+                  && (resource.data.email == request.auth.token.email || isAdmin());
+
+      allow create: if isSignedIn()
+                    && isSurveyor()
+                    && request.resource.data.email == request.auth.token.email
+                    && request.resource.data.date  == todayJst()
+                    && docId == request.resource.data.branch + '__'
+                              + request.resource.data.email  + '__'
+                              + request.resource.data.date
+                    && request.resource.data.inAt  == request.time   // serverTimestamp() 以外を弾く
+                    && request.resource.data.outAt == null;          // 開始時点で終了は入れさせない
+
+      allow update: if isSignedIn()
+                    && (isAdmin() || (
+                         resource.data.email == request.auth.token.email
+                      && resource.data.outAt == null                 // 二重終了は rules 側でも止める
+                      && request.resource.data.outAt == request.time // serverTimestamp() 以外を弾く
+                      && request.resource.data.diff(resource.data)
+                           .affectedKeys().hasOnly(['outAt', 'outLoc', 'updatedAt'])
+                    ));
+
+      allow delete: if isAdmin();
+    }
+
+    // 社員マスタ（staff）。doc ID = メールアドレス。
+    //   K-1 では読むだけ（勤怠一覧の氏名表示に使い、未登録なら displayNames の name へフォールバック）。
+    //   登録・時給等の項目追加は K-3。書き込みは管理者のみ。
+    match /staff/{email} {
+      allow read:  if isSignedIn();
+      allow write: if isAdmin();
+    }
+
     // 公図取得済みマーク（kouzu_marks）。法務局/登記情報提供サービスで公図を取得した地点の記録。
     //   二重取得の防止が目的。read も isAdmin にすることで調査員(index.html)からは購読しても読めない
     //   ＝完全に管理者専用。公図ファイル本体は保持しない（マークとメタ情報のみ）。

@@ -106,6 +106,13 @@
     let checkedIds = new Set();
     let selectedPinId = null;
     let myBranch = "名古屋";     // ログイン管理者の所属店(displayNames[email].branch)。読取前は名古屋を既定に。
+
+    // 各店の座標（拠点）。地図の初期中心と、勤怠の「店から◯m」で同じ値を使う。
+    // ここが単一ソース。initMap 側に座標を直書きしない（二重管理にすると片方だけずれる）。
+    const OFFICE_LL = {
+      "京都":   { lat: 34.957969663952724, lng: 135.76069814005794 },   // 京都店
+      "名古屋": { lat: 35.12665773554829,  lng: 136.92989789393815 },   // 名古屋店（既定）
+    };
     let isAdminUser = false;    // admins/{uid} 存在＝管理者。周回管理UIの表示可否に使う（fail-closed・既定false）
     // 反社/NG登録（管理画面専用）
     let regMode = false;        // 地図クリックで反社/NG登録するモード
@@ -392,6 +399,8 @@
         if (rmBtn && isAdminUser) rmBtn.style.display = "";
         const apBtn = document.getElementById("areaPolyBtn");
         if (apBtn && isAdminUser) apBtn.style.display = "";
+        const atBtn = document.getElementById("attBtn");
+        if (atBtn && isAdminUser) atBtn.style.display = "";
         initStatusFilter();       // ステータスDDの選択肢を構築（1回）
         updateStatsHighlight();   // カウンター初期ハイライト（総件数=全表示）
         // 自店は initMap より前に確定させる。初期中心の拠点駅分岐は mapOptions 段階で myBranch を読むため、
@@ -531,9 +540,8 @@
         // 初期中心はログイン管理者の「店の所在地」。事務所での作業起点なので駅ではなく店に置く。
         // ※index.html は現場アプリなので拠点駅のまま（意図的に admin とは別基準）。
         // myBranch は onAuthStateChanged 内で initMap より前に確定済み。
-        const HOME_CENTER = { "京都": new ZDC.LatLng(34.957969663952724, 135.76069814005794) };   // 京都店
-        mapOptions.center = HOME_CENTER[myBranch]
-          || new ZDC.LatLng(35.12665773554829, 136.92989789393815);   // 既定=名古屋店
+        const home = OFFICE_LL[myBranch] || OFFICE_LL["名古屋"];   // 座標は OFFICE_LL が単一ソース
+        mapOptions.center = new ZDC.LatLng(home.lat, home.lng);
         mapOptions.zoom = ADMIN_DEFAULT_ZOOM;   // Z18。カリング前提で「画面内の少数だけ描く」に合わせた倍率
         mapOptions.movable = true;
         mapOptions.zoomable = true;
@@ -1320,6 +1328,200 @@
 
     // エリアDD：ピンが存在する areaCode を areaName で列挙。
     // 周回管理と違い自店では絞らない（行政界は地図データで、店ごとに変わるものではないため）。
+    // ═══════════════════════════════════════════════════════════════
+    // 当日の勤怠（K便 K-1）
+    //   attendance コレクションの一覧＋打刻忘れの検知。修正は K-2、給与計算/Excel は K-3。
+    //   判定（60分の空白・終了忘れ・開始忘れ）は純関数に切り出してあり、
+    //   scripts/verify-k1-attendance.mjs が同じ実装を抜き出して境界値を通している。
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── ここから K-1 純ロジック（Nodeから抜き出して実行する。DOM/Firestoreに触らないこと）
+    const ATT_GAP_LIMIT_MIN = 60;        // 開始→初ピン / 最終ピン→終了 が「これを超えたら」黄色（60ちょうどは対象外）
+    const ATT_FORGET_OUT_MIN = 22 * 60;  // JST 22:00 を過ぎて outAt が無ければ「終了忘れ」
+
+    // 【このブロックの時刻の約束】扱う ms はすべて jstDate() と同じ「+9h シフト済み」。
+    // つまり UTC として読んだ桁がそのまま JST の値になる。ここで重ねて +9h してはいけない
+    // （二重シフトで 22:00 判定が 4:00 になる。検証で実際に踏んだ）。
+    /** +9hシフト済みの ms から「その日の何分目」(0-1439) を出す。 */
+    function attMinOfDayJst(shiftedMs) {
+      const d = new Date(shiftedMs);
+      return d.getUTCHours() * 60 + d.getUTCMinutes();
+    }
+    /** 空白が閾値を超えているか。どちらかが欠けていれば判定しない（＝黄色にしない）。 */
+    function attGapOver(fromMs, toMs) {
+      if (!fromMs || !toMs) return false;
+      return (toMs - fromMs) / 60000 > ATT_GAP_LIMIT_MIN;
+    }
+    /** 打刻忘れの検知。表示のみで自動修正はしない（修正UIは K-2）。 */
+    function attFlags(r, nowMinJst) {
+      const f = [];
+      if (r.inMs && !r.outMs && nowMinJst >= ATT_FORGET_OUT_MIN) f.push("終了忘れ");
+      if (!r.inMs && r.pinCount > 0) f.push("開始忘れ");
+      return f;
+    }
+    /** 2点間のおおよその距離(m)。「店から◯m」の目安なので簡易式で足りる。 */
+    function attDistM(a, b) {
+      if (!a || !b || typeof a.lat !== "number" || typeof b.lat !== "number") return null;
+      const R = 6378137, rad = Math.PI / 180;
+      const dLat = (b.lat - a.lat) * rad;
+      const dLng = (b.lng - a.lng) * rad * Math.cos((a.lat + b.lat) / 2 * rad);
+      return Math.round(Math.sqrt(dLat * dLat + dLng * dLng) * R);
+    }
+    /** 分 → "7h32m" / "45m"。null は "—"。 */
+    function attFmtMin(m) {
+      if (m === null || m === undefined || Number.isNaN(m)) return "—";
+      const h = Math.floor(m / 60), mm = m % 60;
+      return h > 0 ? h + "h" + String(mm).padStart(2, "0") + "m" : mm + "m";
+    }
+
+    /**
+     * 一覧の行を組み立てる純関数。DOM も Firestore も触らない（Nodeから境界値を叩けるように）。
+     * @param {Array}  docs  [{email, inMs, outMs, inLoc}]（attendance 由来・自店ぶん）
+     * @param {Object} pins  メール → {firstMs, lastMs, count}（その日のピン）
+     * @param {number} nowMs 判定時点(ms)
+     * @param {boolean} isToday 今日を見ているか。過去日は「22:00を過ぎている」扱いで判定する
+     */
+    function attBuildRows(docs, pins, nowMs, isToday) {
+      const emails = [];
+      docs.forEach(d => { if (d.email && emails.indexOf(d.email) === -1) emails.push(d.email); });
+      Object.keys(pins).forEach(e => { if (e && emails.indexOf(e) === -1) emails.push(e); });
+
+      const nowMin = isToday ? attMinOfDayJst(nowMs) : 24 * 60;
+      const rows = emails.map(email => {
+        const d = docs.find(x => x.email === email) || {};
+        const p = pins[email] || { firstMs: null, lastMs: null, count: 0 };
+        const inMs = d.inMs || null, outMs = d.outMs || null;
+        // 経過：終了済みは実績、勤務中は「開いた時点」まで。自動では更新しない（開き直せば新しくなる）。
+        const endMs = outMs || (isToday && inMs ? nowMs : null);
+        return {
+          email, inMs, outMs, inLoc: d.inLoc || null,
+          working: !!(inMs && !outMs),
+          elapsedMin: (inMs && endMs) ? Math.round((endMs - inMs) / 60000) : null,
+          firstPinMs: p.firstMs, lastPinMs: p.lastMs, pinCount: p.count,
+          gapStart: attGapOver(inMs, p.firstMs),   // 開始 → 初ピン
+          gapEnd:   attGapOver(p.lastMs, outMs),   // 最終ピン → 終了
+          flags: attFlags({ inMs, outMs, pinCount: p.count }, nowMin),
+        };
+      });
+      // 開始の早い順。未打刻（開始忘れ）は最後にまとめる。
+      rows.sort((a, b) => (a.inMs || Infinity) - (b.inMs || Infinity));
+      return rows;
+    }
+
+    // ── ここまで K-1 純ロジック
+
+    window.openAttendanceModal = () => {
+      if (!isAdminUser) return;   // fail-closed（rules 側でも一覧は admin だけが引ける）
+      const el = document.getElementById("attDate");
+      if (el && !el.value) el.value = jstYmd(new Date().toISOString());
+      document.getElementById("attBranch").textContent = myBranch;
+      document.getElementById("attModal").style.display = "flex";
+      loadAttendance();
+    };
+    window.closeAttendanceModal = () => {
+      document.getElementById("attModal").style.display = "none";
+    };
+
+    window.loadAttendance = async () => {
+      const ymd = document.getElementById("attDate").value;
+      const body = document.getElementById("attBody");
+      if (!ymd) { body.innerHTML = '<div class="att-empty">日付を選んでください</div>'; return; }
+      body.innerHTML = '<div class="att-empty">読み込み中…</div>';
+
+      // date だけの単一等価クエリ（複合インデックスを増やさない）。自店の絞り込みはクライアント側。
+      // 1日あたり人数ぶんの docs しか無いので、この分だけ余分に読んでも軽い。
+      let docs = [];
+      try {
+        const snap = await getDocs(query(collection(db, "attendance"), where("date", "==", ymd)));
+        docs = snap.docs.map(d => d.data())
+          .filter(r => (r.branch && String(r.branch).trim() ? r.branch : "名古屋") === myBranch)
+          .map(r => ({
+            email: r.email,
+            inMs:  jstDate(r.inAt)  ? jstDate(r.inAt).getTime()  : null,   // 以降 jstDate 基準(+9h)で統一
+            outMs: jstDate(r.outAt) ? jstDate(r.outAt).getTime() : null,
+            inLoc: r.inLoc || null,
+          }));
+      } catch (e) {
+        console.error("attendance", e);
+        body.innerHTML = '<div class="att-empty">勤怠を読み込めませんでした（権限またはネットワーク）</div>';
+        return;
+      }
+
+      // 氏名は staff マスタ優先（K-1 では空のことが多い）→ 無ければ displayNames の表示名。
+      let staffMap = {};
+      try {
+        const s = await getDocs(collection(db, "staff"));
+        s.forEach(d => { const n = d.data().name; if (n) staffMap[d.id] = n; });
+      } catch (e) { staffMap = {}; }
+
+      // その日のピンの初/最終。購読済み allPins をここで1回だけ走査する（開いた時だけ）。
+      const pins = {};
+      allPins.forEach(p => {
+        if (!p.email || jstYmd(p.createdAt) !== ymd) return;
+        const d = jstDate(p.createdAt); if (!d) return;
+        const t = d.getTime();
+        const a = pins[p.email] || (pins[p.email] = { firstMs: t, lastMs: t, count: 0 });
+        if (t < a.firstMs) a.firstMs = t;
+        if (t > a.lastMs)  a.lastMs  = t;
+        a.count++;
+      });
+
+      const isToday = ymd === jstYmd(new Date().toISOString());
+      // nowMs も jstDate と同じ +9h シフト系に合わせる（inMs/outMs と同じ土俵で引き算するため）。
+      const rows = attBuildRows(docs, pins, Date.now() + 9 * 3600 * 1000, isToday);
+      renderAttendance(rows, staffMap);
+    };
+
+    function attHm(ms) {
+      // ここに来る ms は +9h 済み（jstDate と同じ土俵）なので、UTCの桁がそのままJSTの表示になる。
+      return ms ? new Date(ms).toISOString().slice(11, 16) : "—";
+    }
+
+    function renderAttendance(rows, staffMap) {
+      const body = document.getElementById("attBody");
+      if (!rows.length) { body.innerHTML = '<div class="att-empty">この日の打刻とピンはありません</div>'; return; }
+      const office = OFFICE_LL[myBranch] || OFFICE_LL["名古屋"];
+
+      const tr = rows.map(r => {
+        const name = staffMap[r.email] || staffName(r.email);
+        const dist = attDistM(office, r.inLoc);
+        const where = r.inLoc
+          ? (dist === null ? "—" : "店から" + (dist >= 1000 ? (dist / 1000).toFixed(1) + "km" : dist + "m"))
+          : (r.inMs ? "位置なし" : "—");
+        // 打刻忘れの候補時刻は灰字で横に出すだけ（K-2の修正UIで使う参考値。ここでは書き込まない）。
+        const inCell  = r.inMs  ? attHm(r.inMs)
+                                : (r.firstPinMs ? '—<span class="att-hint"> (初ピン ' + attHm(r.firstPinMs) + ')</span>' : "—");
+        const outCell = r.outMs ? attHm(r.outMs)
+                                : (r.working
+                                    ? '<span class="att-working">勤務中</span>'
+                                      + (r.lastPinMs ? '<span class="att-hint"> (最終ピン ' + attHm(r.lastPinMs) + ')</span>' : "")
+                                    : "—");
+        const flags = r.flags.length
+          ? r.flags.map(f => '<span class="att-flag">' + f + '</span>').join(" ")
+          : "";
+        return "<tr>"
+          + "<td>" + escAttr(name) + "</td>"
+          + "<td>" + inCell + "</td>"
+          + "<td>" + outCell + "</td>"
+          + '<td class="att-num">' + attFmtMin(r.elapsedMin) + "</td>"
+          + "<td>" + where + "</td>"
+          + '<td class="' + (r.gapStart ? "att-warn" : "") + '">' + attHm(r.firstPinMs) + "</td>"
+          + '<td class="' + (r.gapEnd ? "att-warn" : "") + '">' + attHm(r.lastPinMs) + "</td>"
+          + '<td class="att-num">' + (r.pinCount || 0) + "</td>"
+          + "<td>" + flags + "</td>"
+          + "</tr>";
+      }).join("");
+
+      body.innerHTML =
+        '<table class="att-table"><thead><tr>'
+        + "<th>名前</th><th>開始</th><th>終了</th><th>経過</th><th>開始位置</th>"
+        + "<th>初ピン</th><th>最終ピン</th><th>ピン数</th><th>フラグ</th>"
+        + "</tr></thead><tbody>" + tr + "</tbody></table>"
+        + '<div class="att-note" style="margin-top:8px">'
+        + "黄色＝開始→初ピン／最終ピン→終了 の空白が" + ATT_GAP_LIMIT_MIN + "分超。"
+        + "勤務中の経過はこの画面を開いた時点の値です。</div>";
+    }
+
     window.openAreaPolyModal = () => {
       if (!isAdminUser) return;   // fail-closed（rules 側でも write=isAdmin で二重に守られる）
       const nameByCode = {};
@@ -3037,6 +3239,23 @@
     .kouzu-save { padding:7px 16px; border-radius:6px; background:#06B6D4; border:1px solid #0891b2;
       color:#fff; font-size:13px; font-weight:700; cursor:pointer; font-family:inherit; }
 
+    /* 当日の勤怠（K-1）。外枠は .kouzu-modal 系を流用し、表まわりだけ定義する */
+    .att-box { width: min(1060px, 96vw); max-height: 86vh; overflow: auto; }
+    .att-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .att-head input[type="date"] {
+      padding:6px 10px; border-radius:6px; border:1px solid #cbd5e1; font-family:inherit; font-size:13px;
+    }
+    .att-note { font-size:11px; color:#64748b; }
+    .att-table { width:100%; border-collapse:collapse; font-size:12px; margin-top:10px; }
+    .att-table th, .att-table td { border-bottom:1px solid #e2e8f0; padding:7px 8px; text-align:left; white-space:nowrap; }
+    .att-table th { color:#475569; font-weight:700; background:#f8fafc; position:sticky; top:0; }
+    .att-table td.att-num { text-align:right; font-variant-numeric:tabular-nums; }
+    /* 開始→初ピン / 最終ピン→終了 の空白が60分を超えた欄。表示だけで、自動修正はしない */
+    .att-table td.att-warn { background:#fef9c3; }
+    .att-working { color:#059669; font-weight:700; }
+    .att-flag { display:inline-block; padding:2px 6px; border-radius:4px; background:#fee2e2; color:#b91c1c; font-weight:700; }
+    .att-hint { color:#94a3b8; }          /* 打刻忘れの候補時刻（灰字・あくまで参考） */
+    .att-empty { padding:18px 4px; color:#64748b; font-size:13px; }
     /* 周回管理（C-2）。モーダル外枠は .kouzu-modal 系を流用し、固有部分だけ定義する */
     .round-mgr { border-color:#9333EA; color:#9333EA; }
     .round-none-note { font-size:11px; color:#b45309; }
@@ -3113,6 +3332,9 @@
     <select id="roundFilter" onchange="setRoundFilter(this.value)" title="周回で絞り込み（NG系は常時表示）">
       <option value="all">周回：すべて</option>
     </select>
+    <!-- 当日の勤怠（K便 K-1・管理者専用）。既定 display:none で、admins 判定が通った時だけ開示する。
+         483f4a6 の判断どおりヘッダーは1段を維持する（本ボタンはgap込み約84px＝フルHD最大化で1段のまま）。 -->
+    <button class="layer-btn att-btn" id="attBtn" style="display:none" onclick="openAttendanceModal()" title="当日の勤怠（打刻の一覧・管理者専用）">🕒 勤怠</button>
     <!-- 周回管理（管理者専用）。既定 display:none で、admins 判定が通った時だけ開示する -->
     <button class="layer-btn round-mgr" id="roundMgrBtn" style="display:none" onclick="openRoundManager()" title="エリアごとに新しい周回を開始（管理者専用）">🔄 周回管理</button>
     <!-- 行政界ポリゴン取込（E-1・管理者専用）。周回管理と同じく既定 display:none。 -->
@@ -3224,6 +3446,22 @@
 
 <!-- 周回管理（C-2・管理者専用）。開始ボタン→dry-runプレビュー→［実行する］の2段構え。
      プレビュー表示の時点ではDBに一切書き込まない。 -->
+<!-- 当日の勤怠（K便 K-1）。一覧と打刻忘れの検知だけ。修正UIは K-2、給与計算/Excel は K-3。
+     集計はこのモーダルを開いた時にだけ走る（全件ループに重い処理を足さない＝da3bd11 の教訓）。 -->
+<div id="attModal" class="kouzu-modal" style="display:none">
+  <div class="kouzu-modal-box att-box">
+    <div class="kouzu-modal-title">🕒 当日の勤怠</div>
+    <div class="att-head">
+      <input id="attDate" type="date" onchange="loadAttendance()">
+      <span class="att-note">自店（<span id="attBranch"></span>）ぶん／打刻忘れは表示のみで自動修正はしません</span>
+    </div>
+    <div id="attBody"></div>
+    <div class="kouzu-modal-actions">
+      <button class="kouzu-cancel" onclick="closeAttendanceModal()">閉じる</button>
+    </div>
+  </div>
+</div>
+
 <div id="roundModal" class="kouzu-modal" style="display:none">
   <div class="kouzu-modal-box">
     <div class="kouzu-modal-title">🔄 新しい周回を開始</div>

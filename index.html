@@ -73,6 +73,8 @@
 
     let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（listenPinsで消さない）
     let lastFixLL = null;        // 直近に青ドットを描いた位置。位置が古くなっても薄く残すため保持する
+    let lastFixAcc = null;       // 同上の測位精度(m)。勤怠打刻の inLoc/outLoc に使う（打刻のためだけに測り直さない）
+    let lastFixAt = 0;           // 同上の取得時刻(ms)。古い値を位置として記録しないための鮮度判定に使う
     let myLocationStale = false; // 位置情報が古い＝60秒間更新なし（薄色＋パルス停止で明示）
     let followMode = true;       // 追従モード（カーナビ式）。既定ON。手動パンでOFF、📍でON復帰
     let watchId = null;          // watchPosition のID（二重起動防止）
@@ -472,6 +474,7 @@
         document.getElementById("mapScreen").style.display = "flex";
         document.getElementById("userLabel").textContent = user.email;
         await loadMyBranch(user.email);   // 自店を確定してからピン/グリッド作成に入る（branch に使う）
+        loadPunchState();                 // 勤怠チップの復元（doc IDに myBranch を使うのでこの後・地図は待たせない）
         // 担当者カラー/表示名は displayNames の全件読み。ログイン時に1回だけ読む
         // （以前は pins の onSnapshot ごとに読んでおり、ピン1件の追加/編集でも毎回 getDocs が走っていた）。
         await Promise.all([buildStaffColors(), buildStaffNames()]);
@@ -485,6 +488,9 @@
         // ログアウト：購読解除＋マーカー消去（再ログイン時の多重購読・残像を防ぐ）
         if (pinsUnsub) { pinsUnsub(); pinsUnsub = null; }
         if (roundsUnsub) { roundsUnsub(); roundsUnsub = null; }
+        punchToday = null;   // 共有端末で担当が入れ替わる。前の人の勤務中表示を残さない
+        const pchip = document.getElementById("punchChip");
+        if (pchip) { pchip.style.display = "none"; pchip.className = "punch-chip off"; pchip.textContent = "未出勤"; }
         if (map) {
           for (const id of Array.from(pinWidgetMap.keys())) {
             removePinMarker(id);
@@ -515,6 +521,165 @@
       undoStack = [];
       updateUndoBtn();
       await signOut(auth);
+    };
+
+    // ═══════════════════════════════════════════════════════════════
+    // 勤怠打刻（K便 K-1）
+    //   事務所のタイムカードを、このチップの「開始／終了」に置き換える第1段。
+    //   ここが持つのは打刻2つだけ。休憩・修正は K-2、給与計算/Excel は K-3。
+    //   時刻は必ず serverTimestamp()（端末時計は使わない・rules 側でも request.time 一致で強制）。
+    //   設計は docs/attendance-design.md、権限は firestore.rules の attendance ブロック。
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── ここから K-1 純ロジック（Nodeから抜き出して実行する。DOM/Firestoreに触らないこと）
+    /**
+     * 打刻UIを出す人＝調査員（K-1 の暫定判定）。
+     * 事務・営業・管理（@housemarket.com / @kyoto.com / @nagoya.com）はドメインで落ち、
+     * 調査員ドメインでも営業共有アカウントは個別に除外する。
+     * firestore.rules の attendance/isSurveyor() と同じ条件。片方だけ変えないこと。
+     * ※ K-3 で staff マスタができたら「staff に登録がある人」判定へ切り替え、この判定は消す。
+     */
+    const PUNCH_DOMAIN_RE = /@(hm|kyoto-hm)\.com$/;
+    const PUNCH_EXCLUDE_EMAILS = ["kyotoman@kyoto-hm.com", "mmau@nagoya.com"];   // 営業共有アカウント
+    function canPunch(email) {
+      const e = String(email || "").trim().toLowerCase();
+      return PUNCH_DOMAIN_RE.test(e) && PUNCH_EXCLUDE_EMAILS.indexOf(e) === -1;
+    }
+
+    let punchToday = null;    // 当日の attendance doc。未打刻は null
+    let punchBusy = false;    // 書込中。二重押しをUI側で止める（rules 側でも二重終了は弾く）
+
+    // JSTの YYYY-MM-DD。admin.html の jstDate() と同じ「+9hしてUTCとして読む」方式で、
+    // 閲覧端末のタイムゾーン設定に影響されない。Intl.DateTimeFormat は使わない（実行コストを足さない）。
+    function jstYmdOf(ms) {
+      return new Date(ms + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    }
+    // Timestamp / Date / ISO文字列 のどれでも "HH:MM"(JST) にする。読めない値は空文字。
+    function jstHm(v) {
+      if (!v) return "";
+      const t = (typeof v.toDate === "function") ? v.toDate().getTime()
+              : (v instanceof Date) ? v.getTime() : Date.parse(v);
+      if (!t || Number.isNaN(t)) return "";
+      return new Date(t + 9 * 3600 * 1000).toISOString().slice(11, 16);
+    }
+    // doc ID = `${branch}__${email}__${YYYY-MM-DD}`。rules 側でも同じ組み立てを検証している。
+    function attendanceId(email, ymd) { return myBranch + "__" + email + "__" + ymd; }
+
+    /** チップの見え方を決める純関数。next は次に打つ打刻（null＝もう押せない）。 */
+    function punchState(d) {
+      if (!d || !d.inAt) return { cls: "off",  label: "未出勤", next: "in" };
+      if (!d.outAt)      return { cls: "on",   label: "勤務中 " + jstHm(d.inAt) + "〜", next: "out" };
+      return { cls: "done", label: "本日 " + jstHm(d.inAt) + "〜" + jstHm(d.outAt), next: null };
+    }
+    /** 前日ぶんの「終了が押されていない」判定。自動では埋めない（修正は事務所＝K-2）。 */
+    function needsYesterdayNotice(d) { return !!(d && d.inAt && !d.outAt); }
+
+    // ── ここまで K-1 純ロジック
+
+    function renderPunchChip() {
+      const chip = document.getElementById("punchChip");
+      if (!chip) return;
+      const st = punchState(punchToday);
+      chip.className = "punch-chip " + st.cls;
+      chip.textContent = st.label;
+      chip.setAttribute("aria-disabled", String(punchBusy || st.next === null));
+    }
+
+    /**
+     * ログイン後に当日の状態を復元する。リロード・再ログインでも勤務中が戻るのはここ。
+     * 読むのは自分の doc の getDoc だけ（list クエリは投げない＝rules の read はメール一致で通る）。
+     */
+    async function loadPunchState() {
+      const chip = document.getElementById("punchChip");
+      if (!chip) return;
+      if (!currentUser || !canPunch(currentUser.email)) { chip.style.display = "none"; return; }
+      chip.style.display = "";
+      const today = jstYmdOf(Date.now());
+      try {
+        const snap = await getDoc(doc(db, "attendance", attendanceId(currentUser.email, today)));
+        punchToday = snap.exists() ? snap.data() : null;
+      } catch (e) {
+        punchToday = null;   // 読めなくても打刻はできる。未出勤表示のまま続行する
+      }
+      renderPunchChip();
+      checkYesterdayPunch(today);
+    }
+
+    /** 日跨ぎ：前日の doc が outAt なしのまま残っていたら知らせるだけ（自動で埋めない）。 */
+    async function checkYesterdayPunch(todayYmd) {
+      const y = jstYmdOf(Date.now() - 24 * 3600 * 1000);
+      if (y === todayYmd) return;
+      try {
+        const snap = await getDoc(doc(db, "attendance", attendanceId(currentUser.email, y)));
+        if (needsYesterdayNotice(snap.exists() ? snap.data() : null)) {
+          showToast("昨日の終了が押されていません（事務所で修正します）", "warn");
+        }
+      } catch (e) { /* 読めないだけなら黙って何もしない。打刻の邪魔をしない */ }
+    }
+
+    // 打刻時の位置。既存 watch の最新値が新しければそれを使い、無い/古いときだけ1回測る。
+    // 位置が取れないことで打刻を止めない＝失敗は null で通す（位置は補助情報）。
+    const PUNCH_LOC_FRESH_MS = 60000;    // これより新しい watch の測位はそのまま流用する
+    const PUNCH_LOC_TIMEOUT_MS = 5000;   // 単発測位の待ち上限。超えたら null で打刻を通す
+    function getPunchLoc() {
+      if (lastFixLL && lastFixAt && (Date.now() - lastFixAt) < PUNCH_LOC_FRESH_MS) {
+        return Promise.resolve({
+          lat: lastFixLL.lat, lng: lastFixLL.lng,
+          acc: (typeof lastFixAcc === "number") ? lastFixAcc : null,
+        });
+      }
+      if (!navigator.geolocation) return Promise.resolve(null);
+      // 【重要】必ず解決する。getCurrentPosition のコールバックを返さない実装があるため
+      // （既存の初期測位と同じ作法）、保険のタイマーを必ず添える。
+      return new Promise(resolve => {
+        let done = false;
+        const finish = v => { if (!done) { done = true; resolve(v); } };
+        navigator.geolocation.getCurrentPosition(
+          p => finish({ lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy }),
+          () => finish(null),
+          { enableHighAccuracy: false, timeout: PUNCH_LOC_TIMEOUT_MS, maximumAge: PUNCH_LOC_FRESH_MS }
+        );
+        setTimeout(() => finish(null), PUNCH_LOC_TIMEOUT_MS + 500);
+      });
+    }
+
+    /**
+     * チップのタップ＝開始 or 終了。確認 → 書込 → 状態を取り直して表示に反映。
+     * 二重押しは punchBusy と punchState().next で止め、二重終了は rules 側でも弾く。
+     */
+    window.onPunchTap = async () => {
+      if (punchBusy || !currentUser || !canPunch(currentUser.email)) return;
+      const st = punchState(punchToday);
+      if (!st.next) return;                       // 退勤済み＝もう押せない
+      if (!confirm(st.next === "in" ? "業務を開始しますか？" : "業務を終了しますか？")) return;
+
+      punchBusy = true; renderPunchChip();
+      const today = jstYmdOf(Date.now());
+      const ref = doc(db, "attendance", attendanceId(currentUser.email, today));
+      try {
+        const loc = await getPunchLoc();
+        if (st.next === "in") {
+          await setDoc(ref, {
+            email: currentUser.email, branch: myBranch, date: today,
+            inAt: serverTimestamp(), outAt: null,
+            inLoc: loc, outLoc: null,
+            breakMin: null, note: "", flags: [], corrections: [],
+            createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+          });
+        } else {
+          await updateDoc(ref, { outAt: serverTimestamp(), outLoc: loc, updatedAt: serverTimestamp() });
+        }
+        // 書いた直後に読み直す。表示する時刻を必ずサーバ側の値にするため（端末時計を画面にも出さない）。
+        try {
+          const snap = await getDoc(ref);
+          if (snap.exists()) punchToday = snap.data();
+        } catch (e) { /* 読み直せなくても打刻自体は成立している */ }
+        showToast(st.next === "in" ? "業務を開始しました" : "業務を終了しました");
+      } catch (e) {
+        showToast("打刻を保存できませんでした。電波の良い場所でもう一度お試しください", "error");
+      } finally {
+        punchBusy = false; renderPunchChip();
+      }
     };
 
     // ===== 調査グリッド(survey grid) MVP =====
@@ -2117,6 +2282,7 @@
           if (pos.coords.accuracy > 1000) return;  // 既存ガード踏襲（粗い測位は無視）
           const lat = pos.coords.latitude, lng = pos.coords.longitude;
           noteFix();                               // 実際に位置が入った時点で復帰（watch開始時点ではない）
+          lastFixAcc = pos.coords.accuracy; lastFixAt = Date.now();   // 勤怠打刻が流用する最新値（測位を増やさないため）
           showMyLocation(lat, lng);                // 青ドットは常に現在地へ（followの有無に関係なく）
           if (followMode) maybeRecenter(lat, lng); // 追従中のみ地図も追従（毎回は寄せない）
           // 進行方向↑用：移動中はGPSの進行方向を優先する。停止時は heading が null になるためコンパスへ戻す。
@@ -2747,6 +2913,19 @@
     .header-left { min-width: 0; flex-shrink: 0; }
     .header-title { font-size: 14px; font-weight: 700; color: #f9fafb; }
     #userLabel { font-size: 11px; color: #6b7280; margin-top: 1px; }
+    /* ユーザー名と勤怠チップを横並びにする行。タイトルの下＝ヘッダー左下。 */
+    .header-sub { display: flex; align-items: center; gap: 6px; margin-top: 1px; }
+    /* 勤怠打刻チップ（K便 K-1）。未出勤=グレー枠／勤務中=緑／退勤済=薄字。
+       調査員アカウント以外では JS 側が display:none のままにする。 */
+    .punch-chip {
+      font-size: 11px; line-height: 1; padding: 4px 8px; border-radius: 999px;
+      border: 1px solid #374151; background: transparent; color: #9ca3af;
+      cursor: pointer; white-space: nowrap;
+      -webkit-touch-callout: none; -webkit-user-select: none; user-select: none;
+    }
+    .punch-chip.on   { border-color: #10b981; background: #065f46; color: #d1fae5; font-weight: 700; }
+    .punch-chip.done { border-color: #1f2937; color: #6b7280; cursor: default; }
+    .punch-chip[aria-disabled="true"] { opacity: .55; }
     /* 市区ジャンプのドロップダウン。スマホで詰まりすぎないよう中央で可変＋上限幅。 */
     .jump-select {
       flex: 1; min-width: 0; max-width: 220px; margin: 0 8px;
@@ -2953,7 +3132,11 @@
   <div class="header">
     <div class="header-left">
       <div class="header-title">🏚 空家マップ</div>
-      <div id="userLabel"></div>
+      <div class="header-sub">
+        <div id="userLabel"></div>
+        <!-- 勤怠打刻（K便 K-1）。タップで開始／終了。調査員アカウントにだけ出す（canPunch） -->
+        <span class="punch-chip off" id="punchChip" style="display:none" onclick="onPunchTap()">未出勤</span>
+      </div>
     </div>
     <!-- 市区ごとの「前回の続き」へ飛ぶ。各行＝市区名 最終調査日 最終ピン住所。直近に回った市区が上。 -->
     <select id="jumpSelect" class="jump-select" onchange="jumpToCity(this.value)">
