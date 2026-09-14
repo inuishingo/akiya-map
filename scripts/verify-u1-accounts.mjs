@@ -1,5 +1,7 @@
 /**
- * アカウント管理（U-1）の自動検証：listAccounts / setAccountDisabled / account_audit_logs の rules。
+ * アカウント管理の自動検証
+ *   U-1：listAccounts / setAccountDisabled / account_audit_logs の rules
+ *   U-2：createSurveyorAccount / resetSurveyorPassword（店縛り・重複・ロールバック・PW個別化・監査ログ）
  *
  *   前提：npm run emu:auth（auth,firestore,functions）が起動していること。
  *   実行：
@@ -15,7 +17,7 @@
  * ※ Functions エミュレータは ID トークンの署名を検証しない。ここで確かめているのは
  *   「admins 判定・ガード順・監査ログ」のロジックまでで、署名検証は本番の Firebase 側が担う。
  */
-import { emulatorHosts, seed, ACCOUNTS, DUMMY_PASSWORD, PROJECT } from "./seed-accounts-emu.mjs";
+import { emulatorHosts, seed, ACCOUNTS, GHOST_DISPLAYNAMES, DUMMY_PASSWORD, PROJECT } from "./seed-accounts-emu.mjs";
 
 // ---- 冒頭チェック（seed-accounts-emu.mjs 側でも import 時に同じチェックが走る）----
 const { authHost: AUTH_HOST, fsHost: FS_HOST } = emulatorHosts();
@@ -43,10 +45,10 @@ function check(label, cond, detail = "") {
   else { fail++; console.log(`  ✖ ${label}${detail ? "  … " + detail : ""}`); }
 }
 
-async function signIn(email) {
+async function signIn(email, password = DUMMY_PASSWORD) {
   const res = await fetch(`${AUTH}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=emulator`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password: DUMMY_PASSWORD, returnSecureToken: true }),
+    body: JSON.stringify({ email, password, returnSecureToken: true }),
   });
   const j = await res.json();
   return { status: res.status, idToken: j.idToken, error: j.error && j.error.message };
@@ -85,6 +87,29 @@ async function authUser(uid) {
     body: JSON.stringify({ localId: [uid] }),
   });
   return ((await res.json()).users || [])[0];
+}
+async function authUserByEmail(email) {
+  const res = await fetch(`${AUTH}/identitytoolkit.googleapis.com/v1/projects/${PROJECT}/accounts:lookup`, {
+    method: "POST", headers: { Authorization: "Bearer owner", "Content-Type": "application/json" },
+    body: JSON.stringify({ email: [email] }),
+  });
+  return ((await res.json()).users || [])[0];
+}
+async function authUserCount() {
+  const res = await fetch(`${AUTH}/identitytoolkit.googleapis.com/v1/projects/${PROJECT}/accounts:query`, {
+    method: "POST", headers: { Authorization: "Bearer owner", "Content-Type": "application/json" },
+    body: JSON.stringify({ returnUserInfo: false }),
+  });
+  return Number((await res.json()).recordsCount || 0);
+}
+async function fsDoc(path) {
+  const segs = path.split("/").map(encodeURIComponent).join("/");
+  const res = await fetch(`${FS_DOCS}/${segs}`, { headers: { Authorization: "Bearer owner" } });
+  return res.status === 200 ? res.json() : null;
+}
+async function fsCount(collection) {
+  const res = await fetch(`${FS_DOCS}/${collection}?pageSize=300`, { headers: { Authorization: "Bearer owner" } });
+  return ((await res.json()).documents || []).length;
 }
 
 async function main() {
@@ -182,6 +207,142 @@ async function main() {
     body: JSON.stringify({ fields: { action: { stringValue: "disable" } } }),
   });
   check("管理者でもクライアントからは write できない（403）", w.status === 403, `status ${w.status}`);
+
+  // ════════════════════ U-2 ════════════════════
+  const PW_RE = /^[a-km-np-z2-9]{10}$/;      // 英小文字＋数字10桁・0 o 1 l を含まない（i は可）
+  const issued = [];                          // 発行されたパスワード（監査ログに含まれていないことの確認用）
+  const create = (u, data) => callFn("createSurveyorAccount", data, tokens[u.uid]);
+  for (const u of [U.allstore, U.ngyAdmin, U.kyoAdmin, U.ngyA]) await tokenOf(u);
+
+  console.log("\n■ U-2 createSurveyorAccount：認証・入力検証");
+  r = await callFn("createSurveyorAccount", { localPart: "u2none", domain: "hm.com", name: "未ログイン" }, null);
+  check("未ログイン → unauthenticated", !r.ok && r.status === "UNAUTHENTICATED", JSON.stringify(r));
+  r = await create(U.ngyA, { localPart: "u2surveyor", domain: "hm.com", name: "調査員が作る" });
+  check("admins に無い uid → permission-denied", !r.ok && r.status === "PERMISSION_DENIED", JSON.stringify(r));
+  for (const [label, data] of [
+    ["ローカルパートに大文字", { localPart: "Yamada", domain: "hm.com", name: "山田" }],
+    ["ローカルパートが記号始まり", { localPart: "-yamada", domain: "hm.com", name: "山田" }],
+    ["ローカルパートが32文字", { localPart: "a".repeat(32), domain: "hm.com", name: "山田" }],
+    ["ローカルパートに @ を混ぜる", { localPart: "yamada@kyoto-hm.com", domain: "hm.com", name: "山田" }],
+    ["許可リスト外のドメイン", { localPart: "yamada", domain: "gmail.com", name: "山田" }],
+    ["ドメインに @ 付き", { localPart: "yamada", domain: "@hm.com", name: "山田" }],
+    ["氏名が空", { localPart: "yamada", domain: "hm.com", name: "   " }],
+    ["氏名が21文字", { localPart: "yamada", domain: "hm.com", name: "あ".repeat(21) }],
+  ]) {
+    r = await create(U.ngyAdmin, data);
+    check(`${label} → invalid-argument`, !r.ok && r.status === "INVALID_ARGUMENT", JSON.stringify(r));
+  }
+  check("入力検証で弾いた分は Auth に作られていない", !(await authUserByEmail("yamada@hm.com")));
+
+  console.log("\n■ U-2 店縛り（受け入れ条件2〜4）");
+  const users0 = await authUserCount();
+  r = await create(U.ngyAdmin, { localPart: "u2cross", domain: "kyoto-hm.com", name: "越境(ダミー)" });
+  check("名古屋管理者 → @kyoto-hm.com は permission-denied「他店のアカウントは作成できません」",
+    !r.ok && r.status === "PERMISSION_DENIED" && r.message === "他店のアカウントは作成できません", JSON.stringify(r));
+  r = await create(U.kyoAdmin, { localPart: "u2cross", domain: "hm.com", name: "越境(ダミー)" });
+  check("京都管理者 → @hm.com は permission-denied", !r.ok && r.status === "PERMISSION_DENIED", JSON.stringify(r));
+  check("  → どちらも Auth に作られていない", (await authUserCount()) === users0);
+
+  r = await create(U.allstore, { localPart: "u2all-ngy", domain: "hm.com", name: "全店作成 名古屋(ダミー)" });
+  check("全店管理者 → @hm.com を作成できる", r.ok && r.result.email === "u2all-ngy@hm.com", JSON.stringify(r));
+  if (r.ok) issued.push(r.result.password);
+  r = await create(U.allstore, { localPart: "u2all-kyo", domain: "kyoto-hm.com", name: "全店作成 京都(ダミー)" });
+  check("全店管理者 → @kyoto-hm.com を作成できる", r.ok && r.result.email === "u2all-kyo@kyoto-hm.com", JSON.stringify(r));
+  if (r.ok) issued.push(r.result.password);
+  const kyoDn = await fsDoc("displayNames/u2all-kyo@kyoto-hm.com");
+  check("  → 京都ドメインの displayNames.branch は 京都", kyoDn && kyoDn.fields.branch.stringValue === "京都");
+
+  console.log("\n■ U-2 作成（名古屋管理者 → @hm.com）：受け入れ条件5〜7・12");
+  r = await create(U.ngyAdmin, { localPart: "u2.yamada", domain: "hm.com", name: "  山田 太郎(ダミー)  " });
+  check("作成が ok（返り値に uid / email / password）", r.ok && r.result.ok === true && r.result.uid && r.result.email === "u2.yamada@hm.com" && typeof r.result.password === "string", JSON.stringify(r && r.message));
+  const created = r.ok ? r.result : {};
+  if (r.ok) issued.push(created.password);
+  check("パスワードが英小文字＋数字10桁・紛らわしい文字なし・英字と数字を両方含む",
+    PW_RE.test(created.password || "") && /[a-z]/.test(created.password) && /[0-9]/.test(created.password), created.password);
+  check("表示されたパスワードでログインできる", !!(await signIn(created.email, created.password)).idToken);
+  const wrong = await signIn(created.email, "wrongpass22");
+  check("それ以外のパスワードでは失敗する", !wrong.idToken, JSON.stringify(wrong));
+  check("共通PW（212121）では失敗する", !(await signIn(created.email, "212121")).idToken);
+  const dn = await fsDoc(`displayNames/${created.email}`);
+  const dnKeys = dn ? Object.keys(dn.fields).sort() : [];
+  check("displayNames に name（前後空白を除去）と branch=名古屋", dn && dn.fields.name.stringValue === "山田 太郎(ダミー)" && dn.fields.branch.stringValue === "名古屋");
+  check("displayNames のフィールドは name / branch だけ（order が無い）", JSON.stringify(dnKeys) === JSON.stringify(["branch", "name"]), JSON.stringify(dnKeys));
+  check("admins に対象 uid が作られていない", !(await fsDoc(`admins/${created.uid}`)));
+  check("Auth 上で有効（disabled でない）", !(await authUser(created.uid)).disabled);
+  r = await callFn("listAccounts", {}, tokens[U.ngyAdmin.uid]);
+  const listed = r.ok ? r.result.find(x => x.uid === created.uid) : null;
+  check("一覧に「有効」・氏名・拠点が正しく出る", listed && listed.disabled === false && listed.displayName === "山田 太郎(ダミー)" && listed.branch === "名古屋" && listed.isAdmin === false, JSON.stringify(listed));
+  const pw2 = issued.filter(Boolean);
+  check("発行ごとにパスワードが異なる", new Set(pw2).size === pw2.length, JSON.stringify(pw2));
+
+  console.log("\n■ U-2 重複（受け入れ条件8）");
+  let u0 = await authUserCount(), d0 = await fsCount("displayNames");
+  r = await create(U.ngyAdmin, { localPart: "u2.yamada", domain: "hm.com", name: "二重登録" });
+  check("Auth に既存のメール → already-exists「このメールアドレスは既に使われています」",
+    !r.ok && r.status === "ALREADY_EXISTS" && r.message === "このメールアドレスは既に使われています", JSON.stringify(r));
+  const ghost = GHOST_DISPLAYNAMES[0];
+  const [ghostLocal, ghostDomain] = ghost.email.split("@");
+  r = await create(U.kyoAdmin, { localPart: ghostLocal, domain: ghostDomain, name: "残骸に上書き" });
+  check("displayNames だけ残っているメール → already-exists", !r.ok && r.status === "ALREADY_EXISTS", JSON.stringify(r));
+  check("  → Auth のアカウント数が増えていない", (await authUserCount()) === u0);
+  check("  → displayNames の件数が増えていない", (await fsCount("displayNames")) === d0);
+  check("  → 残骸の displayNames は上書きされていない", (await fsDoc(`displayNames/${ghost.email}`)).fields.name.stringValue === ghost.name);
+  check("  → 残骸メールの Auth は作られていない", !(await authUserByEmail(ghost.email)));
+
+  console.log("\n■ U-2 ロールバック（受け入れ条件9・displayNames 書込を故障注入で失敗させる）");
+  u0 = await authUserCount(); d0 = await fsCount("displayNames");
+  const auditBeforeFault = (await auditLogs()).docs.length;
+  r = await create(U.ngyAdmin, { localPart: "u2rollback", domain: "hm.com", name: "__FAULT_DN__" });
+  check("internal「氏名の登録に失敗したため、アカウントの作成を取り消しました」",
+    !r.ok && r.status === "INTERNAL" && r.message === "氏名の登録に失敗したため、アカウントの作成を取り消しました", JSON.stringify(r));
+  check("  → Auth にアカウントが残っていない（deleteUser が通った）", !(await authUserByEmail("u2rollback@hm.com")) && (await authUserCount()) === u0);
+  check("  → displayNames も増えていない", (await fsCount("displayNames")) === d0 && !(await fsDoc("displayNames/u2rollback@hm.com")));
+  check("  → 監査ログも増えていない", (await auditLogs()).docs.length === auditBeforeFault);
+
+  console.log("\n■ U-2 resetSurveyorPassword のガード（U-1 と同じ3つ・同じ順序）");
+  const reset = (u, data) => callFn("resetSurveyorPassword", data, tokens[u.uid]);
+  r = await callFn("resetSurveyorPassword", { uid: U.ngyA.uid }, null);
+  check("未ログイン → unauthenticated", !r.ok && r.status === "UNAUTHENTICATED", JSON.stringify(r));
+  r = await reset(U.ngyA, { uid: U.nodn.uid });
+  check("admins に無い uid → permission-denied", !r.ok && r.status === "PERMISSION_DENIED", JSON.stringify(r));
+  r = await reset(U.ngyAdmin, { uid: 123 });
+  check("uid が文字列でない → invalid-argument", !r.ok && r.status === "INVALID_ARGUMENT", JSON.stringify(r));
+  r = await reset(U.ngyAdmin, { uid: U.ngyAdmin.uid });
+  check("自分自身 → failed-precondition「自分のアカウントは操作できません」", !r.ok && r.status === "FAILED_PRECONDITION" && r.message === "自分のアカウントは操作できません", JSON.stringify(r));
+  r = await reset(U.ngyAdmin, { uid: U.kyoAdmin.uid });
+  check("管理者アカウント → failed-precondition（他店より先）", !r.ok && r.status === "FAILED_PRECONDITION" && r.message === "管理者アカウントはこの画面からパスワードを再発行できません", JSON.stringify(r));
+  r = await reset(U.ngyAdmin, { uid: U.kyoA.uid });
+  check("名古屋管理者 → 京都の調査員は permission-denied「他店のアカウントです（京都店）」", !r.ok && r.status === "PERMISSION_DENIED" && r.message === "他店のアカウントです（京都店）", JSON.stringify(r));
+  r = await reset(U.ngyAdmin, { uid: "no-such-uid" });
+  check("存在しない uid → not-found", !r.ok && r.status === "NOT_FOUND", JSON.stringify(r));
+  check("  → 拒否された対象の PW は変わっていない（共通ダミーPWでログインできる）", !!(await signIn(U.kyoA.email)).idToken && !!(await signIn(U.kyoAdmin.email)).idToken);
+
+  console.log("\n■ U-2 PW再発行（受け入れ条件10）");
+  r = await reset(U.ngyAdmin, { uid: created.uid });
+  check("再発行が ok（返り値に email / password）", r.ok && r.result.ok === true && r.result.uid === created.uid && r.result.email === created.email && PW_RE.test(r.result.password), JSON.stringify(r && r.message));
+  const newPw = r.ok ? r.result.password : "";
+  if (newPw) issued.push(newPw);
+  check("新PWは旧PWと異なる", newPw && newPw !== created.password);
+  check("旧PWではログインできない", !(await signIn(created.email, created.password)).idToken);
+  check("新PWでログインできる", !!(await signIn(created.email, newPw)).idToken);
+  r = await reset(U.allstore, { uid: U.kyoA.uid });
+  check("全店管理者 → 京都の調査員を再発行できる", r.ok, JSON.stringify(r));
+  if (r.ok) issued.push(r.result.password);
+
+  console.log("\n■ U-2 監査ログ（受け入れ条件11）");
+  const all = (await auditLogs()).docs;
+  const createLogs = all.filter(x => fv(x, "action") === "create");
+  const resetLogs = all.filter(x => fv(x, "action") === "reset_password");
+  check("create が3件（全店×2・名古屋×1）", createLogs.length === 3, String(createLogs.length));
+  check("reset_password が2件", resetLogs.length === 2, String(resetLogs.length));
+  const yamadaCreate = createLogs.find(x => fv(x, "targetUid") === created.uid);
+  check("create ログのフィールド（target/by/branch/at）", yamadaCreate && fv(yamadaCreate, "targetEmail") === created.email
+    && fv(yamadaCreate, "byUid") === U.ngyAdmin.uid && fv(yamadaCreate, "branch") === "名古屋" && !!yamadaCreate.fields.at.timestampValue);
+  const keysOk = [...createLogs, ...resetLogs].every(x =>
+    JSON.stringify(Object.keys(x.fields).sort()) === JSON.stringify(["action", "at", "branch", "byEmail", "byUid", "targetEmail", "targetUid"]));
+  check("ログのフィールドは U-1 と同じ7つだけ（password フィールドが無い）", keysOk);
+  const dump = JSON.stringify(all);
+  check(`発行したパスワード（${issued.length}件）の文字列がどのログにも含まれていない`, issued.length >= 5 && issued.every(p => !dump.includes(p)));
 
   console.log(`\n結果: ${pass} 合格 / ${fail} 不合格`);
   process.exit(fail ? 1 : 0);

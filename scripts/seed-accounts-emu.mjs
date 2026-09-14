@@ -39,6 +39,12 @@ export const ACCOUNTS = [
   { uid: "emu-nodn",        email: "no-displayname@example.test",        name: null,                    branch: null },
 ];
 
+// Auth には居ないのに displayNames だけ残っている「残骸」（U-2：Auth を消して displayNames が残った前例の再現）。
+// createSurveyorAccount はこのメールで作成を試みると already-exists で止まる必要がある。
+export const GHOST_DISPLAYNAMES = [
+  { email: "ghost-u2test@kyoto-hm.com", name: "残骸(ダミー)", branch: "京都" },
+];
+
 export function emulatorHosts() {
   const authHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
   const fsHost = process.env.FIRESTORE_EMULATOR_HOST;
@@ -99,6 +105,9 @@ export async function seed({ quiet = false } = {}) {
   for (const a of ACCOUNTS) {
     if (a.admin) await setFsDoc(`admins/${a.uid}`, { note: "emulator seed" });
     if (a.name) await setFsDoc(`displayNames/${a.email}`, { name: a.name, branch: a.branch });
+  }
+  for (const g of GHOST_DISPLAYNAMES) {
+    await setFsDoc(`displayNames/${g.email}`, { name: g.name, branch: g.branch });
   }
 
   if (!quiet) {

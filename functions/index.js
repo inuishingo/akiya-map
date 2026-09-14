@@ -5,7 +5,9 @@
  * ├─ areaPolygon : ZENRIN 住所検索APIのプロキシ（行政界ポリゴン＝大字(OAZ)の面）
  * ├─ youto       : 不動産情報ライブラリ XKT002（用途地域）のプロキシ
  * ├─ listAccounts       : 調査員アカウント一覧（callable・管理者専用）
- * └─ setAccountDisabled : アカウントの無効化／再有効化（callable・管理者専用・監査ログ付き）
+ * ├─ setAccountDisabled : アカウントの無効化／再有効化（callable・管理者専用・監査ログ付き）
+ * ├─ createSurveyorAccount : 調査員アカウントの新規作成（callable・管理者専用・自店ドメインのみ）
+ * └─ resetSurveyorPassword : 調査員アカウントのパスワード再発行（callable・管理者専用）
  *
  * 【重要】この3つは必ず同じ codebase に置くこと。
  *   一部だけをローカルに置いた状態で `firebase deploy --only functions` を打つと、
@@ -467,16 +469,15 @@ exports.listAccounts = onCall(async (request) => {
   return rows;
 });
 
-exports.setAccountDisabled = onCall(async (request) => {
-  assertNotProdAuthFromEmulator();
-  const caller = await assertAdminCaller(request);
+// 呼び出し元の拠点：displayNames/{email}.branch を正とし、無ければメール判定にフォールバック
+async function callerBranchOf(caller) {
+  const snap = caller.email ? await admin.firestore().doc(`displayNames/${caller.email}`).get() : null;
+  return branchFromDisplayName(snap && snap.exists ? snap.data() : null, caller.email);
+}
 
-  const uid = request.data && request.data.uid;
-  const disabled = request.data && request.data.disabled;
-  if (typeof uid !== "string" || !uid || typeof disabled !== "boolean") {
-    throw new HttpsError("invalid-argument", "uid(string) と disabled(boolean) が必要です");
-  }
-
+// 既存アカウントを操作する前のガード（U-1 のガード1〜3。setAccountDisabled / resetSurveyorPassword 共通）
+//   順序とメッセージは U-1 から変えない。verb は「管理者アカウントはこの画面から{verb}できません」にだけ使う。
+async function assertOperableTarget(caller, uid, verb) {
   // ガード1：自分自身は不可
   if (uid === caller.uid) {
     throw new HttpsError("failed-precondition", "自分のアカウントは操作できません");
@@ -485,7 +486,7 @@ exports.setAccountDisabled = onCall(async (request) => {
   const db = admin.firestore();
   // ガード2：管理者アカウントは不可（ロックアウト防止）
   if ((await db.doc(`admins/${uid}`).get()).exists) {
-    throw new HttpsError("failed-precondition", "管理者アカウントはこの画面から無効化できません");
+    throw new HttpsError("failed-precondition", `管理者アカウントはこの画面から${verb}できません`);
   }
 
   let target;
@@ -498,36 +499,194 @@ exports.setAccountDisabled = onCall(async (request) => {
   const targetEmail = target.email || "";
 
   // ガード3：他店のアカウントは不可（全店扱いのメールはこのチェックのみスキップ）
-  //   呼び出し元の branch は displayNames/{email}.branch を正とし、無ければメール判定にフォールバック。
-  const [callerDn, targetDn] = await Promise.all([
-    caller.email ? db.doc(`displayNames/${caller.email}`).get() : Promise.resolve(null),
+  const [callerBranch, targetDn] = await Promise.all([
+    callerBranchOf(caller),
     targetEmail ? db.doc(`displayNames/${targetEmail}`).get() : Promise.resolve(null),
   ]);
-  const callerBranch = branchFromDisplayName(callerDn && callerDn.exists ? callerDn.data() : null, caller.email);
   const targetBranch = branchFromDisplayName(targetDn && targetDn.exists ? targetDn.data() : null, targetEmail);
   if (!isAllStoreEmail(caller.email) && callerBranch !== targetBranch) {
     throw new HttpsError("permission-denied", `他店のアカウントです（${targetBranch}店）`);
   }
+  return { targetEmail, targetBranch };
+}
 
-  await admin.auth().updateUser(uid, { disabled });
-
-  // 監査ログ。Auth の変更は既に確定しているので、ここで失敗しても ok を返す
-  // （失敗を返すと画面と実態がズレる）。取りこぼしは Cloud Logging で追えるようにする。
+// 監査ログ。Auth の変更は既に確定しているので、ここで失敗しても呼び出し元は ok を返す
+// （失敗を返すと画面と実態がズレる）。取りこぼしは Cloud Logging で追えるようにする。
+// ★パスワードは渡さない・残さない。
+async function writeAuditLog(action, { targetUid, targetEmail, caller, branch }) {
   try {
-    await db.collection("account_audit_logs").add({
-      action: disabled ? "disable" : "enable",
-      targetUid: uid,
+    await admin.firestore().collection("account_audit_logs").add({
+      action,
+      targetUid,
       targetEmail,
       byUid: caller.uid,
       byEmail: caller.email,
-      branch: targetBranch,
+      branch,
       at: FieldValue.serverTimestamp(),
     });
   } catch (e) {
-    console.error("account_audit_logs write failed", {
-      action: disabled ? "disable" : "enable", targetUid: uid, byUid: caller.uid, message: e.message,
-    });
+    console.error("account_audit_logs write failed", { action, targetUid, byUid: caller.uid, message: e.message });
+  }
+}
+
+exports.setAccountDisabled = onCall(async (request) => {
+  assertNotProdAuthFromEmulator();
+  const caller = await assertAdminCaller(request);
+
+  const uid = request.data && request.data.uid;
+  const disabled = request.data && request.data.disabled;
+  if (typeof uid !== "string" || !uid || typeof disabled !== "boolean") {
+    throw new HttpsError("invalid-argument", "uid(string) と disabled(boolean) が必要です");
   }
 
+  const { targetEmail, targetBranch } = await assertOperableTarget(caller, uid, "無効化");
+
+  await admin.auth().updateUser(uid, { disabled });
+  await writeAuditLog(disabled ? "disable" : "enable", { targetUid: uid, targetEmail, caller, branch: targetBranch });
+
   return { ok: true, uid, disabled };
+});
+
+// ═══════════════════════════════════════════════════════════════
+// アカウント管理（U-2）: createSurveyorAccount / resetSurveyorPassword
+//
+//   調査員アカウントの新規作成と、パスワードの再発行。管理者アカウントの発行・admins の付け外しはしない。
+//   パスワードは自動生成し、返り値で1回だけ返す（Firestore にもログにも残さない）。
+//   共通PW（既存アカウント）は据え置き。新規・再発行からパスワードを個別化する。
+//
+//   【店縛りの本体】メールのドメインは許可リストから選ばせ、生成したメールの拠点（branchOfEmail）が
+//   呼び出し元の拠点と一致しなければ拒否する。全店扱いのメールだけがこのチェックをスキップする。
+// ═══════════════════════════════════════════════════════════════
+const { randomInt } = require("node:crypto");
+
+// 拠点ごとに作成を許すドメイン。キーは branchOfEmail の戻り値と一致させること
+// （食い違うと createSurveyorAccount が internal で止まる＝黙って他店のアカウントを作らない）。
+const ALLOWED_DOMAINS = { "名古屋": ["hm.com"], "京都": ["kyoto-hm.com"] };
+const LOCAL_PART_RE = /^[a-z0-9][a-z0-9._-]{0,30}$/;
+const NAME_MAX = 20;
+
+function branchOfAllowedDomain(domain) {
+  return Object.keys(ALLOWED_DOMAINS).find(b => ALLOWED_DOMAINS[b].includes(domain)) || null;
+}
+
+// 英小文字＋数字の10桁。紛らわしい文字（0 o O 1 l I）は除外（大文字はそもそも使わない）。
+// 英字と数字を最低1文字ずつ含める（口頭・手書きで伝えるときに「全部数字？」の取り違えを防ぐ）。
+const PW_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789";
+function generatePassword(length = 10) {
+  for (;;) {
+    let s = "";
+    for (let i = 0; i < length; i++) s += PW_ALPHABET[randomInt(PW_ALPHABET.length)];
+    if (/[a-z]/.test(s) && /[0-9]/.test(s)) return s;
+  }
+}
+
+// 【検証専用】受け入れ条件9（displayNames 書込失敗時のロールバック）を再現するための故障注入。
+//   エミュレータ上で、氏名が FAULT_NAME_DISPLAYNAMES のときだけ displayNames の書込を失敗させる。
+//   本番（Cloud Run）では FUNCTIONS_EMULATOR が立たないので構造的に発火しない。
+const FAULT_NAME_DISPLAYNAMES = "__FAULT_DN__";
+function injectDisplayNamesFaultForEmulator(name) {
+  if (process.env.FUNCTIONS_EMULATOR === "true" && name === FAULT_NAME_DISPLAYNAMES) {
+    throw new Error("fault injection (emulator only): displayNames write");
+  }
+}
+
+exports.createSurveyorAccount = onCall(async (request) => {
+  assertNotProdAuthFromEmulator();
+  const caller = await assertAdminCaller(request);
+
+  // 1. 入力検証
+  const d = request.data || {};
+  const localPart = d.localPart;
+  const domain = d.domain;
+  const name = typeof d.name === "string" ? d.name.trim() : d.name;
+  if (typeof localPart !== "string" || !LOCAL_PART_RE.test(localPart)) {
+    throw new HttpsError("invalid-argument",
+      "メールの@より前は、英小文字か数字で始まる31文字以内（英小文字・数字・. _ -）で入力してください");
+  }
+  const domainBranch = typeof domain === "string" ? branchOfAllowedDomain(domain) : null;
+  if (!domainBranch) {
+    throw new HttpsError("invalid-argument", "このドメインではアカウントを作成できません");
+  }
+  if (typeof name !== "string" || !name || Array.from(name).length > NAME_MAX || /[\x00-\x1f\x7f]/.test(name)) {
+    throw new HttpsError("invalid-argument", `氏名は1〜${NAME_MAX}文字で入力してください`);
+  }
+
+  // 2. メールを組み立て、店縛りを確認
+  const email = `${localPart}@${domain}`;
+  const newBranch = branchOfEmail(email);
+  if (newBranch !== domainBranch) {
+    // 許可リストの定義と拠点判定が食い違っている＝設定ミス。作らずに止める。
+    console.error("ALLOWED_DOMAINS と branchOfEmail の不一致", { domain, domainBranch, newBranch });
+    throw new HttpsError("internal", "拠点の判定に失敗しました（許可ドメインの設定を確認してください）");
+  }
+  if (!isAllStoreEmail(caller.email) && (await callerBranchOf(caller)) !== newBranch) {
+    throw new HttpsError("permission-denied", "他店のアカウントは作成できません");
+  }
+
+  // 3. Auth の重複
+  try {
+    await admin.auth().getUserByEmail(email);
+    throw new HttpsError("already-exists", "このメールアドレスは既に使われています");
+  } catch (e) {
+    if (e instanceof HttpsError) throw e;
+    if (e.code !== "auth/user-not-found") throw e;
+  }
+  // 4. displayNames の残骸（Auth だけ消して displayNames が残っているケース）
+  const db = admin.firestore();
+  const dnRef = db.doc(`displayNames/${email}`);
+  if ((await dnRef.get()).exists) {
+    throw new HttpsError("already-exists", "このメールアドレスは既に使われています");
+  }
+
+  // 5. パスワード生成 → 6. Auth 作成
+  const password = generatePassword();
+  let user;
+  try {
+    user = await admin.auth().createUser({ email, password, disabled: false });
+  } catch (e) {
+    if (e.code === "auth/email-already-exists") {
+      throw new HttpsError("already-exists", "このメールアドレスは既に使われています");
+    }
+    throw e;
+  }
+
+  // 7. displayNames（name / branch のみ。order は書かない＝年色化 af519fd で不要になった概念）
+  //    create() は既存 doc があると失敗する＝4 と 7 の間に誰かが作っても上書きしない。
+  //    失敗したら 6 の Auth を消して戻す（displayNames 無しのアカウントは「（氏名未登録）」になり原因が追えない）。
+  try {
+    injectDisplayNamesFaultForEmulator(name);
+    await dnRef.create({ name, branch: newBranch });
+  } catch (e) {
+    console.error("displayNames write failed; rolling back auth user", { email, uid: user.uid, message: e.message });
+    try {
+      await admin.auth().deleteUser(user.uid);
+    } catch (e2) {
+      console.error("rollback deleteUser failed", { email, uid: user.uid, message: e2.message });
+      throw new HttpsError("internal",
+        `氏名の登録に失敗し、アカウントの取り消しにも失敗しました。管理者に連絡してください（${email}）`);
+    }
+    throw new HttpsError("internal", "氏名の登録に失敗したため、アカウントの作成を取り消しました");
+  }
+  // 8. admins には書かない（本便は調査員アカウントのみ）
+
+  await writeAuditLog("create", { targetUid: user.uid, targetEmail: email, caller, branch: newBranch });
+  return { ok: true, uid: user.uid, email, password };
+});
+
+exports.resetSurveyorPassword = onCall(async (request) => {
+  assertNotProdAuthFromEmulator();
+  const caller = await assertAdminCaller(request);
+
+  const uid = request.data && request.data.uid;
+  if (typeof uid !== "string" || !uid) {
+    throw new HttpsError("invalid-argument", "uid(string) が必要です");
+  }
+
+  const { targetEmail, targetBranch } = await assertOperableTarget(caller, uid, "パスワードを再発行");
+
+  const password = generatePassword();
+  await admin.auth().updateUser(uid, { password });
+  await writeAuditLog("reset_password", { targetUid: uid, targetEmail, caller, branch: targetBranch });
+
+  return { ok: true, uid, email: targetEmail, password };
 });

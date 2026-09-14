@@ -462,6 +462,7 @@
         setGridEditMode(false);
         // アカウント一覧は他人の個人情報なので、ログアウト時に画面からも捨てる
         acctRows = [];
+        hideAcctPwPanel();   // 発行したパスワードも画面から捨てる
         const am = document.getElementById("acctModal");
         if (am) am.style.display = "none";
       }
@@ -2979,15 +2980,25 @@
       } catch(e) { showToast("取消に失敗しました", "error"); }
     };
 
-    // ===== アカウント管理（U-1）— 管理者専用 =====
-    // 一覧・無効化・再有効化だけ（可逆な操作のみ）。作成・PW発行・削除・admins付け外し・氏名/拠点の編集はしない。
-    // 権限境界（自分／管理者／他店）の本体は Functions setAccountDisabled。ここのボタン制御は見た目だけで、
+    // ===== アカウント管理（U-1 / U-2）— 管理者専用 =====
+    // U-1：一覧・無効化・再有効化。U-2：調査員の新規作成・パスワード再発行。
+    // 削除・admins付け外し・管理者の発行・氏名/拠点の編集はしない。
+    // 権限境界（自分／管理者／他店・作成ドメインの店縛り）の本体は Functions。ここのボタン制御は見た目だけで、
     // 迂回されても Functions が弾く。表示は全店・操作は自店のみ。
-    const callListAccounts       = httpsCallable(functions, "listAccounts");
-    const callSetAccountDisabled = httpsCallable(functions, "setAccountDisabled");
+    const callListAccounts          = httpsCallable(functions, "listAccounts");
+    const callSetAccountDisabled    = httpsCallable(functions, "setAccountDisabled");
+    const callCreateSurveyorAccount = httpsCallable(functions, "createSurveyorAccount");
+    const callResetSurveyorPassword = httpsCallable(functions, "resetSurveyorPassword");
     let acctRows = [];          // listAccounts の結果（branch → email 昇順）
     let acctLoading = false;
-    let acctBusyUid = null;     // 実行中の対象uid。実行中は全行の操作ボタンを止める（二度押し・並行実行の防止）
+    let acctBusyUid = null;     // 実行中の対象uid（作成中は "__create__"）。実行中は全ボタンを止める（二度押し・並行実行の防止）
+    let acctBusyAction = null;  // 実行中の操作（"toggle" | "reset" | "create"）。「実行中…」をどのボタンに出すかに使う
+    let acctPwShown = null;     // 発行結果パネルに表示中の { email, password }。閉じたら捨てる（どこにも保存しない）
+
+    // 作成を許すドメイン（Functions の ALLOWED_DOMAINS と同一。ここは選択肢を絞る見た目だけで、本体は Functions）
+    const ACCT_ALLOWED_DOMAINS = { "名古屋": ["hm.com"], "京都": ["kyoto-hm.com"] };
+    const ACCT_LOCAL_PART_RE = /^[a-z0-9][a-z0-9._-]{0,30}$/;
+    const ACCT_NAME_MAX = 20;
 
     // 全店扱い：@housemarket.com かつ "kyoto" を含まない（Functions の isAllStoreEmail と同一）
     function acctIsAllStore(email) {
@@ -3011,6 +3022,16 @@
       }
       return { ok: true, why: "", tip: "" };
     }
+    // 呼び出し元が作成できるドメイン。全店扱いは全ドメイン、それ以外は自店のドメインだけ。
+    function acctCreatableDomains() {
+      const me = auth.currentUser;
+      if (!me || !acctRows.length) return [];   // 自店は一覧の自分の行で決めるので、読み込み前は出さない
+      if (acctIsAllStore(me.email)) return Object.values(ACCT_ALLOWED_DOMAINS).flat();
+      return ACCT_ALLOWED_DOMAINS[acctMyBranch()] || [];
+    }
+    function acctBranchOfDomain(domain) {
+      return Object.keys(ACCT_ALLOWED_DOMAINS).find(b => ACCT_ALLOWED_DOMAINS[b].includes(domain)) || "";
+    }
     // Auth の metadata は "Mon, 14 Sep 2026 01:23:45 GMT" 形式。JST の YYYY-MM-DD HH:mm で出す。
     function acctFmtTime(s) {
       if (!s) return "未ログイン";
@@ -3025,6 +3046,9 @@
     function renderAccountTable() {
       const body = document.getElementById("acctTableBody");
       const meta = document.getElementById("acctMeta");
+      // 「＋ 新規作成」は、一覧の読み込みが済み（＝自店が確定し）、何も実行中でなく、作れるドメインがある時だけ押せる
+      const createOpenBtn = document.getElementById("acctCreateOpenBtn");
+      createOpenBtn.disabled = acctLoading || acctBusyUid !== null || !acctCreatableDomains().length;
       if (acctLoading && !acctRows.length) {
         body.innerHTML = `<tr><td colspan="6" class="acct-empty">読み込み中…</td></tr>`;
         meta.textContent = "";
@@ -3041,10 +3065,16 @@
       body.innerHTML = acctRows.map(r => {
         const op = acctOperable(r);
         const busy = acctBusyUid !== null;
-        const label = acctBusyUid === r.uid ? "実行中…" : (r.disabled ? "再有効化" : "無効化");
-        const btn = `<span title="${escAttr(op.tip)}"><button class="acct-op ${r.disabled ? "enable" : "disable"}"`
-          + ` data-uid="${escAttr(r.uid)}" title="${escAttr(op.tip)}"`
-          + ` ${op.ok && !busy ? "" : "disabled"} onclick="toggleAccountDisabled(this.dataset.uid)">${label}</button></span>`
+        const dis = op.ok && !busy ? "" : "disabled";
+        const tip = escAttr(op.tip);
+        const running = action => acctBusyUid === r.uid && acctBusyAction === action;
+        const label = running("toggle") ? "実行中…" : (r.disabled ? "再有効化" : "無効化");
+        // PW再発行の押せる条件は無効化ボタンと同一（Functions のガードも同じ3つ）
+        const btn = `<span title="${tip}"><button class="acct-op ${r.disabled ? "enable" : "disable"}"`
+          + ` data-uid="${escAttr(r.uid)}" title="${tip}"`
+          + ` ${dis} onclick="toggleAccountDisabled(this.dataset.uid)">${label}</button></span>`
+          + `<span title="${tip}"><button class="acct-op reset" data-uid="${escAttr(r.uid)}" title="${tip}"`
+          + ` ${dis} onclick="resetAccountPassword(this.dataset.uid)">${running("reset") ? "実行中…" : "PW再発行"}</button></span>`
           + (op.why ? `<span class="acct-why">${escAttr(op.why)}</span>` : "");
         return `<tr class="${r.disabled ? "acct-disabled" : ""}">`
           + `<td>${escAttr(r.displayName || "（氏名未登録）")}${r.isAdmin ? `<span class="acct-badge adm">管理者</span>` : ""}</td>`
@@ -3078,11 +3108,14 @@
     window.openAccountModal = () => {
       if (!isAdminUser) return;   // fail-closed（Functions 側でも admins を確認する）
       acctRows = [];
+      closeAcctCreateForm();
       document.getElementById("acctModal").style.display = "flex";
       loadAccounts();
     };
     window.closeAccountModal = () => {
       if (acctBusyUid) return;   // 実行中は閉じさせない（結果のトーストと一覧の更新を見届けるため）
+      if (acctPwShown) return;   // 発行したパスワードの表示中は閉じさせない（先にパネルを閉じる）
+      closeAcctCreateForm();
       document.getElementById("acctModal").style.display = "none";
     };
     window.reloadAccounts = () => { if (!acctBusyUid && !acctLoading) loadAccounts(); };
@@ -3113,6 +3146,147 @@
       }
       // 成否どちらでも一覧はサーバーから取り直す（画面の状態を Auth の実態に合わせる）
       await loadAccounts();
+    };
+
+    // ── U-2：新規作成 ─────────────────────────────────────
+    // メールは「@より前の入力欄 ＋ ドメインのプルダウン」。プルダウンは自店のドメインだけ（全店扱いは全ドメイン）。
+    // 他店ドメインを画面から選べなくするのは見た目の制限で、店縛りの本体は Functions createSurveyorAccount。
+    window.openAcctCreateForm = () => {
+      if (!isAdminUser || acctBusyUid || acctLoading) return;
+      const domains = acctCreatableDomains();
+      if (!domains.length) { showToast("作成できるドメインがありません", "warn"); return; }
+      document.getElementById("acctNewName").value = "";
+      document.getElementById("acctNewLocal").value = "";
+      document.getElementById("acctNewDomain").innerHTML =
+        domains.map(d => `<option value="${escAttr(d)}">@${escAttr(d)}</option>`).join("");
+      onAcctNewDomainChange();
+      document.getElementById("acctCreateForm").style.display = "";
+      document.getElementById("acctNewName").focus();
+    };
+    function closeAcctCreateForm() {
+      const f = document.getElementById("acctCreateForm");
+      if (f) f.style.display = "none";
+    }
+    window.closeAcctCreateForm = () => { if (acctBusyAction !== "create") closeAcctCreateForm(); };
+    // ドメインから拠点を確定表示する（ユーザーが選ぶ項目ではないことを明示）
+    window.onAcctNewDomainChange = () => {
+      const b = acctBranchOfDomain(document.getElementById("acctNewDomain").value);
+      document.getElementById("acctNewBranch").textContent = b ? `拠点：${b}` : "";
+    };
+    // 姓のローマ字小文字を想定。大文字は小文字に寄せる（Functions は大文字を拒否する）
+    window.onAcctNewLocalInput = () => {
+      const el = document.getElementById("acctNewLocal");
+      const lower = el.value.toLowerCase();
+      if (lower !== el.value) {
+        const pos = el.selectionStart;
+        el.value = lower;
+        el.setSelectionRange(pos, pos);
+      }
+    };
+
+    window.submitAcctCreate = async () => {
+      if (!isAdminUser || acctBusyUid || acctLoading) return;
+      const name = document.getElementById("acctNewName").value.trim();
+      const localPart = document.getElementById("acctNewLocal").value.trim();
+      const domain = document.getElementById("acctNewDomain").value;
+      if (!name || Array.from(name).length > ACCT_NAME_MAX) {
+        showToast(`氏名は1〜${ACCT_NAME_MAX}文字で入力してください`, "error"); return;
+      }
+      if (!ACCT_LOCAL_PART_RE.test(localPart)) {
+        showToast("@より前は英小文字か数字で始まる31文字以内（英小文字・数字・. _ -）で入力してください", "error"); return;
+      }
+      if (!acctCreatableDomains().includes(domain)) {
+        showToast("このドメインではアカウントを作成できません", "error"); return;
+      }
+
+      acctBusyUid = "__create__";
+      acctBusyAction = "create";
+      const btn = document.getElementById("acctCreateBtn");
+      btn.disabled = true; btn.textContent = "作成中…";
+      renderAccountTable();
+      try {
+        const res = await callCreateSurveyorAccount({ localPart, domain, name });
+        closeAcctCreateForm();
+        showAcctPwPanel("create", { name, email: res.data.email, password: res.data.password });
+      } catch (e) {
+        console.error("createSurveyorAccount", e);
+        showToast("作成に失敗しました（" + e.message + "）", "error");
+      } finally {
+        acctBusyUid = null;
+        acctBusyAction = null;
+        btn.disabled = false; btn.textContent = "作成する";
+      }
+      await loadAccounts();
+    };
+
+    // ── U-2：パスワード再発行 ─────────────────────────────
+    window.resetAccountPassword = async (uid) => {
+      if (!isAdminUser || acctBusyUid || acctLoading) return;
+      const r = acctRows.find(x => x.uid === uid);
+      if (!r) return;
+      const op = acctOperable(r);
+      if (!op.ok) { showToast(op.tip, "warn"); return; }
+      const who = `${r.displayName || "（氏名未登録）"}（${r.email}）`;
+      if (!confirm(`${who}のパスワードを再発行します。\n現在のパスワードは使えなくなります。新しいパスワードは1回だけ表示されます。`)) return;
+
+      acctBusyUid = uid;
+      acctBusyAction = "reset";
+      renderAccountTable();
+      try {
+        const res = await callResetSurveyorPassword({ uid });
+        showAcctPwPanel("reset", { name: r.displayName, email: res.data.email, password: res.data.password });
+      } catch (e) {
+        console.error("resetSurveyorPassword", e);
+        showToast("再発行に失敗しました（" + e.message + "）", "error");
+      } finally {
+        acctBusyUid = null;
+        acctBusyAction = null;
+      }
+      await loadAccounts();
+    };
+
+    // ── U-2：発行結果パネル（作成・再発行 共通）──────────────
+    // パスワードは二度と取得できないので、トーストでは出さない（消えると復旧不能）。
+    // 閉じるボタンでしか閉じない（パネル外クリック・モーダルの「閉じる」でも閉じない）。
+    function showAcctPwPanel(kind, { name, email, password }) {
+      acctPwShown = { email, password };
+      document.getElementById("acctPwTitle").textContent =
+        kind === "create" ? "アカウントを作成しました" : "パスワードを再発行しました";
+      document.getElementById("acctPwLabel").textContent = kind === "create" ? "初期パスワード" : "新しいパスワード";
+      document.getElementById("acctPwName").textContent = name || "（氏名未登録）";
+      document.getElementById("acctPwEmail").textContent = email;
+      document.getElementById("acctPwValue").textContent = password;
+      document.getElementById("acctPwCopied").textContent = "";
+      document.getElementById("acctPwPanel").style.display = "flex";
+    }
+    function hideAcctPwPanel() {
+      acctPwShown = null;
+      const p = document.getElementById("acctPwPanel");
+      if (!p) return;
+      p.style.display = "none";
+      document.getElementById("acctPwValue").textContent = "";   // DOM にも残さない
+      document.getElementById("acctPwEmail").textContent = "";
+    }
+    window.closeAcctPwPanel = () => hideAcctPwPanel();
+    window.copyAcctPw = async (which) => {
+      if (!acctPwShown) return;
+      const v = which === "password" ? acctPwShown.password : acctPwShown.email;
+      let ok = false;
+      try {
+        await navigator.clipboard.writeText(v);
+        ok = true;
+      } catch (e) {
+        // クリップボードAPIが使えない環境向け
+        const ta = document.createElement("textarea");
+        ta.value = v; ta.setAttribute("readonly", "");
+        ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta); ta.select();
+        try { ok = document.execCommand("copy"); } catch (e2) { ok = false; }
+        ta.remove();
+      }
+      document.getElementById("acctPwCopied").textContent = ok
+        ? (which === "password" ? "パスワードをコピーしました" : "メールをコピーしました")
+        : "コピーできませんでした。画面の表示を見て伝えてください";
     };
 
     // ===== TOAST =====
@@ -3514,6 +3688,39 @@
     /* 押せないボタンは色を抜いて、見た目だけで押せる/押せないが分かるようにする */
     .acct-op:disabled { background:#f1f5f9; color:#cbd5e1; border-color:#e2e8f0; cursor:not-allowed; }
     .acct-why { margin-left:6px; font-size:11px; color:#94a3b8; }
+    /* U-2：新規作成・PW再発行・発行結果パネル */
+    .acct-op.reset { margin-left:6px; }
+    /* 色は押せる時だけ付ける。.acct-op.reset に直接色を書くと .acct-op:disabled と詳細度が同じで後勝ちになり、
+       押せないボタンが青いまま＝押せるように見えてしまう（U-2 の画面検証で実測） */
+    .acct-op.reset:not(:disabled) { color:#1d4ed8; border-color:#93c5fd; }
+    #acctModal .kouzu-save:disabled { opacity:.45; cursor:not-allowed; }   /* 他のモーダルの見た目は変えない */
+    .acct-toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+    .acct-create { border:1px solid #bae6fd; background:#f0f9ff; border-radius:8px; padding:10px 12px;
+      display:flex; flex-direction:column; gap:8px; }
+    .acct-create-title { font-size:13px; font-weight:700; color:#0e7490; }
+    .acct-email { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+    .acct-email input { width:180px; padding:7px 10px; border:1px solid #cbd5e1; border-radius:6px;
+      font-size:13px; font-family:inherit; font-weight:400; outline:none; }
+    .acct-email input:focus { border-color:#06B6D4; }
+    .acct-email select { padding:6px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;
+      font-family:inherit; background:#fff; }
+    .acct-at { font-size:14px; color:#475569; }
+    .acct-branch-fixed { font-size:12px; font-weight:700; color:#0f766e; background:#ccfbf1; border-radius:10px; padding:2px 10px; }
+    /* 発行結果パネルはアカウント管理モーダル(9998)・トースト(9999)より上に出す */
+    .acct-pw-overlay { position:fixed; inset:0; z-index:10000; background:rgba(15,23,42,.65);
+      display:flex; align-items:center; justify-content:center; padding:16px; }
+    .acct-pw-box { background:#fff; border-radius:10px; padding:18px 20px; width:min(520px,100%);
+      box-shadow:0 10px 30px rgba(0,0,0,.45); display:flex; flex-direction:column; gap:12px; border-top:4px solid #EA580C; }
+    .acct-pw-title { font-size:15px; font-weight:700; color:#7c2d12; }
+    .acct-pw-grid { display:grid; grid-template-columns:auto 1fr auto; gap:8px 10px; align-items:center; font-size:13px; }
+    .acct-pw-label { font-size:12px; color:#64748b; font-weight:700; white-space:nowrap; }
+    .acct-pw-code { font-family:ui-monospace, "Consolas", monospace; background:#f1f5f9; border-radius:6px;
+      padding:4px 8px; user-select:all; word-break:break-all; }
+    .acct-pw-value { font-size:20px; font-weight:700; letter-spacing:.08em; color:#0f172a; }
+    .acct-copy { padding:4px 12px; font-size:12px; }
+    .acct-pw-copied { font-size:12px; color:#047857; min-height:16px; }
+    .acct-pw-warn { font-size:13px; font-weight:700; color:#991b1b; background:#fef2f2; border:1px solid #fecaca;
+      border-radius:6px; padding:8px 10px; }
 
     .toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -3764,8 +3971,32 @@
 <div id="acctModal" class="kouzu-modal" style="display:none">
   <div class="kouzu-modal-box acct-modal-box">
     <div class="kouzu-modal-title">👤 アカウント管理</div>
-    <div class="acct-meta" id="acctMeta"></div>
-    <div class="acct-note">無効化するとログインできなくなります。過去のピン・グリッド・担当者名は残ります。新規作成・パスワード・削除はこの画面では扱いません。<br>管理者アカウントの無効化はこの画面では行いません（スクリプト対応）。</div>
+    <div class="acct-toolbar">
+      <button class="kouzu-save" id="acctCreateOpenBtn" onclick="openAcctCreateForm()" disabled>＋ 新規作成</button>
+      <div class="acct-meta" id="acctMeta"></div>
+    </div>
+    <!-- U-2：調査員アカウントの新規作成。ドメインは自店のものだけ選べる（店縛りの本体は Functions） -->
+    <div class="acct-create" id="acctCreateForm" style="display:none">
+      <div class="acct-create-title">調査員アカウントを新規作成</div>
+      <label class="kouzu-field">氏名（必須・20文字以内）
+        <input id="acctNewName" type="text" maxlength="20" autocomplete="off" placeholder="例：山田 太郎">
+      </label>
+      <div class="kouzu-field">メールアドレス（必須）
+        <div class="acct-email">
+          <input id="acctNewLocal" type="text" maxlength="31" autocomplete="off" autocapitalize="off" spellcheck="false"
+            placeholder="例：yamada" oninput="onAcctNewLocalInput()" aria-label="メールの@より前">
+          <span class="acct-at">@</span>
+          <select id="acctNewDomain" onchange="onAcctNewDomainChange()" aria-label="ドメイン"></select>
+          <span class="acct-branch-fixed" id="acctNewBranch"></span>
+        </div>
+      </div>
+      <div class="acct-note">@より前は姓のローマ字小文字（英小文字・数字・. _ -）。パスワードは自動で発行され、作成後に1回だけ表示されます。</div>
+      <div class="kouzu-modal-actions">
+        <button class="kouzu-cancel" onclick="closeAcctCreateForm()">キャンセル</button>
+        <button class="kouzu-save" id="acctCreateBtn" onclick="submitAcctCreate()">作成する</button>
+      </div>
+    </div>
+    <div class="acct-note">無効化するとログインできなくなります。過去のピン・グリッド・担当者名は残ります。アカウントの削除はこの画面では扱いません。<br>管理者アカウントの無効化・パスワード再発行はこの画面では行いません（スクリプト対応）。</div>
     <div class="acct-table-wrap">
       <table class="acct-table">
         <thead><tr><th>氏名</th><th>メール</th><th>拠点</th><th>状態</th><th>最終ログイン</th><th>操作</th></tr></thead>
@@ -3775,6 +4006,26 @@
     <div class="kouzu-modal-actions">
       <button class="kouzu-cancel" id="acctReloadBtn" onclick="reloadAccounts()">↻ 再読込</button>
       <button class="kouzu-cancel" onclick="closeAccountModal()">閉じる</button>
+    </div>
+  </div>
+</div>
+
+<!-- U-2：発行結果パネル（作成・再発行 共通）。パスワードは二度と取得できないので、
+     「閉じる」ボタン以外では閉じない（外側クリックのハンドラは付けない）。トーストでは出さない。 -->
+<div id="acctPwPanel" class="acct-pw-overlay" style="display:none">
+  <div class="acct-pw-box" role="dialog" aria-modal="true" aria-labelledby="acctPwTitle">
+    <div class="acct-pw-title" id="acctPwTitle"></div>
+    <div class="acct-pw-grid">
+      <span class="acct-pw-label">氏名</span><span id="acctPwName"></span><span></span>
+      <span class="acct-pw-label">メール</span><code id="acctPwEmail" class="acct-pw-code"></code>
+      <button class="kouzu-cancel acct-copy" onclick="copyAcctPw('email')">コピー</button>
+      <span class="acct-pw-label" id="acctPwLabel">初期パスワード</span><code id="acctPwValue" class="acct-pw-code acct-pw-value"></code>
+      <button class="kouzu-save acct-copy" onclick="copyAcctPw('password')">コピー</button>
+    </div>
+    <div class="acct-pw-copied" id="acctPwCopied"></div>
+    <div class="acct-pw-warn">このパスワードは二度と表示されません。閉じる前に本人へ伝えてください。</div>
+    <div class="kouzu-modal-actions">
+      <button class="round-exec" onclick="closeAcctPwPanel()">閉じる</button>
     </div>
   </div>
 </div>
