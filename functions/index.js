@@ -3,7 +3,9 @@
  *
  * ┌─ zenrin      : ZENRIN Web API のプロキシ（逆ジオ / 地番検索 / ジオコード）
  * ├─ areaPolygon : ZENRIN 住所検索APIのプロキシ（行政界ポリゴン＝大字(OAZ)の面）
- * └─ youto       : 不動産情報ライブラリ XKT002（用途地域）のプロキシ
+ * ├─ youto       : 不動産情報ライブラリ XKT002（用途地域）のプロキシ
+ * ├─ listAccounts       : 調査員アカウント一覧（callable・管理者専用）
+ * └─ setAccountDisabled : アカウントの無効化／再有効化（callable・管理者専用・監査ログ付き）
  *
  * 【重要】この3つは必ず同じ codebase に置くこと。
  *   一部だけをローカルに置いた状態で `firebase deploy --only functions` を打つと、
@@ -17,10 +19,12 @@
  *     firebase functions:secrets:set REINFOLIB_KEY
  */
 
-const { onRequest } = require("firebase-functions/v2/https");
+const { onRequest, onCall, HttpsError } = require("firebase-functions/v2/https");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
+// ※ admin.firestore.FieldValue はこの構成では undefined になる（U-1 のエミュレータ検証で実測）。modular から取る。
+const { FieldValue } = require("firebase-admin/firestore");
 
 setGlobalOptions({ maxInstances: 10, region: "asia-northeast1" });
 
@@ -360,3 +364,170 @@ exports.youto = onRequest(
     }
   }
 );
+
+// ═══════════════════════════════════════════════════════════════
+// アカウント管理（U-1）: listAccounts / setAccountDisabled
+//
+//   admin.html の「👤 アカウント管理」から呼ぶ callable。
+//   Firebase 側が disabledUserSignup / disabledUserDeletion のため、クライアントSDKから Auth は触れない。
+//   Admin SDK を持つここが唯一の経路になる。
+//
+//   U-1 は「可逆な操作だけ」。作成・PW発行・削除・admins付け外し・displayNames編集はしない。
+//   退職者は Auth 無効化のみ。displayNames は消さない（過去ピンの担当者名が displayNames.name 引きのため）。
+//
+//   【権限境界はすべてここで持つ】admin.html 側のボタン制御は見た目だけで、迂回されても通さない。
+// ═══════════════════════════════════════════════════════════════
+
+// 拠点判定：メールに "kyoto" を含む → 京都、それ以外 → 名古屋（index.html の branchOfEmail と同一）
+function branchOfEmail(email) {
+  return String(email || "").toLowerCase().includes("kyoto") ? "京都" : "名古屋";
+}
+// 全店扱い：@housemarket.com かつ "kyoto" を含まない（inui＝全店の運用に合わせる）
+function isAllStoreEmail(email) {
+  const e = String(email || "").toLowerCase();
+  return e.endsWith("@housemarket.com") && !e.includes("kyoto");
+}
+function branchFromDisplayName(data, email) {
+  const b = data && data.branch;
+  return (b && String(b).trim()) ? String(b).trim() : branchOfEmail(email);
+}
+
+// 【安全装置】エミュレータ上で Auth エミュレータが起動していないときは拒否する。
+//   Functions エミュレータの Admin SDK は、Auth エミュレータが無いと「本番の Auth」に繋がる。
+//   `npm run emu`（firestore,functions のみ）から呼ぶと本番アカウントを書き換える事故になるので、
+//   URLパラメータ（?authEmu=1）の付け忘れを前提に、サーバー側で構造的に止める。
+//   本番（Cloud Run）では FUNCTIONS_EMULATOR が立たないので影響しない。
+function assertNotProdAuthFromEmulator() {
+  if (process.env.FUNCTIONS_EMULATOR === "true" && !process.env.FIREBASE_AUTH_EMULATOR_HOST) {
+    throw new HttpsError("failed-precondition",
+      "Auth エミュレータが起動していません（本番の Auth に繋がるため拒否しました）。npm run emu:auth で起動してください");
+  }
+}
+
+// 認証必須＋ admins/{uid} の存在チェック（fail-closed：読めなければ拒否）
+async function assertAdminCaller(request) {
+  if (!request.auth || !request.auth.uid) {
+    throw new HttpsError("unauthenticated", "ログインが必要です");
+  }
+  let isAdmin = false;
+  try {
+    isAdmin = (await admin.firestore().doc(`admins/${request.auth.uid}`).get()).exists;
+  } catch (e) {
+    console.error("admins check failed", { uid: request.auth.uid, message: e.message });
+    isAdmin = false;
+  }
+  if (!isAdmin) {
+    throw new HttpsError("permission-denied", "管理者権限がありません");
+  }
+  return { uid: request.auth.uid, email: String(request.auth.token.email || "") };
+}
+
+exports.listAccounts = onCall(async (request) => {
+  assertNotProdAuthFromEmulator();
+  await assertAdminCaller(request);
+
+  const db = admin.firestore();
+  const [users, dnSnap, adminsSnap] = await Promise.all([
+    (async () => {
+      const all = [];
+      let pageToken;
+      do {
+        const page = await admin.auth().listUsers(1000, pageToken);
+        all.push(...page.users);
+        pageToken = page.pageToken;
+      } while (pageToken);
+      return all;
+    })(),
+    db.collection("displayNames").get(),
+    db.collection("admins").get(),
+  ]);
+
+  const dnByEmail = new Map();
+  dnSnap.forEach(d => dnByEmail.set(d.id, d.data()));
+  const adminUids = new Set(adminsSnap.docs.map(d => d.id));
+
+  const rows = users.map(u => {
+    const email = u.email || "";
+    const dn = dnByEmail.get(email);
+    return {
+      uid: u.uid,
+      email,
+      displayName: (dn && dn.name) || "",
+      branch: branchFromDisplayName(dn, email),
+      disabled: !!u.disabled,
+      isAdmin: adminUids.has(u.uid),   // 画面側で操作ボタンを押せなくするため（判定の本体は setAccountDisabled）
+      lastSignInTime: u.metadata.lastSignInTime || null,
+      creationTime: u.metadata.creationTime || null,
+    };
+  });
+  // 並び：branch → email の昇順（ロケール非依存の単純比較で順序を固定する）
+  rows.sort((a, b) =>
+    a.branch < b.branch ? -1 : a.branch > b.branch ? 1 :
+    a.email < b.email ? -1 : a.email > b.email ? 1 : 0);
+  return rows;
+});
+
+exports.setAccountDisabled = onCall(async (request) => {
+  assertNotProdAuthFromEmulator();
+  const caller = await assertAdminCaller(request);
+
+  const uid = request.data && request.data.uid;
+  const disabled = request.data && request.data.disabled;
+  if (typeof uid !== "string" || !uid || typeof disabled !== "boolean") {
+    throw new HttpsError("invalid-argument", "uid(string) と disabled(boolean) が必要です");
+  }
+
+  // ガード1：自分自身は不可
+  if (uid === caller.uid) {
+    throw new HttpsError("failed-precondition", "自分のアカウントは操作できません");
+  }
+
+  const db = admin.firestore();
+  // ガード2：管理者アカウントは不可（ロックアウト防止）
+  if ((await db.doc(`admins/${uid}`).get()).exists) {
+    throw new HttpsError("failed-precondition", "管理者アカウントはこの画面から無効化できません");
+  }
+
+  let target;
+  try {
+    target = await admin.auth().getUser(uid);
+  } catch (e) {
+    if (e.code === "auth/user-not-found") throw new HttpsError("not-found", "対象のアカウントが見つかりません");
+    throw e;
+  }
+  const targetEmail = target.email || "";
+
+  // ガード3：他店のアカウントは不可（全店扱いのメールはこのチェックのみスキップ）
+  //   呼び出し元の branch は displayNames/{email}.branch を正とし、無ければメール判定にフォールバック。
+  const [callerDn, targetDn] = await Promise.all([
+    caller.email ? db.doc(`displayNames/${caller.email}`).get() : Promise.resolve(null),
+    targetEmail ? db.doc(`displayNames/${targetEmail}`).get() : Promise.resolve(null),
+  ]);
+  const callerBranch = branchFromDisplayName(callerDn && callerDn.exists ? callerDn.data() : null, caller.email);
+  const targetBranch = branchFromDisplayName(targetDn && targetDn.exists ? targetDn.data() : null, targetEmail);
+  if (!isAllStoreEmail(caller.email) && callerBranch !== targetBranch) {
+    throw new HttpsError("permission-denied", `他店のアカウントです（${targetBranch}店）`);
+  }
+
+  await admin.auth().updateUser(uid, { disabled });
+
+  // 監査ログ。Auth の変更は既に確定しているので、ここで失敗しても ok を返す
+  // （失敗を返すと画面と実態がズレる）。取りこぼしは Cloud Logging で追えるようにする。
+  try {
+    await db.collection("account_audit_logs").add({
+      action: disabled ? "disable" : "enable",
+      targetUid: uid,
+      targetEmail,
+      byUid: caller.uid,
+      byEmail: caller.email,
+      branch: targetBranch,
+      at: FieldValue.serverTimestamp(),
+    });
+  } catch (e) {
+    console.error("account_audit_logs write failed", {
+      action: disabled ? "disable" : "enable", targetUid: uid, byUid: caller.uid, message: e.message,
+    });
+  }
+
+  return { ok: true, uid, disabled };
+});

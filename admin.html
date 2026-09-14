@@ -15,10 +15,12 @@
 
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-    import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
+    import { getAuth, connectAuthEmulator, signInWithEmailAndPassword, signOut, onAuthStateChanged }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
     import { getFirestore, connectFirestoreEmulator, collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, where, orderBy, runTransaction, serverTimestamp, setDoc, writeBatch, arrayUnion }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+    import { getFunctions, connectFunctionsEmulator, httpsCallable }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-functions.js";
 
     const firebaseConfig = {
       apiKey: "AIzaSyDloqlUX051jReuAW4_TyncQgGlk03CfO0",
@@ -32,6 +34,7 @@
     const app = initializeApp(firebaseConfig);
     const auth = getAuth(app);
     const db = getFirestore(app);
+    const functions = getFunctions(app, "asia-northeast1");   // callable（アカウント管理 U-1）用
 
     // ═══════════════════════════════════════════════════════════════
     // ローカル開発：Firebase エミュレータ接続（admin.html のみ。index.html は本番のまま）
@@ -50,17 +53,32 @@
     //   エミュレータの Firestore は空なので、管理者判定に使う admins/{uid} を
     //   Emulator UI（http://localhost:4000）で1件作っておくこと。手順は docs/local-dev.md。
     //
-    // Cloud Functions は areaPolygon だけをエミュレータに向ける（AREAPOLY_API の定義箇所を参照）。
+    // Cloud Functions は areaPolygon と callable（listAccounts / setAccountDisabled）をエミュレータに向ける
+    //   （AREAPOLY_API の定義箇所・connectFunctionsEmulator を参照）。
     //   zenrin / youto は本番のまま。既にデプロイ済みで動いており、localhost は CORS 許可済み。
     //   エミュレータに寄せると REINFOLIB_KEY まで用意が要るので、必要のない範囲を広げない。
+    //
+    // 【Auth エミュレータは opt-in（U-1 で追加）】?emu=1&authEmu=1 のときだけ Auth もエミュレータに向ける。
+    //   アカウント管理（無効化／再有効化）の検証で本番 Auth を書き換えないため。起動は npm run emu:auth。
+    //   ?emu=1 だけの既存運用（本番Authでログイン）は変えない。
+    //   ※本体の安全装置は Functions 側（Auth エミュレータ無しのエミュレータ実行を拒否）。
+    //     このパラメータは「人が付け忘れる」前提で、付け忘れても本番 Auth は書き換わらない。
+    //   ※Auth エミュレータのトークンは本番の youto では検証に通らない（用途地域は出ない。仕様）。
     // ═══════════════════════════════════════════════════════════════
     const IS_LOCALHOST = location.hostname === "localhost" || location.hostname === "127.0.0.1";
     const IS_EMULATOR = IS_LOCALHOST && new URLSearchParams(location.search).get("emu") === "1";
+    const IS_AUTH_EMULATOR = IS_EMULATOR && new URLSearchParams(location.search).get("authEmu") === "1";
     const EMU_FIRESTORE_PORT = 8080;   // firebase.json の emulators.firestore.port と一致させること
     const EMU_FUNCTIONS_PORT = 5001;   // 同 emulators.functions.port
+    const EMU_AUTH_PORT = 9099;        // 同 emulators.auth.port
     if (IS_EMULATOR) {
       connectFirestoreEmulator(db, location.hostname, EMU_FIRESTORE_PORT);
       console.warn(`[emulator] Firestore -> ${location.hostname}:${EMU_FIRESTORE_PORT}（本番DBには書き込みません）`);
+      connectFunctionsEmulator(functions, location.hostname, EMU_FUNCTIONS_PORT);
+      if (IS_AUTH_EMULATOR) {
+        connectAuthEmulator(auth, `http://${location.hostname}:${EMU_AUTH_PORT}`, { disableWarnings: true });
+        console.warn(`[emulator] Auth -> ${location.hostname}:${EMU_AUTH_PORT}（本番Authには触れません）`);
+      }
       // 本番データを触っていると誤認する事故を防ぐため、画面に必ず出す。
       // このスクリプトは <head> にあるので body 未生成のことがある。DOM確定後に挿す。
       const showEmuBanner = () => {
@@ -68,7 +86,9 @@
         document.documentElement.classList.add("emu-on");   // 画面を26px下げる（CSS側で定義）
         const bar = document.createElement("div");
         bar.id = "emuBanner";
-        bar.textContent = `🧪 エミュレータ接続中（Firestore :${EMU_FIRESTORE_PORT} / Functions :${EMU_FUNCTIONS_PORT}）— 本番データではありません`;
+        // Auth の接続先も必ず出す。「Functions はエミュレータ・Auth だけ本番」を目で見分けるため。
+        const authPart = IS_AUTH_EMULATOR ? `Auth :${EMU_AUTH_PORT}` : "Auth は本番";
+        bar.textContent = `🧪 エミュレータ接続中（Firestore :${EMU_FIRESTORE_PORT} / Functions :${EMU_FUNCTIONS_PORT} / ${authPart}）— 本番データではありません`;
         document.body.appendChild(bar);
         document.title = "🧪[EMU] " + document.title;       // タブを何枚も開いたときの取り違え防止
       };
@@ -419,6 +439,8 @@
         if (rmBtn && isAdminUser) rmBtn.style.display = "";
         const apBtn = document.getElementById("areaPolyBtn");
         if (apBtn && isAdminUser) apBtn.style.display = "";
+        const acBtn = document.getElementById("acctBtn");
+        if (acBtn && isAdminUser) acBtn.style.display = "";
         initStatusFilter();       // ステータスDDの選択肢を構築（1回）
         updateStatsHighlight();   // カウンター初期ハイライト（総件数=全表示）
         // 自店は initMap より前に確定させる。初期中心の拠点駅分岐は mapOptions 段階で myBranch を読むため、
@@ -438,6 +460,10 @@
         // 共有端末で担当が入れ替わったとき、前の人の操作が取消対象に残らないよう捨てる。
         gridUndoStack = [];
         setGridEditMode(false);
+        // アカウント一覧は他人の個人情報なので、ログアウト時に画面からも捨てる
+        acctRows = [];
+        const am = document.getElementById("acctModal");
+        if (am) am.style.display = "none";
       }
     });
 
@@ -2953,6 +2979,142 @@
       } catch(e) { showToast("取消に失敗しました", "error"); }
     };
 
+    // ===== アカウント管理（U-1）— 管理者専用 =====
+    // 一覧・無効化・再有効化だけ（可逆な操作のみ）。作成・PW発行・削除・admins付け外し・氏名/拠点の編集はしない。
+    // 権限境界（自分／管理者／他店）の本体は Functions setAccountDisabled。ここのボタン制御は見た目だけで、
+    // 迂回されても Functions が弾く。表示は全店・操作は自店のみ。
+    const callListAccounts       = httpsCallable(functions, "listAccounts");
+    const callSetAccountDisabled = httpsCallable(functions, "setAccountDisabled");
+    let acctRows = [];          // listAccounts の結果（branch → email 昇順）
+    let acctLoading = false;
+    let acctBusyUid = null;     // 実行中の対象uid。実行中は全行の操作ボタンを止める（二度押し・並行実行の防止）
+
+    // 全店扱い：@housemarket.com かつ "kyoto" を含まない（Functions の isAllStoreEmail と同一）
+    function acctIsAllStore(email) {
+      const e = String(email || "").toLowerCase();
+      return e.endsWith("@housemarket.com") && !e.includes("kyoto");
+    }
+    // 呼び出し元の拠点。一覧の自分の行（＝Functions と同じ displayNames 優先＋メール判定フォールバック）を使う。
+    function acctMyBranch() {
+      const me = auth.currentUser;
+      const row = me && acctRows.find(r => r.uid === me.uid);
+      return row ? row.branch : myBranch;
+    }
+    // 操作可否と理由（表示用）。判定順は Functions のガード順と揃える。
+    function acctOperable(r) {
+      const me = auth.currentUser;
+      if (!me) return { ok: false, why: "", tip: "ログインが必要です" };
+      if (r.uid === me.uid) return { ok: false, why: "自分", tip: "自分のアカウントは操作できません" };
+      if (r.isAdmin) return { ok: false, why: "管理者", tip: "管理者アカウントはこの画面から操作できません" };
+      if (!acctIsAllStore(me.email) && r.branch !== acctMyBranch()) {
+        return { ok: false, why: "他店", tip: "他店のアカウント" };
+      }
+      return { ok: true, why: "", tip: "" };
+    }
+    // Auth の metadata は "Mon, 14 Sep 2026 01:23:45 GMT" 形式。JST の YYYY-MM-DD HH:mm で出す。
+    function acctFmtTime(s) {
+      if (!s) return "未ログイン";
+      const d = new Date(s);
+      if (isNaN(d)) return String(s);
+      const p = new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit",
+        day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(d)
+        .reduce((o, x) => (o[x.type] = x.value, o), {});
+      return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+    }
+
+    function renderAccountTable() {
+      const body = document.getElementById("acctTableBody");
+      const meta = document.getElementById("acctMeta");
+      if (acctLoading && !acctRows.length) {
+        body.innerHTML = `<tr><td colspan="6" class="acct-empty">読み込み中…</td></tr>`;
+        meta.textContent = "";
+        return;
+      }
+      if (!acctRows.length) {
+        body.innerHTML = `<tr><td colspan="6" class="acct-empty">アカウントがありません</td></tr>`;
+        meta.textContent = "";
+        return;
+      }
+      const offCount = acctRows.filter(r => r.disabled).length;
+      meta.textContent = `全${acctRows.length}件（無効 ${offCount}件）｜あなたの操作範囲：`
+        + (acctIsAllStore(auth.currentUser && auth.currentUser.email) ? "全店" : `${acctMyBranch()}店のみ`);
+      body.innerHTML = acctRows.map(r => {
+        const op = acctOperable(r);
+        const busy = acctBusyUid !== null;
+        const label = acctBusyUid === r.uid ? "実行中…" : (r.disabled ? "再有効化" : "無効化");
+        const btn = `<span title="${escAttr(op.tip)}"><button class="acct-op ${r.disabled ? "enable" : "disable"}"`
+          + ` data-uid="${escAttr(r.uid)}" title="${escAttr(op.tip)}"`
+          + ` ${op.ok && !busy ? "" : "disabled"} onclick="toggleAccountDisabled(this.dataset.uid)">${label}</button></span>`
+          + (op.why ? `<span class="acct-why">${escAttr(op.why)}</span>` : "");
+        return `<tr class="${r.disabled ? "acct-disabled" : ""}">`
+          + `<td>${escAttr(r.displayName || "（氏名未登録）")}${r.isAdmin ? `<span class="acct-badge adm">管理者</span>` : ""}</td>`
+          + `<td>${escAttr(r.email)}</td>`
+          + `<td>${escAttr(r.branch)}</td>`
+          + `<td>${r.disabled ? `<span class="acct-badge off">無効</span>` : `<span class="acct-badge on">有効</span>`}</td>`
+          + `<td>${escAttr(acctFmtTime(r.lastSignInTime))}</td>`
+          + `<td class="acct-op-cell">${btn}</td>`
+          + `</tr>`;
+      }).join("");
+    }
+
+    async function loadAccounts() {
+      acctLoading = true;
+      renderAccountTable();
+      const rb = document.getElementById("acctReloadBtn");
+      rb.disabled = true;
+      try {
+        const res = await callListAccounts();
+        acctRows = Array.isArray(res.data) ? res.data : [];
+      } catch (e) {
+        console.error("listAccounts", e);
+        showToast("アカウント一覧の取得に失敗しました（" + e.message + "）", "error");
+      } finally {
+        acctLoading = false;
+        rb.disabled = false;
+        renderAccountTable();
+      }
+    }
+
+    window.openAccountModal = () => {
+      if (!isAdminUser) return;   // fail-closed（Functions 側でも admins を確認する）
+      acctRows = [];
+      document.getElementById("acctModal").style.display = "flex";
+      loadAccounts();
+    };
+    window.closeAccountModal = () => {
+      if (acctBusyUid) return;   // 実行中は閉じさせない（結果のトーストと一覧の更新を見届けるため）
+      document.getElementById("acctModal").style.display = "none";
+    };
+    window.reloadAccounts = () => { if (!acctBusyUid && !acctLoading) loadAccounts(); };
+
+    window.toggleAccountDisabled = async (uid) => {
+      if (!isAdminUser || acctBusyUid || acctLoading) return;
+      const r = acctRows.find(x => x.uid === uid);
+      if (!r) return;
+      const op = acctOperable(r);
+      if (!op.ok) { showToast(op.tip, "warn"); return; }
+      const next = !r.disabled;
+      const who = `${r.displayName || "（氏名未登録）"}（${r.email}）`;
+      const msg = next
+        ? `${who}を無効化します。\nログインできなくなりますが、過去のピン・グリッド・担当者名はそのまま残ります。\n再有効化はこの画面からいつでもできます。`
+        : `${who}を再有効化します。\n再びログインできるようになります。無効化はこの画面からいつでもできます。`;
+      if (!confirm(msg)) return;
+
+      acctBusyUid = uid;
+      renderAccountTable();
+      try {
+        const res = await callSetAccountDisabled({ uid, disabled: next });
+        showToast(`${r.displayName || r.email} を${res.data.disabled ? "無効化" : "再有効化"}しました`);
+      } catch (e) {
+        console.error("setAccountDisabled", e);
+        showToast("操作に失敗しました（" + e.message + "）", "error");
+      } finally {
+        acctBusyUid = null;
+      }
+      // 成否どちらでも一覧はサーバーから取り直す（画面の状態を Auth の実態に合わせる）
+      await loadAccounts();
+    };
+
     // ===== TOAST =====
     function showToast(msg, type = "ok") {
       const t = document.getElementById("toast");
@@ -3329,6 +3491,30 @@
     .areapoly-sec { font-size:12px; font-weight:700; color:#0f766e; background:#f0fdfa;
       border-left:3px solid #0D9488; padding:5px 8px; margin:14px 0 8px; border-radius:0 4px 4px 0; }
 
+    /* アカウント管理（U-1）。モーダル外枠は .kouzu-modal 系を流用し、固有部分だけ定義する */
+    .acct-btn { border-color:#64748b; color:#cbd5e1; }
+    .acct-modal-box { width:min(960px,100%); max-height:calc(100vh - 32px); }
+    .acct-meta { font-size:12px; color:#475569; }
+    .acct-note { font-size:11px; color:#64748b; }
+    .acct-table-wrap { overflow:auto; border:1px solid #e2e8f0; border-radius:6px; min-height:120px; }
+    .acct-table { width:100%; border-collapse:collapse; font-size:12px; color:#1e293b; }
+    .acct-table th { position:sticky; top:0; background:#f8fafc; text-align:left; font-weight:700; color:#475569;
+      padding:7px 8px; border-bottom:1px solid #e2e8f0; white-space:nowrap; }
+    .acct-table td { padding:6px 8px; border-bottom:1px solid #f1f5f9; white-space:nowrap; }
+    .acct-table tr.acct-disabled td { background:#f1f5f9; color:#94a3b8; }
+    .acct-empty { text-align:center; color:#64748b; padding:18px 8px !important; }
+    .acct-badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:700; }
+    .acct-badge.on  { background:#dcfce7; color:#166534; }
+    .acct-badge.off { background:#e5e7eb; color:#374151; border:1px solid #9ca3af; }
+    .acct-badge.adm { background:#ede9fe; color:#6d28d9; margin-left:6px; }
+    .acct-op { padding:4px 12px; border-radius:6px; font-size:12px; font-weight:700; cursor:pointer;
+      font-family:inherit; border:1px solid; background:#fff; }
+    .acct-op.disable { color:#b91c1c; border-color:#f87171; }
+    .acct-op.enable  { color:#047857; border-color:#34d399; }
+    /* 押せないボタンは色を抜いて、見た目だけで押せる/押せないが分かるようにする */
+    .acct-op:disabled { background:#f1f5f9; color:#cbd5e1; border-color:#e2e8f0; cursor:not-allowed; }
+    .acct-why { margin-left:6px; font-size:11px; color:#94a3b8; }
+
     .toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
       padding: 10px 20px; border-radius: 20px; font-size: 13px; font-weight: 500;
@@ -3384,6 +3570,8 @@
     <button class="layer-btn round-mgr" id="roundMgrBtn" style="display:none" onclick="openRoundManager()" title="エリアごとに新しい周回を開始（管理者専用）">🔄 周回管理</button>
     <!-- 行政界ポリゴン取込（E-1・管理者専用）。周回管理と同じく既定 display:none。 -->
     <button class="layer-btn areapoly-btn" id="areaPolyBtn" style="display:none" onclick="openAreaPolyModal()" title="大字(OAZ)の行政界ポリゴンをゼンリンから取り込む（管理者専用）">🗾 行政界取込</button>
+    <!-- アカウント管理（U-1・管理者専用）。周回管理と同じく既定 display:none。 -->
+    <button class="layer-btn acct-btn" id="acctBtn" style="display:none" onclick="openAccountModal()" title="調査員アカウントの一覧・無効化／再有効化（管理者専用）">👤 アカウント管理</button>
     <button class="grid-btn" id="gridBtn" onclick="toggleGridMode()" title="調査グリッド進捗の表示切替">▦ グリッド</button>
     <!-- グリッド編集（代理入力）。既定OFF・localStorageに保存しない＝開き直すたびOFFから始まる。 -->
     <button class="grid-btn grid-edit" id="gridEditBtn" onclick="toggleGridEditMode()" title="ONの間だけマスをタップで記録／解除（確認ダイアログなし・↩で取消）">✏ グリッド編集</button>
@@ -3568,6 +3756,26 @@
     <div class="areapoly-prog" id="areaPolyProg"></div>
     <div class="areapoly-bar" id="areaPolyBar" style="display:none"><i></i></div>
     <div class="areapoly-result" id="areaPolyResult" style="display:none"></div>
+  </div>
+</div>
+
+<!-- アカウント管理（U-1・管理者専用）。表示は全店・操作は自店のみ。
+     権限の本体は Functions setAccountDisabled（自分／管理者／他店は Functions が弾く）。 -->
+<div id="acctModal" class="kouzu-modal" style="display:none">
+  <div class="kouzu-modal-box acct-modal-box">
+    <div class="kouzu-modal-title">👤 アカウント管理</div>
+    <div class="acct-meta" id="acctMeta"></div>
+    <div class="acct-note">無効化するとログインできなくなります。過去のピン・グリッド・担当者名は残ります。新規作成・パスワード・削除はこの画面では扱いません。<br>管理者アカウントの無効化はこの画面では行いません（スクリプト対応）。</div>
+    <div class="acct-table-wrap">
+      <table class="acct-table">
+        <thead><tr><th>氏名</th><th>メール</th><th>拠点</th><th>状態</th><th>最終ログイン</th><th>操作</th></tr></thead>
+        <tbody id="acctTableBody"></tbody>
+      </table>
+    </div>
+    <div class="kouzu-modal-actions">
+      <button class="kouzu-cancel" id="acctReloadBtn" onclick="reloadAccounts()">↻ 再読込</button>
+      <button class="kouzu-cancel" onclick="closeAccountModal()">閉じる</button>
+    </div>
   </div>
 </div>
 

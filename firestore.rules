@@ -101,5 +101,13 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
     // ───────────────────────────────────────────────────────────────
+
+    // アカウント操作の監査ログ（account_audit_logs）。U-1（アカウント管理）で新設。
+    //   書き込みは Cloud Functions setAccountDisabled（Admin SDK＝rules をバイパス）だけ。
+    //   クライアントからは誰も書けない。閲覧は管理者のみ（閲覧UIは U-1 では作らない）。
+    match /account_audit_logs/{doc} {
+      allow read: if exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+      allow write: if false;
+    }
   }
 }
