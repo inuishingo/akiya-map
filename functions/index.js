@@ -7,7 +7,8 @@
  * ├─ listAccounts       : 調査員アカウント一覧（callable・管理者専用）
  * ├─ setAccountDisabled : アカウントの無効化／再有効化（callable・管理者専用・監査ログ付き）
  * ├─ createSurveyorAccount : 調査員アカウントの新規作成（callable・管理者専用・自店ドメインのみ）
- * └─ resetSurveyorPassword : 調査員アカウントのパスワード再発行（callable・管理者専用）
+ * ├─ resetSurveyorPassword : 調査員アカウントのパスワード再発行・任意設定（callable・管理者専用）
+ * └─ updateSurveyorName    : 氏名（displayNames.name）の変更（callable・管理者専用・他店チェックのみ）
  *
  * 【重要】この3つは必ず同じ codebase に置くこと。
  *   一部だけをローカルに置いた状態で `firebase deploy --only functions` を打つと、
@@ -475,20 +476,10 @@ async function callerBranchOf(caller) {
   return branchFromDisplayName(snap && snap.exists ? snap.data() : null, caller.email);
 }
 
-// 既存アカウントを操作する前のガード（U-1 のガード1〜3。setAccountDisabled / resetSurveyorPassword 共通）
-//   順序とメッセージは U-1 から変えない。verb は「管理者アカウントはこの画面から{verb}できません」にだけ使う。
-async function assertOperableTarget(caller, uid, verb) {
-  // ガード1：自分自身は不可
-  if (uid === caller.uid) {
-    throw new HttpsError("failed-precondition", "自分のアカウントは操作できません");
-  }
-
-  const db = admin.firestore();
-  // ガード2：管理者アカウントは不可（ロックアウト防止）
-  if ((await db.doc(`admins/${uid}`).get()).exists) {
-    throw new HttpsError("failed-precondition", `管理者アカウントはこの画面から${verb}できません`);
-  }
-
+// 対象アカウントを引き、他店チェック（ガード3）だけを行う。
+//   assertOperableTarget（ガード1〜3）と updateSurveyorName（ガード3のみ）で共用する。
+//   not-found → 他店 の順序とメッセージは U-1 から変えない。
+async function resolveTargetInCallerBranch(caller, uid) {
   let target;
   try {
     target = await admin.auth().getUser(uid);
@@ -501,21 +492,40 @@ async function assertOperableTarget(caller, uid, verb) {
   // ガード3：他店のアカウントは不可（全店扱いのメールはこのチェックのみスキップ）
   const [callerBranch, targetDn] = await Promise.all([
     callerBranchOf(caller),
-    targetEmail ? db.doc(`displayNames/${targetEmail}`).get() : Promise.resolve(null),
+    targetEmail ? admin.firestore().doc(`displayNames/${targetEmail}`).get() : Promise.resolve(null),
   ]);
   const targetBranch = branchFromDisplayName(targetDn && targetDn.exists ? targetDn.data() : null, targetEmail);
   if (!isAllStoreEmail(caller.email) && callerBranch !== targetBranch) {
     throw new HttpsError("permission-denied", `他店のアカウントです（${targetBranch}店）`);
   }
+  return { targetEmail, targetBranch, targetDn };
+}
+
+// 既存アカウントを操作する前のガード（U-1 のガード1〜3。setAccountDisabled / resetSurveyorPassword 共通）
+//   順序とメッセージは U-1 から変えない。verb は「管理者アカウントはこの画面から{verb}できません」にだけ使う。
+async function assertOperableTarget(caller, uid, verb) {
+  // ガード1：自分自身は不可
+  if (uid === caller.uid) {
+    throw new HttpsError("failed-precondition", "自分のアカウントは操作できません");
+  }
+
+  // ガード2：管理者アカウントは不可（ロックアウト防止）
+  if ((await admin.firestore().doc(`admins/${uid}`).get()).exists) {
+    throw new HttpsError("failed-precondition", `管理者アカウントはこの画面から${verb}できません`);
+  }
+
+  // not-found → ガード3
+  const { targetEmail, targetBranch } = await resolveTargetInCallerBranch(caller, uid);
   return { targetEmail, targetBranch };
 }
 
 // 監査ログ。Auth の変更は既に確定しているので、ここで失敗しても呼び出し元は ok を返す
 // （失敗を返すと画面と実態がズレる）。取りこぼしは Cloud Logging で追えるようにする。
-// ★パスワードは渡さない・残さない。
-async function writeAuditLog(action, { targetUid, targetEmail, caller, branch }) {
+// ★パスワードは渡さない・残さない。extra は操作ごとの追加項目（U-3：oldName / newName / method）。
+async function writeAuditLog(action, { targetUid, targetEmail, caller, branch }, extra = {}) {
   try {
     await admin.firestore().collection("account_audit_logs").add({
+      ...extra,
       action,
       targetUid,
       targetEmail,
@@ -673,6 +683,54 @@ exports.createSurveyorAccount = onCall(async (request) => {
   return { ok: true, uid: user.uid, email, password };
 });
 
+// ── U-3：パスワードの手入力（resetSurveyorPassword の password 引数）の検査 ──
+//   違反なら「何が駄目か」を具体的に書いたメッセージを返す。問題なければ null。
+//   ★このリポジトリは Public。実運用で配っている共通パスワードの文字列はここに書かない。
+//     それらは「6桁の数字だけ」なので、長さ（8文字以上）と英字・数字の混在で必ず弾かれる。
+//     下の拒否リストは、一般に推測されやすい文字列だけを置く。
+const PW_MANUAL_MIN = 8;
+const PW_MANUAL_MAX = 64;
+const PW_DENYLIST = new Set([
+  "password", "password1", "passw0rd", "p@ssw0rd", "12345678", "123456789", "1234567890",
+  "11111111", "00000000", "qwerty123", "abcd1234", "abc12345", "1q2w3e4r", "asdf1234",
+  "houseneko", "housemarket", "century21",
+]);
+function isRepeatOrSequence(s) {
+  const t = s.toLowerCase();
+  if (t.split("").every(ch => ch === t[0])) return true;   // aaaaaaaa
+  const step = t.charCodeAt(1) - t.charCodeAt(0);
+  if (step !== 1 && step !== -1) return false;
+  for (let i = 1; i < t.length; i++) {
+    if (t.charCodeAt(i) - t.charCodeAt(i - 1) !== step) return false;
+  }
+  return true;                                              // 12345678 / abcdefgh / 87654321
+}
+function manualPasswordProblem(pw, email) {
+  if (pw.length < PW_MANUAL_MIN || pw.length > PW_MANUAL_MAX) {
+    return `パスワードは${PW_MANUAL_MIN}文字以上${PW_MANUAL_MAX}文字以下にしてください`;
+  }
+  // ASCII の印字可能文字（0x21 '!' 〜 0x7e '~'）のみ。空白・全角・制御文字は不可
+  if (!/^[!-~]+$/.test(pw)) {
+    return "パスワードは半角の英字・数字・記号だけで入力してください（空白・全角文字は使えません）";
+  }
+  if (PW_DENYLIST.has(pw.toLowerCase())) {
+    return "推測されやすいパスワードは使えません。別の文字列にしてください";
+  }
+  if (isRepeatOrSequence(pw)) {
+    return "同じ文字の繰り返しや、連番（12345678・abcdefgh など）だけのパスワードは使えません";
+  }
+  const localPart = String(email || "").split("@")[0].toLowerCase();
+  const lower = pw.toLowerCase();
+  // 含むかどうかは3文字以上のローカルパートだけで見る（「01」等の短いローカルパートで大半の文字列が弾かれるのを防ぐ）
+  if (localPart && (lower === localPart || (localPart.length >= 3 && lower.includes(localPart)))) {
+    return `メールアドレスの@より前（${localPart}）を含むパスワードは使えません`;
+  }
+  if (!/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw)) {
+    return "英字と数字をそれぞれ1文字以上混ぜてください";
+  }
+  return null;
+}
+
 exports.resetSurveyorPassword = onCall(async (request) => {
   assertNotProdAuthFromEmulator();
   const caller = await assertAdminCaller(request);
@@ -681,12 +739,79 @@ exports.resetSurveyorPassword = onCall(async (request) => {
   if (typeof uid !== "string" || !uid) {
     throw new HttpsError("invalid-argument", "uid(string) が必要です");
   }
+  // U-3：password を渡したら手入力、省略（undefined / null）なら従来どおり自動生成
+  const rawPassword = request.data.password;
+  const manual = rawPassword !== undefined && rawPassword !== null;
+  if (manual && typeof rawPassword !== "string") {
+    throw new HttpsError("invalid-argument", "パスワードは文字列で指定してください");
+  }
 
+  // ガードは手入力でも3つ全部（管理者のパスワードを他人が決められる＝乗っ取りになるため、ガード2は外さない）
   const { targetEmail, targetBranch } = await assertOperableTarget(caller, uid, "パスワードを再発行");
 
-  const password = generatePassword();
+  if (manual) {
+    const problem = manualPasswordProblem(rawPassword, targetEmail);
+    if (problem) throw new HttpsError("invalid-argument", problem);
+  }
+
+  const password = manual ? rawPassword : generatePassword();
   await admin.auth().updateUser(uid, { password });
-  await writeAuditLog("reset_password", { targetUid: uid, targetEmail, caller, branch: targetBranch });
+  await writeAuditLog("reset_password", { targetUid: uid, targetEmail, caller, branch: targetBranch },
+    { method: manual ? "manual" : "auto" });
 
   return { ok: true, uid, email: targetEmail, password };
+});
+
+// ═══════════════════════════════════════════════════════════════
+// アカウント管理（U-3）: updateSurveyorName
+//
+//   displayNames/{email}.name だけを書き換える（誤字・改姓・表記ゆれの訂正）。
+//   ★ガードは他店チェック（ガード3）だけ。自分・管理者の氏名も直せる（権限を増減せず完全に可逆なため。
+//     自分・管理者を弾くと、管理者の氏名を直す手段が画面から消えてスクリプトに戻る）。
+//   ★name は過去のピン・グリッドの担当者名表示にも引かれる＝変更は過去データの表示にも遡って効く。
+//   branch・order など他のフィールドは触らない。doc が無い場合は作らない（not-found）。
+// ═══════════════════════════════════════════════════════════════
+function hasControlChar(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c <= 0x1f || c === 0x7f) return true;
+  }
+  return false;
+}
+
+exports.updateSurveyorName = onCall(async (request) => {
+  assertNotProdAuthFromEmulator();
+  const caller = await assertAdminCaller(request);
+
+  const uid = request.data && request.data.uid;
+  const rawName = request.data && request.data.name;
+  if (typeof uid !== "string" || !uid) {
+    throw new HttpsError("invalid-argument", "uid(string) が必要です");
+  }
+  const name = typeof rawName === "string" ? rawName.trim() : rawName;
+  if (typeof name !== "string" || !name || Array.from(name).length > NAME_MAX || hasControlChar(name)) {
+    throw new HttpsError("invalid-argument", `氏名は1〜${NAME_MAX}文字で入力してください（改行などは使えません）`);
+  }
+
+  const { targetEmail, targetBranch, targetDn } = await resolveTargetInCallerBranch(caller, uid);
+  if (!targetDn || !targetDn.exists) {
+    throw new HttpsError("not-found", "氏名の登録がありません");
+  }
+
+  const oldName = targetDn.data().name || "";
+  if (oldName === name) {
+    return { ok: true, uid, email: targetEmail, name };   // 変更なし：書き込まない・監査ログも残さない
+  }
+
+  try {
+    // update() は name だけを書く（branch・order 等は巻き込まない）。doc が消えていれば失敗する＝新規作成しない
+    await targetDn.ref.update({ name });
+  } catch (e) {
+    if (e.code === 5 || e.code === "not-found") throw new HttpsError("not-found", "氏名の登録がありません");
+    throw e;
+  }
+  await writeAuditLog("update_name", { targetUid: uid, targetEmail, caller, branch: targetBranch },
+    { oldName, newName: name });
+
+  return { ok: true, uid, email: targetEmail, name };
 });

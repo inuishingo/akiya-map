@@ -463,6 +463,8 @@
         // アカウント一覧は他人の個人情報なので、ログアウト時に画面からも捨てる
         acctRows = [];
         hideAcctPwPanel();   // 発行したパスワードも画面から捨てる
+        closeAcctPwForm();   // 手入力途中のパスワードも捨てる
+        acctEditingUid = null;
         const am = document.getElementById("acctModal");
         if (am) am.style.display = "none";
       }
@@ -2992,8 +2994,12 @@
     let acctRows = [];          // listAccounts の結果（branch → email 昇順）
     let acctLoading = false;
     let acctBusyUid = null;     // 実行中の対象uid（作成中は "__create__"）。実行中は全ボタンを止める（二度押し・並行実行の防止）
-    let acctBusyAction = null;  // 実行中の操作（"toggle" | "reset" | "create"）。「実行中…」をどのボタンに出すかに使う
+    let acctBusyAction = null;  // 実行中の操作（"toggle" | "reset" | "create" | "name"）。「実行中…」をどのボタンに出すかに使う
     let acctPwShown = null;     // 発行結果パネルに表示中の { email, password }。閉じたら捨てる（どこにも保存しない）
+    const callUpdateSurveyorName = httpsCallable(functions, "updateSurveyorName");
+    let acctEditingUid = null;  // U-3：氏名をインライン編集中の行の uid（同時に1行だけ）
+    let acctNameDraft = "";     // 編集中の氏名（一覧を描き直しても入力途中の値を失わないよう保持）
+    let acctPwFormUid = null;   // U-3：パスワード再発行フォームを開いている対象の uid
 
     // 作成を許すドメイン（Functions の ALLOWED_DOMAINS と同一。ここは選択肢を絞る見た目だけで、本体は Functions）
     const ACCT_ALLOWED_DOMAINS = { "名古屋": ["hm.com"], "京都": ["kyoto-hm.com"] };
@@ -3077,7 +3083,7 @@
           + ` ${dis} onclick="resetAccountPassword(this.dataset.uid)">${running("reset") ? "実行中…" : "PW再発行"}</button></span>`
           + (op.why ? `<span class="acct-why">${escAttr(op.why)}</span>` : "");
         return `<tr class="${r.disabled ? "acct-disabled" : ""}">`
-          + `<td>${escAttr(r.displayName || "（氏名未登録）")}${r.isAdmin ? `<span class="acct-badge adm">管理者</span>` : ""}</td>`
+          + `<td class="acct-name-cell">${acctNameCell(r, busy)}</td>`
           + `<td>${escAttr(r.email)}</td>`
           + `<td>${escAttr(r.branch)}</td>`
           + `<td>${r.disabled ? `<span class="acct-badge off">無効</span>` : `<span class="acct-badge on">有効</span>`}</td>`
@@ -3085,7 +3091,89 @@
           + `<td class="acct-op-cell">${btn}</td>`
           + `</tr>`;
       }).join("");
+      updateAcctPwFormExec();
     }
+
+    // ── U-3：氏名セル（インライン編集）─────────────────────
+    // ✏️ の出し分けは他店チェックだけ（Functions updateSurveyorName のガードと同じ）。自分・管理者の行でも出す。
+    // displayNames が無いアカウント（氏名未登録）は Functions が not-found を返すので ✏️ を出さない。
+    function acctNameCell(r, busy) {
+      const me = auth.currentUser;
+      const adminBadge = r.isAdmin ? `<span class="acct-badge adm">管理者</span>` : "";
+      if (acctBusyUid === r.uid && acctBusyAction === "name") {
+        return `<span class="acct-saving">保存中…</span>${adminBadge}`;
+      }
+      if (acctEditingUid === r.uid) {
+        return `<span class="acct-name-edit">`
+          + `<input id="acctNameInput" class="acct-name-input" type="text" maxlength="${ACCT_NAME_MAX}" value="${escAttr(acctNameDraft)}"`
+          + ` oninput="onAcctNameInput(this.value)" onkeydown="onAcctNameKey(event)" aria-label="氏名">`
+          + `<button class="acct-icon" title="保存（Enter）" ${busy ? "disabled" : ""} onclick="saveAcctName()">✓</button>`
+          + `<button class="acct-icon" title="キャンセル（Esc）" onclick="cancelAcctName()">✕</button>`
+          + `</span>${adminBadge}`;
+      }
+      const label = escAttr(r.displayName || "（氏名未登録）");
+      const otherBranch = !(me && acctIsAllStore(me.email)) && r.branch !== acctMyBranch();
+      if (otherBranch) return `<span title="他店のアカウント">${label}</span>${adminBadge}`;
+      if (!r.displayName) return `<span title="氏名の登録がありません（スクリプト対応）">${label}</span>${adminBadge}`;
+      return `${label}<button class="acct-name-pen" data-uid="${escAttr(r.uid)}" title="氏名を変更"`
+        + ` ${busy ? "disabled" : ""} onclick="startAcctNameEdit(this.dataset.uid)">✏️</button>${adminBadge}`;
+    }
+    window.startAcctNameEdit = (uid) => {
+      if (!isAdminUser || acctBusyUid || acctLoading) return;
+      const r = acctRows.find(x => x.uid === uid);
+      if (!r || !r.displayName) return;
+      acctEditingUid = uid;
+      acctNameDraft = r.displayName;
+      renderAccountTable();
+      const el = document.getElementById("acctNameInput");
+      if (el) { el.focus(); el.select(); }
+    };
+    window.cancelAcctName = () => {
+      if (acctBusyAction === "name") return;
+      acctEditingUid = null;
+      acctNameDraft = "";
+      renderAccountTable();
+    };
+    window.onAcctNameInput = (v) => { acctNameDraft = v; };
+    window.onAcctNameKey = (e) => {
+      if (e.isComposing || e.keyCode === 229) return;   // 日本語入力の変換確定の Enter では保存しない
+      if (e.key === "Enter") { e.preventDefault(); saveAcctName(); }
+      else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelAcctName(); }
+    };
+    window.saveAcctName = async () => {
+      if (!isAdminUser || acctBusyUid || acctLoading || !acctEditingUid) return;
+      const r = acctRows.find(x => x.uid === acctEditingUid);
+      if (!r) { cancelAcctName(); return; }
+      const name = acctNameDraft.trim();
+      if (!name || Array.from(name).length > ACCT_NAME_MAX) {
+        showToast(`氏名は1〜${ACCT_NAME_MAX}文字で入力してください`, "error"); return;
+      }
+      if (name === r.displayName) { cancelAcctName(); return; }   // 変更なし：呼ばない
+      if (!confirm(`${r.displayName} を ${name} に変更します。\n過去のピン・グリッドの担当者名もすべて新しい氏名で表示されるようになります。`)) return;
+
+      acctBusyUid = r.uid;
+      acctBusyAction = "name";
+      renderAccountTable();
+      let ok = false;
+      try {
+        await callUpdateSurveyorName({ uid: r.uid, name });
+        ok = true;
+        acctEditingUid = null;
+        acctNameDraft = "";
+        showToast(`氏名を「${name}」に変更しました`);
+      } catch (e) {
+        console.error("updateSurveyorName", e);
+        showToast("氏名の変更に失敗しました（" + e.message + "）", "error");   // 編集欄は開いたまま＝直して再保存できる
+      } finally {
+        acctBusyUid = null;
+        acctBusyAction = null;
+      }
+      if (ok) {
+        // この画面の担当者名（ピン一覧・担当者フィルタ）も新しい氏名で出し直す
+        try { await buildStaffNames(); updateStaffFilter(); renderList(); } catch (e) { console.warn("staff names refresh", e); }
+      }
+      await loadAccounts();
+    };
 
     async function loadAccounts() {
       acctLoading = true;
@@ -3108,14 +3196,18 @@
     window.openAccountModal = () => {
       if (!isAdminUser) return;   // fail-closed（Functions 側でも admins を確認する）
       acctRows = [];
+      acctEditingUid = null;
       closeAcctCreateForm();
+      closeAcctPwForm();
       document.getElementById("acctModal").style.display = "flex";
       loadAccounts();
     };
     window.closeAccountModal = () => {
       if (acctBusyUid) return;   // 実行中は閉じさせない（結果のトーストと一覧の更新を見届けるため）
       if (acctPwShown) return;   // 発行したパスワードの表示中は閉じさせない（先にパネルを閉じる）
+      acctEditingUid = null;
       closeAcctCreateForm();
+      closeAcctPwForm();
       document.getElementById("acctModal").style.display = "none";
     };
     window.reloadAccounts = () => { if (!acctBusyUid && !acctLoading) loadAccounts(); };
@@ -3155,6 +3247,7 @@
       if (!isAdminUser || acctBusyUid || acctLoading) return;
       const domains = acctCreatableDomains();
       if (!domains.length) { showToast("作成できるドメインがありません", "warn"); return; }
+      closeAcctPwForm();
       document.getElementById("acctNewName").value = "";
       document.getElementById("acctNewLocal").value = "";
       document.getElementById("acctNewDomain").innerHTML =
@@ -3219,28 +3312,95 @@
       await loadAccounts();
     };
 
-    // ── U-2：パスワード再発行 ─────────────────────────────
-    window.resetAccountPassword = async (uid) => {
+    // ── U-2 / U-3：パスワード再発行（自動で発行する／手で決める）──────
+    // 「PW再発行」でフォームを開き、実行時に U-2 と同じ confirm を出す。押せる条件（ガード1〜3）は U-2 のまま。
+    // 手入力の検査は画面では a〜c（長さ・半角・英数混在）だけ。拒否リスト等は Functions 側で行う。
+    function acctManualPwProblem(pw) {
+      if (pw.length < 8 || pw.length > 64) return "8文字以上（64文字以下）にしてください";
+      for (const ch of pw) {
+        const c = ch.charCodeAt(0);
+        if (c < 33 || c > 126) return "半角の英字・数字・記号だけにしてください（空白・全角文字は使えません）";
+      }
+      if (!/[A-Za-z]/.test(pw) || !/[0-9]/.test(pw)) return "英字と数字をそれぞれ1文字以上混ぜてください";
+      return "";
+    }
+    function acctPwMode() {
+      const el = document.querySelector('input[name="acctPwMode"]:checked');
+      return el ? el.value : "auto";
+    }
+    function updateAcctPwFormExec() {
+      const btn = document.getElementById("acctPwFormExecBtn");
+      if (!btn || !acctPwFormUid) return;
+      const manual = acctPwMode() === "manual";
+      const problem = manual ? acctManualPwProblem(document.getElementById("acctPwManual").value) : "";
+      document.getElementById("acctPwRuleNg").textContent = manual && document.getElementById("acctPwManual").value ? problem : "";
+      btn.disabled = acctBusyUid !== null || acctLoading || (manual && !!problem);
+    }
+    function closeAcctPwForm() {
+      acctPwFormUid = null;
+      const f = document.getElementById("acctPwForm");
+      if (!f) return;
+      f.style.display = "none";
+      document.getElementById("acctPwManual").value = "";   // 入力したパスワードを画面に残さない
+    }
+    window.closeAcctPwForm = () => { if (acctBusyAction !== "reset") closeAcctPwForm(); };
+    window.onAcctPwModeChange = () => {
+      const manual = acctPwMode() === "manual";
+      document.getElementById("acctPwManualBox").style.display = manual ? "" : "none";
+      if (manual) document.getElementById("acctPwManual").focus();
+      updateAcctPwFormExec();
+    };
+    window.onAcctPwManualInput = () => updateAcctPwFormExec();
+
+    window.resetAccountPassword = (uid) => {
       if (!isAdminUser || acctBusyUid || acctLoading) return;
       const r = acctRows.find(x => x.uid === uid);
       if (!r) return;
       const op = acctOperable(r);
       if (!op.ok) { showToast(op.tip, "warn"); return; }
+      closeAcctCreateForm();
+      acctPwFormUid = uid;
+      document.getElementById("acctPwFormTarget").textContent = `${r.displayName || "（氏名未登録）"}（${r.email}）`;
+      document.querySelector('input[name="acctPwMode"][value="auto"]').checked = true;
+      document.getElementById("acctPwManual").value = "";
+      document.getElementById("acctPwManualBox").style.display = "none";
+      document.getElementById("acctPwForm").style.display = "";
+      updateAcctPwFormExec();
+    };
+
+    window.submitAcctPwForm = async () => {
+      if (!isAdminUser || acctBusyUid || acctLoading || !acctPwFormUid) return;
+      const uid = acctPwFormUid;
+      const r = acctRows.find(x => x.uid === uid);
+      if (!r) { closeAcctPwForm(); return; }
+      const op = acctOperable(r);
+      if (!op.ok) { showToast(op.tip, "warn"); return; }
+      const manual = acctPwMode() === "manual";
+      const manualPw = document.getElementById("acctPwManual").value;
+      if (manual) {
+        const problem = acctManualPwProblem(manualPw);
+        if (problem) { showToast(problem, "error"); return; }
+      }
       const who = `${r.displayName || "（氏名未登録）"}（${r.email}）`;
       if (!confirm(`${who}のパスワードを再発行します。\n現在のパスワードは使えなくなります。新しいパスワードは1回だけ表示されます。`)) return;
 
       acctBusyUid = uid;
       acctBusyAction = "reset";
+      const btn = document.getElementById("acctPwFormExecBtn");
+      btn.textContent = "再発行中…";
       renderAccountTable();
       try {
-        const res = await callResetSurveyorPassword({ uid });
+        const res = await callResetSurveyorPassword(manual ? { uid, password: manualPw } : { uid });
+        closeAcctPwForm();
         showAcctPwPanel("reset", { name: r.displayName, email: res.data.email, password: res.data.password });
       } catch (e) {
         console.error("resetSurveyorPassword", e);
+        // 手入力が Functions の検査（拒否リスト等）で弾かれた場合もここ。フォームは開いたまま＝直して再実行できる
         showToast("再発行に失敗しました（" + e.message + "）", "error");
       } finally {
         acctBusyUid = null;
         acctBusyAction = null;
+        btn.textContent = "再発行する";
       }
       await loadAccounts();
     };
@@ -3721,6 +3881,24 @@
     .acct-pw-copied { font-size:12px; color:#047857; min-height:16px; }
     .acct-pw-warn { font-size:13px; font-weight:700; color:#991b1b; background:#fef2f2; border:1px solid #fecaca;
       border-radius:6px; padding:8px 10px; }
+    /* U-3：氏名のインライン編集・パスワード再発行フォーム */
+    .acct-name-pen { margin-left:4px; padding:0 4px; border:none; background:transparent; font-size:12px;
+      line-height:1; cursor:pointer; vertical-align:middle; }
+    .acct-name-pen:not(:disabled) { opacity:.85; }
+    .acct-name-pen:not(:disabled):hover { opacity:1; }
+    /* 押せない ✏️ は色を抜いて薄くする（絵文字は color が効かないので filter / opacity で区別する） */
+    .acct-name-pen:disabled { filter:grayscale(1); opacity:.3; cursor:not-allowed; }
+    .acct-name-edit { display:inline-flex; align-items:center; gap:4px; }
+    .acct-name-input { width:150px; padding:3px 6px; border:1px solid #06B6D4; border-radius:5px; font-size:12px; font-family:inherit; }
+    .acct-icon { padding:2px 7px; border:1px solid #cbd5e1; border-radius:5px; background:#fff; font-size:12px; cursor:pointer; }
+    .acct-icon:disabled { color:#cbd5e1; cursor:not-allowed; }
+    .acct-saving { color:#0e7490; font-weight:700; }
+    #acctModal .round-exec:disabled { opacity:.45; cursor:not-allowed; }   /* 他のモーダルの見た目は変えない */
+    .acct-radio { display:flex; align-items:center; gap:6px; font-size:13px; color:#1e293b; cursor:pointer; }
+    .acct-pw-input { width:260px; padding:7px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:15px;
+      font-family:ui-monospace, "Consolas", monospace; letter-spacing:.04em; outline:none; margin:4px 0; }
+    .acct-pw-input:focus { border-color:#06B6D4; }
+    .acct-pw-rule-ng { font-size:12px; color:#b91c1c; min-height:16px; }
 
     .toast {
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -3994,6 +4172,23 @@
       <div class="kouzu-modal-actions">
         <button class="kouzu-cancel" onclick="closeAcctCreateForm()">キャンセル</button>
         <button class="kouzu-save" id="acctCreateBtn" onclick="submitAcctCreate()">作成する</button>
+      </div>
+    </div>
+    <!-- U-3：パスワード再発行フォーム。自動で発行する（推奨）／手で決める。
+         手入力欄は伏せない（管理者が本人に伝えるための文字列で、打ち間違いの確認が要るため）。 -->
+    <div class="acct-create" id="acctPwForm" style="display:none">
+      <div class="acct-create-title">パスワードを再発行：<span id="acctPwFormTarget"></span></div>
+      <label class="acct-radio"><input type="radio" name="acctPwMode" value="auto" checked onchange="onAcctPwModeChange()"> 自動で発行する（推奨）</label>
+      <label class="acct-radio"><input type="radio" name="acctPwMode" value="manual" onchange="onAcctPwModeChange()"> 手で決める</label>
+      <div id="acctPwManualBox" style="display:none">
+        <input id="acctPwManual" class="acct-pw-input" type="text" maxlength="64" autocomplete="off" autocapitalize="off"
+          spellcheck="false" oninput="onAcctPwManualInput()" aria-label="新しいパスワード" placeholder="例：genba2026">
+        <div class="acct-note">8文字以上・英字と数字を混ぜる・今まで配っていた共通パスワードは使えません</div>
+        <div class="acct-pw-rule-ng" id="acctPwRuleNg"></div>
+      </div>
+      <div class="kouzu-modal-actions">
+        <button class="kouzu-cancel" onclick="closeAcctPwForm()">キャンセル</button>
+        <button class="round-exec" id="acctPwFormExecBtn" onclick="submitAcctPwForm()">再発行する</button>
       </div>
     </div>
     <div class="acct-note">無効化するとログインできなくなります。過去のピン・グリッド・担当者名は残ります。アカウントの削除はこの画面では扱いません。<br>管理者アカウントの無効化・パスワード再発行はこの画面では行いません（スクリプト対応）。</div>

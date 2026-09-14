@@ -2,12 +2,18 @@
  * アカウント管理の自動検証
  *   U-1：listAccounts / setAccountDisabled / account_audit_logs の rules
  *   U-2：createSurveyorAccount / resetSurveyorPassword（店縛り・重複・ロールバック・PW個別化・監査ログ）
+ *   U-3：updateSurveyorName / resetSurveyorPassword の手入力パスワード（検査 a〜f・method・回帰）
  *
  *   前提：npm run emu:auth（auth,firestore,functions）が起動していること。
  *   実行：
  *     $env:FIREBASE_AUTH_EMULATOR_HOST = "127.0.0.1:9099"
  *     $env:FIRESTORE_EMULATOR_HOST     = "127.0.0.1:8080"
+ *     $env:SHARED_PASSWORDS            = "<実運用の共通パスワードをカンマ区切りで>"
  *     node scripts/verify-u1-accounts.mjs
+ *
+ * 【共通パスワードはファイルに書かない】このリポジトリは Public。
+ *   「共通パスワードでは入れない／設定できない」ことの検証値は SHARED_PASSWORDS（実行するシェルの中だけ）から読む。
+ *   未設定なら該当の検査は不合格として数える（黙って飛ばさない）。
  *
  * 【安全装置】FIREBASE_AUTH_EMULATOR_HOST / FIRESTORE_EMULATOR_HOST が無い、またはループバックでなければ即終了。
  *   Functions の呼び先も 127.0.0.1 固定。本番のエンドポイントへ向ける経路をコードに持たない。
@@ -26,6 +32,9 @@ const REGION = "asia-northeast1";
 const FUNCTIONS = `http://127.0.0.1:5001/${PROJECT}/${REGION}`;   // firebase.json emulators.functions.port
 const AUTH = `http://${AUTH_HOST}`;
 const FS_DOCS = `http://${FS_HOST}/v1/projects/${PROJECT}/databases/(default)/documents`;
+
+// 実運用の共通パスワード（ファイルに書かない。実行時の環境変数からだけ読む）
+const SHARED_PASSWORDS = String(process.env.SHARED_PASSWORDS || "").split(",").map(s => s.trim()).filter(Boolean);
 
 const byEmail = Object.fromEntries(ACCOUNTS.map(a => [a.email, a]));
 const U = {
@@ -262,7 +271,10 @@ async function main() {
   check("表示されたパスワードでログインできる", !!(await signIn(created.email, created.password)).idToken);
   const wrong = await signIn(created.email, "wrongpass22");
   check("それ以外のパスワードでは失敗する", !wrong.idToken, JSON.stringify(wrong));
-  check("共通PW（212121）では失敗する", !(await signIn(created.email, "212121")).idToken);
+  let sharedFail = SHARED_PASSWORDS.length > 0;
+  for (const p of SHARED_PASSWORDS) if ((await signIn(created.email, p)).idToken) sharedFail = false;
+  check(`共通パスワード（環境変数 SHARED_PASSWORDS・${SHARED_PASSWORDS.length}件）では失敗する`, sharedFail,
+    SHARED_PASSWORDS.length ? "" : "SHARED_PASSWORDS が未設定のため未検証");
   const dn = await fsDoc(`displayNames/${created.email}`);
   const dnKeys = dn ? Object.keys(dn.fields).sort() : [];
   check("displayNames に name（前後空白を除去）と branch=名古屋", dn && dn.fields.name.stringValue === "山田 太郎(ダミー)" && dn.fields.branch.stringValue === "名古屋");
@@ -338,11 +350,174 @@ async function main() {
   const yamadaCreate = createLogs.find(x => fv(x, "targetUid") === created.uid);
   check("create ログのフィールド（target/by/branch/at）", yamadaCreate && fv(yamadaCreate, "targetEmail") === created.email
     && fv(yamadaCreate, "byUid") === U.ngyAdmin.uid && fv(yamadaCreate, "branch") === "名古屋" && !!yamadaCreate.fields.at.timestampValue);
-  const keysOk = [...createLogs, ...resetLogs].every(x =>
-    JSON.stringify(Object.keys(x.fields).sort()) === JSON.stringify(["action", "at", "branch", "byEmail", "byUid", "targetEmail", "targetUid"]));
-  check("ログのフィールドは U-1 と同じ7つだけ（password フィールドが無い）", keysOk);
+  const BASE_KEYS = ["action", "at", "branch", "byEmail", "byUid", "targetEmail", "targetUid"];
+  const keysOk = createLogs.every(x => JSON.stringify(Object.keys(x.fields).sort()) === JSON.stringify(BASE_KEYS))
+    // U-3 で reset_password に method（auto / manual）が加わった。それ以外は増えていない
+    && resetLogs.every(x => JSON.stringify(Object.keys(x.fields).sort()) === JSON.stringify([...BASE_KEYS, "method"].sort())
+      && fv(x, "method") === "auto");
+  check("ログのフィールド：create は U-1 と同じ7つ・reset_password は＋method(auto) だけ（password フィールドが無い）", keysOk);
   const dump = JSON.stringify(all);
   check(`発行したパスワード（${issued.length}件）の文字列がどのログにも含まれていない`, issued.length >= 5 && issued.every(p => !dump.includes(p)));
+
+  // ════════════════════ U-3 ════════════════════
+  const rename = (u, data) => callFn("updateSurveyorName", data, tokens[u.uid]);
+  const dnOf = async email => (await fsDoc(`displayNames/${email}`));
+  const auditCount = async () => (await auditLogs()).docs.length;
+  // 本番の displayNames には order 等の残存フィールドがある。巻き込まないことを見るため、エミュレータの doc に足しておく
+  await fetch(`${FS_DOCS}/displayNames/${encodeURIComponent(U.ngyA.email)}?updateMask.fieldPaths=order&updateMask.fieldPaths=memo`, {
+    method: "PATCH", headers: { Authorization: "Bearer owner", "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: { order: { integerValue: "3" }, memo: { stringValue: "残存フィールド" } } }),
+  });
+
+  console.log("\n■ U-3 updateSurveyorName：認証・入力検証（受け入れ条件5）");
+  r = await callFn("updateSurveyorName", { uid: U.ngyA.uid, name: "未ログイン" }, null);
+  check("未ログイン → unauthenticated", !r.ok && r.status === "UNAUTHENTICATED", JSON.stringify(r));
+  r = await rename(U.ngyA, { uid: U.nodn.uid, name: "調査員が変える" });
+  check("admins に無い uid → permission-denied", !r.ok && r.status === "PERMISSION_DENIED", JSON.stringify(r));
+  const beforeInvalid = await dnOf(U.ngyA.email);
+  for (const [label, data] of [
+    ["氏名が21文字", { uid: U.ngyA.uid, name: "あ".repeat(21) }],
+    ["氏名が空（空白のみ）", { uid: U.ngyA.uid, name: "   " }],
+    ["氏名に改行", { uid: U.ngyA.uid, name: "山田" + String.fromCharCode(10) + "太郎" }],
+    ["氏名にタブ", { uid: U.ngyA.uid, name: "山田" + String.fromCharCode(9) + "太郎" }],
+    ["氏名が文字列でない", { uid: U.ngyA.uid, name: 123 }],
+    ["uid が無い", { name: "山田" }],
+  ]) {
+    r = await rename(U.ngyAdmin, data);
+    check(`${label} → invalid-argument`, !r.ok && r.status === "INVALID_ARGUMENT", JSON.stringify(r));
+  }
+  const afterInvalid = await dnOf(U.ngyA.email);
+  check("  → 既存値は変わっていない（updateTime も同じ）", afterInvalid.updateTime === beforeInvalid.updateTime
+    && afterInvalid.fields.name.stringValue === U.ngyA.name);
+
+  console.log("\n■ U-3 updateSurveyorName：変更（受け入れ条件1・7）");
+  let audit0 = await auditCount();
+  r = await rename(U.ngyAdmin, { uid: U.ngyA.uid, name: "  名古屋 調査員A改(ダミー)  " });
+  check("変更が ok（返り値に uid / email / name＝前後空白除去）", r.ok && r.result.ok === true && r.result.uid === U.ngyA.uid
+    && r.result.email === U.ngyA.email && r.result.name === "名古屋 調査員A改(ダミー)", JSON.stringify(r));
+  const renamed = await dnOf(U.ngyA.email);
+  check("displayNames.name だけが変わった", renamed.fields.name.stringValue === "名古屋 調査員A改(ダミー)");
+  check("branch・order・memo は無傷", renamed.fields.branch.stringValue === "名古屋" && renamed.fields.order.integerValue === "3"
+    && renamed.fields.memo.stringValue === "残存フィールド" && Object.keys(renamed.fields).length === 4, JSON.stringify(renamed.fields));
+  const nameLog = (await auditLogs()).docs.find(x => fv(x, "action") === "update_name" && fv(x, "targetUid") === U.ngyA.uid);
+  check("監査ログ update_name が1件増え、oldName / newName / by / branch が入っている", (await auditCount()) === audit0 + 1 && nameLog
+    && fv(nameLog, "oldName") === U.ngyA.name && fv(nameLog, "newName") === "名古屋 調査員A改(ダミー)"
+    && fv(nameLog, "byUid") === U.ngyAdmin.uid && fv(nameLog, "branch") === "名古屋", JSON.stringify(nameLog && nameLog.fields));
+  r = await callFn("listAccounts", {}, tokens[U.ngyAdmin.uid]);
+  check("一覧の氏名も新しい氏名", r.ok && r.result.find(x => x.uid === U.ngyA.uid).displayName === "名古屋 調査員A改(ダミー)");
+
+  console.log("\n■ U-3 updateSurveyorName：変更なし（受け入れ条件6）");
+  audit0 = await auditCount();
+  const beforeSame = await dnOf(U.ngyA.email);
+  r = await rename(U.ngyAdmin, { uid: U.ngyA.uid, name: " 名古屋 調査員A改(ダミー) " });
+  const afterSame = await dnOf(U.ngyA.email);
+  check("同一文字列（前後空白だけ違う）→ ok", r.ok && r.result.name === "名古屋 調査員A改(ダミー)", JSON.stringify(r));
+  check("  → 書き込みが発生していない（updateTime が同じ）", afterSame.updateTime === beforeSame.updateTime);
+  check("  → 監査ログも増えていない", (await auditCount()) === audit0);
+
+  console.log("\n■ U-3 updateSurveyorName：ガードは他店チェックだけ（受け入れ条件2・3）");
+  const kyoBefore = await dnOf(U.kyoA.email);
+  r = await rename(U.ngyAdmin, { uid: U.kyoA.uid, name: "越境変更" });
+  check("名古屋管理者 → 京都の調査員は permission-denied「他店のアカウントです（京都店）」",
+    !r.ok && r.status === "PERMISSION_DENIED" && r.message === "他店のアカウントです（京都店）", JSON.stringify(r));
+  r = await rename(U.ngyAdmin, { uid: U.transfer.uid, name: "越境変更" });
+  check("名古屋管理者 → displayNames.branch=京都 の調査員も permission-denied", !r.ok && r.status === "PERMISSION_DENIED", JSON.stringify(r));
+  r = await rename(U.kyoAdmin, { uid: U.ngyA.uid, name: "越境変更" });
+  check("京都管理者 → 名古屋の調査員は permission-denied", !r.ok && r.status === "PERMISSION_DENIED", JSON.stringify(r));
+  check("  → 京都の調査員の氏名は変わっていない", (await dnOf(U.kyoA.email)).updateTime === kyoBefore.updateTime);
+  r = await rename(U.ngyAdmin, { uid: U.ngyAdmin.uid, name: "名古屋 管理者改(ダミー)" });
+  check("自分自身の氏名は変更できる（ガード1を適用しない）", r.ok && (await dnOf(U.ngyAdmin.email)).fields.name.stringValue === "名古屋 管理者改(ダミー)", JSON.stringify(r));
+  r = await rename(U.ngyAdmin, { uid: U.allstore.uid, name: "全店 管理者改(ダミー)" });
+  check("同じ店の管理者の氏名は変更できる（ガード2を適用しない）", r.ok && (await dnOf(U.allstore.email)).fields.name.stringValue === "全店 管理者改(ダミー)", JSON.stringify(r));
+  r = await rename(U.allstore, { uid: U.kyoAdmin.uid, name: "京都 管理者改(ダミー)" });
+  check("全店管理者 → 京都の管理者の氏名も変更できる", r.ok, JSON.stringify(r));
+  r = await rename(U.ngyAdmin, { uid: "no-such-uid", name: "存在しない" });
+  check("存在しない uid → not-found「対象のアカウントが見つかりません」", !r.ok && r.status === "NOT_FOUND" && r.message === "対象のアカウントが見つかりません", JSON.stringify(r));
+
+  console.log("\n■ U-3 updateSurveyorName：displayNames が無い（受け入れ条件4）");
+  audit0 = await auditCount();
+  const dnCount0 = await fsCount("displayNames");
+  r = await rename(U.ngyAdmin, { uid: U.nodn.uid, name: "新規に作られては困る" });
+  check("not-found「氏名の登録がありません」", !r.ok && r.status === "NOT_FOUND" && r.message === "氏名の登録がありません", JSON.stringify(r));
+  check("  → displayNames が新規作成されていない", !(await dnOf(U.nodn.email)) && (await fsCount("displayNames")) === dnCount0);
+  check("  → 監査ログも増えていない", (await auditCount()) === audit0);
+
+  console.log("\n■ U-3 パスワード手入力：検査 a〜f（受け入れ条件8）");
+  const target = U.ngyA;   // ローカルパート = nagoya-surveyor-a
+  const setPw = (u, uid, password) => callFn("resetSurveyorPassword", { uid, password }, tokens[u.uid]);
+  const pwCases = [
+    ["a 7文字", "abc1234", "8文字以上"],
+    ["a 65文字", "a1".repeat(32) + "b", "64文字以下"],
+    ["b 空白を含む", "abcd 1234", "半角"],
+    ["b 全角文字を含む", "ａｂｃｄ1234", "半角"],
+    ["b タブを含む", "abcd" + String.fromCharCode(9) + "1234", "半角"],
+    ["c 英字だけ", "gtrkwqmz", "英字と数字"],
+    ["c 数字だけ", "38472916", "英字と数字"],
+    ["d 拒否リスト password1", "password1", "推測されやすい"],
+    ["d 拒否リスト 大文字小文字を無視 PassW0rd", "PassW0rd", "推測されやすい"],
+    ["d 拒否リスト 12345678", "12345678", "推測されやすい"],
+    ["d 拒否リスト houseneko", "houseneko", "推測されやすい"],
+    ["e 同じ文字の繰り返し", "aaaaaaaa", "繰り返し"],
+    ["e 連番（英字）", "abcdefgh", "連番"],
+    ["e 逆順の連番（数字）", "87654321", "連番"],
+    ["f ローカルパートと同一", "nagoya-surveyor-a", "@より前"],
+    ["f ローカルパートを含む", "x9nagoya-surveyor-a1", "@より前"],
+  ];
+  for (const [label, pw, keyword] of pwCases) {
+    r = await setPw(U.ngyAdmin, target.uid, pw);
+    check(`${label} → invalid-argument（「${keyword}」を含むメッセージ）`, !r.ok && r.status === "INVALID_ARGUMENT" && r.message.includes(keyword), JSON.stringify(r));
+  }
+  let sharedRejected = SHARED_PASSWORDS.length > 0;
+  for (const p of SHARED_PASSWORDS) {
+    r = await setPw(U.ngyAdmin, target.uid, p);
+    if (r.ok || r.status !== "INVALID_ARGUMENT") sharedRejected = false;
+  }
+  check(`d 共通パスワード（環境変数 SHARED_PASSWORDS・${SHARED_PASSWORDS.length}件）はすべて invalid-argument`, sharedRejected,
+    SHARED_PASSWORDS.length ? "" : "SHARED_PASSWORDS が未設定のため未検証");
+  r = await setPw(U.ngyAdmin, target.uid, 12345678);
+  check("password が文字列でない → invalid-argument", !r.ok && r.status === "INVALID_ARGUMENT", JSON.stringify(r));
+  check("  → 弾かれた間、パスワードは変わっていない（共通ダミーPWでログインできる）", !!(await signIn(target.email)).idToken);
+
+  console.log("\n■ U-3 パスワード手入力：ガードは3つ全部のまま（受け入れ条件12）");
+  r = await setPw(U.ngyAdmin, U.ngyAdmin.uid, "Genba2026x");
+  check("自分自身 → failed-precondition（手入力でも）", !r.ok && r.status === "FAILED_PRECONDITION" && r.message === "自分のアカウントは操作できません", JSON.stringify(r));
+  r = await setPw(U.ngyAdmin, U.allstore.uid, "Genba2026x");
+  check("管理者アカウント → failed-precondition（手入力でも乗っ取れない）", !r.ok && r.status === "FAILED_PRECONDITION", JSON.stringify(r));
+  r = await setPw(U.ngyAdmin, U.allstore.uid, "short");
+  check("管理者アカウント＋不正なPW → パスワード検査より先にガードで弾く", !r.ok && r.status === "FAILED_PRECONDITION", JSON.stringify(r));
+  r = await setPw(U.ngyAdmin, U.kyoA.uid, "Genba2026x");
+  check("他店 → permission-denied（手入力でも）", !r.ok && r.status === "PERMISSION_DENIED", JSON.stringify(r));
+  check("  → 管理者・他店のパスワードは変わっていない", !(await signIn(U.allstore.email, "Genba2026x")).idToken && !!(await signIn(U.allstore.email)).idToken
+    && !(await signIn(U.kyoA.email, "Genba2026x")).idToken);
+
+  console.log("\n■ U-3 パスワード手入力：設定（受け入れ条件9）");
+  const manualPw = "Genba2026x";
+  r = await setPw(U.ngyAdmin, target.uid, manualPw);
+  check("正当な手入力PW → ok・返り値の password が入力値そのもの", r.ok && r.result.password === manualPw && r.result.email === target.email, JSON.stringify(r));
+  check("手入力したPWでログインできる", !!(await signIn(target.email, manualPw)).idToken);
+  check("旧PW（共通ダミーPW）ではログインできない", !(await signIn(target.email)).idToken);
+
+  console.log("\n■ U-3 password 省略は U-2 と同じ自動生成（受け入れ条件10）");
+  r = await callFn("resetSurveyorPassword", { uid: target.uid }, tokens[U.ngyAdmin.uid]);
+  const autoPw = r.ok ? r.result.password : "";
+  check("password 省略 → 英小文字＋数字10桁の自動生成", r.ok && PW_RE.test(autoPw), JSON.stringify(r && r.message));
+  check("自動生成PWでログインでき、直前の手入力PWでは失敗する", !!(await signIn(target.email, autoPw)).idToken && !(await signIn(target.email, manualPw)).idToken);
+  r = await callFn("resetSurveyorPassword", { uid: target.uid, password: null }, tokens[U.ngyAdmin.uid]);
+  check("password: null も自動生成として扱う", r.ok && PW_RE.test(r.result.password), JSON.stringify(r && r.message));
+  const autoPw2 = r.ok ? r.result.password : "";
+
+  console.log("\n■ U-3 監査ログ（受け入れ条件11）");
+  const u3logs = (await auditLogs()).docs;
+  const targetResets = u3logs.filter(x => fv(x, "action") === "reset_password" && fv(x, "targetUid") === target.uid);
+  check("対象の reset_password が3件（manual 1・auto 2）", targetResets.length === 3
+    && targetResets.filter(x => fv(x, "method") === "manual").length === 1
+    && targetResets.filter(x => fv(x, "method") === "auto").length === 2, JSON.stringify(targetResets.map(x => fv(x, "method"))));
+  const u3dump = JSON.stringify(u3logs);
+  // f のケースはメールアドレス（targetEmail）の一部そのものなのでログに現れて当然。照合から外す
+  const allPws = [...issued, manualPw, autoPw, autoPw2, ...pwCases.filter(c => !c[0].startsWith("f ")).map(c => c[1])]
+    .filter(p => p && p.length >= 8);
+  check(`手入力・自動・却下したパスワード（${allPws.length}件）の文字列がどのログにも含まれていない`, allPws.every(p => !u3dump.includes(p)));
+  check("ログに password という名前のフィールドが無い", u3logs.every(x => !Object.keys(x.fields).some(k => k.toLowerCase().includes("password"))));
 
   console.log(`\n結果: ${pass} 合格 / ${fail} 不合格`);
   process.exit(fail ? 1 : 0);
