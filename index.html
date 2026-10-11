@@ -525,24 +525,35 @@
     // ループが終わるまで書き戻されないため、途中で再読み込みすると同じピンがもう一度送られて二重になる。
     let offlineSyncing = false;
     async function syncOfflineQueue() {
-      if (!navigator.onLine || offlineQueue.length === 0) return;
+      // 二重起動しない。ログイン時の同期と online イベントが重なると、同じピンを2回送ってしまう。
+      if (offlineSyncing || !navigator.onLine || offlineQueue.length === 0) return;
       offlineSyncing = true;
+      let failed = 0;
       try {
-        const remaining = [];
-        for (const item of offlineQueue) {
+        // 開始時点の控えを回し、キュー本体は「送れた分をその場で抜く」だけにする（丸ごと差し替えない）。
+        // 差し替えると、同期中に積まれたピンが消える。1件ごとに保存するのは、途中で
+        // 再読み込みされても送信済みのピンをもう一度送らないため。
+        for (const item of offlineQueue.slice()) {
+          if (!offlineQueue.includes(item)) continue;   // 送信前に「1件戻す」で取り消された
           try {
             // オフライン中に採番できなかったピンは同期時に採番（既に番号があれば維持）。
             if (item.seqNo == null) item.seqNo = await nextSeqNo();
             const ref = await addDoc(collection(db, "pins"), item);
             undoUpgradeQueued(item, ref.id);   // 同期でIDが確定＝Undo対象を doc に昇格（同期後もUndoできる）
+            const i = offlineQueue.indexOf(item);
+            if (i >= 0) offlineQueue.splice(i, 1);
+            localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
           } catch(e) {
-            remaining.push(item);
+            failed++;
           }
         }
-        offlineQueue = remaining;
-        localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
-        if (remaining.length === 0) showToast("オフライン中のデータを同期しました");
-      } finally { offlineSyncing = false; }
+        if (failed === 0) showToast("オフライン中のデータを同期しました");
+      } finally {
+        offlineSyncing = false;
+        localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));   // 採番だけ済んだ失敗分も保存
+      }
+      // 同期中に新しく積まれた分があれば続けて送る（失敗が残っている時は回さない＝無限ループ防止）。
+      if (failed === 0 && offlineQueue.length > 0) syncOfflineQueue();
     }
     window.addEventListener("online", syncOfflineQueue);
 
