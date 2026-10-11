@@ -97,6 +97,7 @@
     }
 
     let map = null;
+    let mapReady = false;        // ZDC.Map の準備完了。new 直後〜コールバック前は map が非nullでも中身が使えない
     let allPins = [];
     let pinWidgetMap = new Map();   // pinId -> {marker, labelWidget}。差分更新のため配列ではなくMapで持つ
     // filtered() の結果キャッシュ（地図描画専用）。idle のたびに 5694件×8条件を回さないために持つ。
@@ -197,6 +198,32 @@
         : "";
       const race = d.raceDetected ? "／保存レース検出" : "";
       return (CHIBAN_DIAG_LABEL[d.reason] || d.reason) + st + oya + near + race;
+    }
+
+    // ===== 打刻位置（deviceLoc）の表示（表示専用。needsReview・Excel には影響させない）=====
+    // index.html がピン作成時に保存する「調査員の端末位置」。旧ピンには無い（＝何も出さない）。
+    // deviceLoc は調査員の端末が書く値＝信用しない。数値は Number() を通し、文字列は必ずエスケープする。
+    const DEVLOC_FAR_M = 100;   // dist − acc がこれを超えたら「離れ打ち」
+    const DEVLOC_REASON_LABEL = {
+      denied: "位置情報の許可なし", unavailable: "位置を取得できず", pc: "PCで入力（測位なし）", stale: "位置が古い",
+    };
+    // "ok" | "far"(離れ打ち) | "none"(位置なしで保存) | null(旧ピン＝記録なし)
+    function devLocKind(p) {
+      const d = p.deviceLoc;
+      if (!d || typeof d !== "object") return null;
+      if (d.reason || !Number.isFinite(Number(d.dist))) return "none";
+      return (Number(d.dist) - (Number(d.acc) || 0) > DEVLOC_FAR_M) ? "far" : "ok";
+    }
+    function devLocHTML(p) {
+      const k = devLocKind(p);
+      if (!k) return "";
+      const d = p.deviceLoc, m = v => Math.round(Number(v));
+      if (k === "none") {
+        const old = (d.reason === "stale" && Number.isFinite(Number(d.dist)))
+          ? `（${m(d.ageSec)}秒前の位置で ${m(d.dist)}m）` : "";
+        return `<div class="devloc none">位置なし：${escAttr(DEVLOC_REASON_LABEL[d.reason] || d.reason || "不明")}${old}</div>`;
+      }
+      return `<div class="devloc ${k}">${k === "far" ? "⚠ 離れ打ち：" : "📍 "}現地との距離 ${m(d.dist)}m（精度±${m(d.acc)}m）</div>`;
     }
 
     // ===== 調査グリッド(MVP) 状態 — 管理画面は表示専用（俯瞰のみ・タップ編集なし） =====
@@ -441,6 +468,8 @@
         if (apBtn && isAdminUser) apBtn.style.display = "";
         const acBtn = document.getElementById("acctBtn");
         if (acBtn && isAdminUser) acBtn.style.display = "";
+        const smBtn = document.getElementById("sumBtn");
+        if (smBtn && isAdminUser) smBtn.style.display = "";
         initStatusFilter();       // ステータスDDの選択肢を構築（1回）
         updateStatsHighlight();   // カウンター初期ハイライト（総件数=全表示）
         // 自店は initMap より前に確定させる。初期中心の拠点駅分岐は mapOptions 段階で myBranch を読むため、
@@ -827,6 +856,7 @@
           document.getElementById("map"),
           mapOptions,
           function() {
+            mapReady = true;
             map.addControl(new ZDC.ZoomButton('top-left'));
             map.addControl(new ZDC.ScaleBar('bottom-left'));
             // 地図移動・ズーム完了(idle)でグリッドを可視範囲だけ再描画（gridMode中のみ）。
@@ -1314,8 +1344,9 @@
       const q = query(collection(db, "pins"), orderBy("createdAt", "desc"));
       onSnapshot(q, snap => {
         // 自店フィルタ：allPins段階で自店ピンだけに絞る（stats/ドロップダウン/地図/Excel が全て自店スコープになる）。
-        allPins = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-          .filter(p => pinBranch(p) === myBranch);
+        // 全拠点ぶんは調査集計（拠点を選べる）専用。一覧・地図・Excel は従来どおり自店の allPins だけを使う。
+        allPinsAllBranches = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        allPins = allPinsAllBranches.filter(p => pinBranch(p) === myBranch);
         updateStats();
         updateStaffFilter();
         updateDateFilter();
@@ -1323,8 +1354,108 @@
         updateRoundFilter();
         renderList();
         renderAllMarkers();   // ピンデータ更新＝色/ラベルが変わり得るので全再描画
+        if (document.getElementById("sumModal").style.display === "flex") renderSurveySummary();   // 開いている間だけ追随
       });
     }
+
+    // ===== 調査集計（調査員×日）=====
+    // 雑な調査・机上入力を日々の数字で拾うための表。表示専用で、ピンには何も書かない。
+    // 定義は 2026-10-10 の京都の実績（498件・144件/時・中央値13秒）と突き合わせて決めた。変えると過去の数字と合わなくなる。
+    //   件/時      = 件数 ÷ 稼働時間（連続する打刻間隔のうち5分未満のものの合計）
+    //   中央値     = その日の全間隔の中央値（5分以上の空白も含む）
+    //   10秒未満   = 10秒未満の間隔数 ÷ 全間隔数
+    //   離れ打ち率 = 離れ打ち ÷ 位置が取れたピン（位置なし・記録なしは分母に入れない）
+    let allPinsAllBranches = [];   // 全拠点のピン（集計専用）
+    const SUM_GAP_MAX_SEC = 300, SUM_FAST_SEC = 10;
+    const SUM_MIN_N = 20;          // これ未満の行は色を付けず、比較相手にも入れない（少数だと件/時が暴れる）
+    // 割合の列は固定のしきい値 [黄, 赤]（%）。件/時と間隔は「同じ拠点の他の調査員の中央値」との倍率で見る。
+    const SUM_FAR_PCT = [10, 30], SUM_FAST_PCT = [20, 40];
+    function sumMedian(a) {
+      if (!a.length) return null;
+      const s = [...a].sort((x, y) => x - y), m = s.length >> 1;
+      return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+    }
+    function buildSurveySummary(pins) {
+      const groups = new Map();
+      for (const p of pins) {
+        const t = Date.parse(p.createdAt), ymd = jstYmd(p.createdAt);
+        if (Number.isNaN(t) || !ymd) continue;
+        const key = pinBranch(p) + "|" + (p.email || "") + "|" + ymd;
+        let g = groups.get(key);
+        if (!g) groups.set(key, g = { branch: pinBranch(p), email: p.email || "", ymd, ts: [], far: 0, ok: 0, none: 0, noRec: 0 });
+        g.ts.push(t);
+        const k = devLocKind(p);
+        if (k === "far") g.far++; else if (k === "ok") g.ok++; else if (k === "none") g.none++; else g.noRec++;
+      }
+      const rows = [];
+      for (const g of groups.values()) {
+        g.ts.sort((a, b) => a - b);
+        const gaps = g.ts.slice(1).map((t, i) => (t - g.ts[i]) / 1000);
+        const activeSec = gaps.filter(x => x < SUM_GAP_MAX_SEC).reduce((s, x) => s + x, 0);
+        const n = g.ts.length, located = g.ok + g.far;
+        rows.push({ branch: g.branch, email: g.email, ymd: g.ymd, n, far: g.far, none: g.none, noRec: g.noRec,
+          perHour: activeSec > 0 ? n / (activeSec / 3600) : null,
+          medGap: sumMedian(gaps),
+          fastPct: gaps.length ? gaps.filter(x => x < SUM_FAST_SEC).length / gaps.length * 100 : null,
+          farPct: located ? g.far / located * 100 : null,
+          flag: {} });
+      }
+      // 色付け（1=黄 / 2=赤）。20件未満の行は対象外。
+      const fixed = (v, th) => v == null ? 0 : v >= th[1] ? 2 : v >= th[0] ? 1 : 0;
+      for (const r of rows) {
+        if (r.n < SUM_MIN_N) continue;
+        // 比較相手＝同じ拠点の「他の調査員」の行（選択期間内・20件以上）。2行に満たなければ比べない。
+        const peers = rows.filter(o => o.branch === r.branch && o.email !== r.email && o.n >= SUM_MIN_N);
+        const base = k => { const v = peers.map(o => o[k]).filter(x => x != null); return v.length >= 2 ? sumMedian(v) : null; };
+        const bh = base("perHour"), bm = base("medGap");
+        r.flag = {
+          perHour: (bh == null || r.perHour == null || bh <= 0) ? 0 : r.perHour >= bh * 3 ? 2 : r.perHour >= bh * 2 ? 1 : 0,
+          medGap:  (bm == null || r.medGap == null) ? 0 : r.medGap <= bm / 3 ? 2 : r.medGap <= bm / 2 ? 1 : 0,
+          fastPct: fixed(r.fastPct, SUM_FAST_PCT),
+          farPct:  fixed(r.farPct, SUM_FAR_PCT),
+        };
+      }
+      return rows.sort((a, b) => b.ymd.localeCompare(a.ymd) || a.branch.localeCompare(b.branch) || b.n - a.n);
+    }
+    function renderSurveySummary() {
+      const br = document.getElementById("sumBranch").value;
+      const from = document.getElementById("sumFrom").value, to = document.getElementById("sumTo").value;
+      const rows = buildSurveySummary(allPinsAllBranches.filter(p => {
+        const d = jstYmd(p.createdAt);
+        return d && (!from || d >= from) && (!to || d <= to) && (br === "" || pinBranch(p) === br);
+      }));
+      const cls = f => f === 2 ? " sum-bad" : f === 1 ? " sum-warn" : "";
+      const num = (v, unit) => v == null ? "–" : Math.round(v) + unit;
+      document.getElementById("sumMeta").textContent = `${rows.length}行（調査員×日）`;
+      document.getElementById("sumBody").innerHTML = rows.length ? rows.map(r => `<tr>
+        <td>${r.ymd}</td><td>${escAttr(r.branch)}</td><td>${escAttr(staffName(r.email))}</td>
+        <td class="num">${r.n}</td>
+        <td class="num${cls(r.flag.perHour)}">${num(r.perHour, "")}</td>
+        <td class="num${cls(r.flag.medGap)}">${num(r.medGap, "秒")}</td>
+        <td class="num${cls(r.flag.fastPct)}">${num(r.fastPct, "%")}</td>
+        <td class="num${cls(r.flag.farPct)}">${r.far}件${r.farPct == null ? "" : `（${Math.round(r.farPct)}%）`}</td>
+        <td class="num">${r.none}件</td>
+        <td class="num sum-dim">${r.noRec}件</td></tr>`).join("")
+        : `<tr><td colspan="10" class="sum-dim">該当するピンがありません</td></tr>`;
+    }
+    window.renderSurveySummary = renderSurveySummary;
+    window.openSurveySummary = () => {
+      const sel = document.getElementById("sumBranch");
+      const branches = [...new Set(allPinsAllBranches.map(pinBranch))].sort();
+      const cur = sel.dataset.init ? sel.value : myBranch;   // 初回だけ自店を既定にする。以後は選択を保つ
+      sel.innerHTML = `<option value="">全拠点</option>`
+        + branches.map(b => `<option value="${escAttr(b)}">${escAttr(b)}</option>`).join("");
+      sel.value = (cur === "" || branches.includes(cur)) ? cur : "";
+      if (!sel.dataset.init) {
+        sel.dataset.init = "1";
+        // 既定は直近7日（JST）。日付の入口は jstYmd() に統一（UTCずれ防止）。
+        document.getElementById("sumTo").value = jstYmd(new Date().toISOString());
+        document.getElementById("sumFrom").value = jstYmd(new Date(Date.now() - 6 * 86400e3).toISOString());
+      }
+      document.getElementById("sumModal").style.display = "flex";
+      renderSurveySummary();
+    };
+    window.closeSurveySummary = () => { document.getElementById("sumModal").style.display = "none"; };
 
     // ===== 公図取得済みマーク：購読・描画・ポップアップ・削除（管理画面専用）=====
     // マークの所属店。branch空/欠落は "名古屋" とみなす（pinBranch と同じ二重防御）。
@@ -2567,6 +2698,7 @@
             <input type="checkbox" ${p.otherCompany ? "checked" : ""} onchange="toggleOtherCompany('${p.id}',this.checked)"> 🏢 他社物件（他社看板）
           </label>
           ${p.chibanDiag?.reason ? `<div class="chiban-diag">⚠ 地番：${escAttr(chibanDiagText(p.chibanDiag))}</div>` : ""}
+          ${devLocHTML(p)}
           ${exported ? `<div class="export-line">✓ Excel出力済 ${exportedMD}${exportedByName ? ` ・ ${exportedByName}` : ""}</div>` : ""}
         </div>`;
       }).join("") + listFooterHTML(shown.length, pins.length);
@@ -2727,7 +2859,8 @@
     // 「見た目そのものが変わる」時（周回色・ステータス変更）と
     // 「重畳画像の上へピンを戻す」時（用途地域/地番レイヤ）はこちらを使う。
     function renderAllMarkers() {
-      if (!map) return;
+      // 準備完了前に onSnapshot が届くと ZDC 内部の getZoom で落ちる（起動直後に実測）。完了時にもう一度呼ばれるので捨ててよい。
+      if (!map || !mapReady) return;
       // 今回の描画でラベルを描くか。idle の閾値跨ぎ判定がこの値を見るので、描く前に確定させる。
       labelsShown = map.getZoom() >= LABEL_MIN_ZOOM;
       for (const id of Array.from(pinWidgetMap.keys())) removePinMarker(id);
@@ -3894,6 +4027,21 @@
       border: 1px solid #fcd34d; border-radius: 4px;
       padding: 2px 8px; margin-top: 6px; display: inline-block;
     }
+    /* 打刻位置（deviceLoc）。位置あり＝控えめ / 離れ打ち＝赤 / 位置なし＝灰。要調査(赤バッジ)・地番診断(琥珀)とは別行。 */
+    .devloc {
+      font-size: 11px; font-weight: 700; color: #475569; background: #f1f5f9;
+      border: 1px solid #e2e8f0; border-radius: 4px;
+      padding: 2px 8px; margin-top: 6px; display: table;
+    }
+    .devloc.far  { color: #b91c1c; background: #fee2e2; border-color: #fca5a5; }
+    .devloc.none { color: #6b7280; background: #f3f4f6; border-color: #d1d5db; font-weight: 600; }
+    /* 調査集計。モーダル外枠は .kouzu-modal、表は .acct-table 系を流用し、固有部分だけ定義する */
+    .sum-ctl { display:flex; flex-wrap:wrap; align-items:center; gap:8px; font-size:12px; color:#475569; }
+    .sum-ctl select, .sum-ctl input { font-size:12px; padding:3px 6px; border:1px solid #cbd5e1; border-radius:4px; }
+    .acct-table td.num { text-align:right; font-variant-numeric:tabular-nums; }
+    .acct-table td.sum-warn { background:#fef3c7; color:#92400e; font-weight:700; }
+    .acct-table td.sum-bad  { background:#fee2e2; color:#b91c1c; font-weight:700; }
+    .acct-table td.sum-dim  { color:#94a3b8; }
     .export-line {
       font-size: 11px; font-weight: 700; color: #fff; background: #6b7280;
       padding: 2px 8px; border-radius: 4px; margin-top: 6px;
@@ -4186,6 +4334,8 @@
     <button class="layer-btn areapoly-btn" id="areaPolyBtn" style="display:none" onclick="openAreaPolyModal()" title="大字(OAZ)の行政界ポリゴンをゼンリンから取り込む（管理者専用）">🗾 行政界取込</button>
     <!-- アカウント管理（U-1・管理者専用）。周回管理と同じく既定 display:none。 -->
     <button class="layer-btn acct-btn" id="acctBtn" style="display:none" onclick="openAccountModal()" title="調査員アカウントの一覧・無効化／再有効化（管理者専用）">👤 アカウント管理</button>
+    <!-- 調査集計（管理者専用）。調査員×日の件数・ペース・打刻位置。周回管理と同じく既定 display:none。 -->
+    <button class="layer-btn acct-btn" id="sumBtn" style="display:none" onclick="openSurveySummary()" title="調査員×日の件数・ペース・離れ打ちの集計">📊 調査集計</button>
     <button class="csv-btn" onclick="exportExcel()">📥 Excel出力</button>
     <button class="csv-btn undo-btn" onclick="unexportAll()" title="チェックがあれば選択分／無ければ表示中の出力済みを未出力に戻す">↩ 出力取消</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
@@ -4366,6 +4516,26 @@
 
 <!-- アカウント管理（U-1・管理者専用）。表示は全店・操作は自店のみ。
      権限の本体は Functions setAccountDisabled（自分／管理者／他店は Functions が弾く）。 -->
+<!-- 調査集計（管理者専用）。表示専用で、ピンには何も書かない。拠点は選べる（一覧・地図・Excel は自店のまま）。 -->
+<div id="sumModal" class="kouzu-modal" style="display:none">
+  <div class="kouzu-modal-box acct-modal-box">
+    <div class="kouzu-modal-title">📊 調査集計（調査員×日）</div>
+    <div class="sum-ctl">
+      拠点 <select id="sumBranch" onchange="renderSurveySummary()"></select>
+      期間 <input type="date" id="sumFrom" onchange="renderSurveySummary()"> 〜 <input type="date" id="sumTo" onchange="renderSurveySummary()">
+      <span class="acct-meta" id="sumMeta"></span>
+    </div>
+    <div class="acct-note">件/時＝件数÷稼働時間（5分以上の空白は除く）。件/時と間隔は、同じ拠点の他の調査員の中央値と比べて 2倍(1/2)で黄・3倍(1/3)で赤。10秒未満は 20%で黄・40%で赤。離れ打ち（距離−精度が100m超）は 10%で黄・30%で赤。20件未満の行は色を付けません。</div>
+    <div class="acct-table-wrap">
+      <table class="acct-table">
+        <thead><tr><th>日付</th><th>拠点</th><th>調査員</th><th>件数</th><th>件/時</th><th>間隔の中央値</th><th>10秒未満</th><th>離れ打ち</th><th>位置なし</th><th>記録なし</th></tr></thead>
+        <tbody id="sumBody"></tbody>
+      </table>
+    </div>
+    <div class="kouzu-modal-actions"><button class="kouzu-cancel" onclick="closeSurveySummary()">閉じる</button></div>
+  </div>
+</div>
+
 <div id="acctModal" class="kouzu-modal" style="display:none">
   <div class="kouzu-modal-box acct-modal-box">
     <div class="kouzu-modal-title">👤 アカウント管理</div>
