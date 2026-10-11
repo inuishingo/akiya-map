@@ -1369,7 +1369,8 @@
     const SUM_GAP_MAX_SEC = 300, SUM_FAST_SEC = 10;
     const SUM_MIN_N = 20;          // これ未満の行は色を付けず、比較相手にも入れない（少数だと件/時が暴れる）
     // 割合の列は固定のしきい値 [黄, 赤]（%）。件/時と間隔は「同じ拠点の他の調査員の中央値」との倍率で見る。
-    const SUM_FAR_PCT = [10, 30], SUM_FAST_PCT = [20, 40];
+    // 位置なし率も見る＝位置情報の許可を切って打つ抜け道を塞ぐ。分母は「位置あり＋位置なし」（旧版の記録なしは入れない）。
+    const SUM_FAR_PCT = [10, 30], SUM_FAST_PCT = [20, 40], SUM_NONE_PCT = [10, 30];
     function sumMedian(a) {
       if (!a.length) return null;
       const s = [...a].sort((x, y) => x - y), m = s.length >> 1;
@@ -1392,12 +1393,13 @@
         g.ts.sort((a, b) => a - b);
         const gaps = g.ts.slice(1).map((t, i) => (t - g.ts[i]) / 1000);
         const activeSec = gaps.filter(x => x < SUM_GAP_MAX_SEC).reduce((s, x) => s + x, 0);
-        const n = g.ts.length, located = g.ok + g.far;
+        const n = g.ts.length, located = g.ok + g.far, recorded = located + g.none;
         rows.push({ branch: g.branch, email: g.email, ymd: g.ymd, n, far: g.far, none: g.none, noRec: g.noRec,
           perHour: activeSec > 0 ? n / (activeSec / 3600) : null,
           medGap: sumMedian(gaps),
           fastPct: gaps.length ? gaps.filter(x => x < SUM_FAST_SEC).length / gaps.length * 100 : null,
           farPct: located ? g.far / located * 100 : null,
+          nonePct: recorded ? g.none / recorded * 100 : null,
           flag: {} });
       }
       // 色付け（1=黄 / 2=赤）。20件未満の行は対象外。
@@ -1413,6 +1415,7 @@
           medGap:  (bm == null || r.medGap == null) ? 0 : r.medGap <= bm / 3 ? 2 : r.medGap <= bm / 2 ? 1 : 0,
           fastPct: fixed(r.fastPct, SUM_FAST_PCT),
           farPct:  fixed(r.farPct, SUM_FAR_PCT),
+          nonePct: fixed(r.nonePct, SUM_NONE_PCT),
         };
       }
       return rows.sort((a, b) => b.ymd.localeCompare(a.ymd) || a.branch.localeCompare(b.branch) || b.n - a.n);
@@ -1434,7 +1437,7 @@
         <td class="num${cls(r.flag.medGap)}">${num(r.medGap, "秒")}</td>
         <td class="num${cls(r.flag.fastPct)}">${num(r.fastPct, "%")}</td>
         <td class="num${cls(r.flag.farPct)}">${r.far}件${r.farPct == null ? "" : `（${Math.round(r.farPct)}%）`}</td>
-        <td class="num">${r.none}件</td>
+        <td class="num${cls(r.flag.nonePct)}">${r.none}件${r.nonePct == null ? "" : `（${Math.round(r.nonePct)}%）`}</td>
         <td class="num sum-dim">${r.noRec}件</td></tr>`).join("")
         : `<tr><td colspan="10" class="sum-dim">該当するピンがありません</td></tr>`;
     }
@@ -4525,7 +4528,7 @@
       期間 <input type="date" id="sumFrom" onchange="renderSurveySummary()"> 〜 <input type="date" id="sumTo" onchange="renderSurveySummary()">
       <span class="acct-meta" id="sumMeta"></span>
     </div>
-    <div class="acct-note">件/時＝件数÷稼働時間（5分以上の空白は除く）。件/時と間隔は、同じ拠点の他の調査員の中央値と比べて 2倍(1/2)で黄・3倍(1/3)で赤。10秒未満は 20%で黄・40%で赤。離れ打ち（距離−精度が100m超）は 10%で黄・30%で赤。20件未満の行は色を付けません。</div>
+    <div class="acct-note">件/時＝件数÷稼働時間（5分以上の空白は除く）。件/時と間隔は、同じ拠点の他の調査員の中央値と比べて 2倍(1/2)で黄・3倍(1/3)で赤。10秒未満は 20%で黄・40%で赤。離れ打ち（距離−精度が100m超）と位置なしは 10%で黄・30%で赤。20件未満の行は色を付けません。</div>
     <div class="acct-table-wrap">
       <table class="acct-table">
         <thead><tr><th>日付</th><th>拠点</th><th>調査員</th><th>件数</th><th>件/時</th><th>間隔の中央値</th><th>10秒未満</th><th>離れ打ち</th><th>位置なし</th><th>記録なし</th></tr></thead>

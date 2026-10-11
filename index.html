@@ -521,22 +521,28 @@
     renderStatusOptions();
 
     // ===== OFFLINE SYNC =====
+    // 送信の最中か。更新通知の再読み込みを止めるのに使う：送信済みでも localStorage のキューは
+    // ループが終わるまで書き戻されないため、途中で再読み込みすると同じピンがもう一度送られて二重になる。
+    let offlineSyncing = false;
     async function syncOfflineQueue() {
       if (!navigator.onLine || offlineQueue.length === 0) return;
-      const remaining = [];
-      for (const item of offlineQueue) {
-        try {
-          // オフライン中に採番できなかったピンは同期時に採番（既に番号があれば維持）。
-          if (item.seqNo == null) item.seqNo = await nextSeqNo();
-          const ref = await addDoc(collection(db, "pins"), item);
-          undoUpgradeQueued(item, ref.id);   // 同期でIDが確定＝Undo対象を doc に昇格（同期後もUndoできる）
-        } catch(e) {
-          remaining.push(item);
+      offlineSyncing = true;
+      try {
+        const remaining = [];
+        for (const item of offlineQueue) {
+          try {
+            // オフライン中に採番できなかったピンは同期時に採番（既に番号があれば維持）。
+            if (item.seqNo == null) item.seqNo = await nextSeqNo();
+            const ref = await addDoc(collection(db, "pins"), item);
+            undoUpgradeQueued(item, ref.id);   // 同期でIDが確定＝Undo対象を doc に昇格（同期後もUndoできる）
+          } catch(e) {
+            remaining.push(item);
+          }
         }
-      }
-      offlineQueue = remaining;
-      localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
-      if (remaining.length === 0) showToast("オフライン中のデータを同期しました");
+        offlineQueue = remaining;
+        localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
+        if (remaining.length === 0) showToast("オフライン中のデータを同期しました");
+      } finally { offlineSyncing = false; }
     }
     window.addEventListener("online", syncOfflineQueue);
 
@@ -2781,6 +2787,54 @@
       }, recordGeoError);
     };
 
+    // ===== 更新通知（新しい版が配信されたら知らせる。自動では再読み込みしない）=====
+    // 判定は「配信中の index.html の module スクリプトが、いま動いているものと違うか」。
+    //   ETag / Last-Modified だけでは判定しない：GitHub Pages はデプロイのたびに全ファイルの日時を
+    //   更新するため、admin.html だけの push でも変わる（2026-10-11 に実測）。日時は「本体を取りに行くか」の判断にだけ使う。
+    //   ※HTML/CSS だけの変更は検知しない（スクリプトを変えない更新は通知不要と割り切る）。
+    // 通信量：5分に1回の HEAD（本文なし）だけ。本体の取得は起動後の初回と、配信側が変わった時だけ。画面が隠れている間は何もしない。
+    const UPDATE_CHECK_MIN_MS = 5 * 60 * 1000;
+    const RUNNING_SRC = document.querySelector('script[type="module"]').textContent;
+    let updateCheckedAt = 0, updateSeenTag = null, updateAvailable = false, updateChecking = false;
+    async function checkForUpdate() {
+      if (updateAvailable || updateChecking || document.hidden || !navigator.onLine) return;
+      const now = Date.now();
+      if (now - updateCheckedAt < UPDATE_CHECK_MIN_MS) return;
+      updateCheckedAt = now; updateChecking = true;
+      try {
+        const head = await fetch(location.pathname, { method: "HEAD", cache: "no-store" });
+        const tag = head.headers.get("ETag") || head.headers.get("Last-Modified");
+        if (!head.ok || (tag && tag === updateSeenTag)) return;   // 前回「同じ」と確認した配信のまま
+        const res = await fetch(location.pathname, { cache: "no-store" });
+        if (!res.ok) return;
+        const el = new DOMParser().parseFromString(await res.text(), "text/html").querySelector('script[type="module"]');
+        if (!el) return;                                          // 想定外の応答（エラーページ等）では出さない
+        if (el.textContent !== RUNNING_SRC) {
+          updateAvailable = true;
+          document.getElementById("updateBar").style.display = "block";
+        } else {
+          updateSeenTag = tag;
+        }
+      } catch (e) { /* 通信失敗は無視（次回に再確認） */ }
+      finally { updateChecking = false; }
+    }
+    window.applyUpdate = async () => {
+      // 入力途中のピンを失わせない。通常はモーダルがバーを覆っていて押せないが、二重に守る。
+      if (document.getElementById("pinModal").style.display === "flex") {
+        showToast("入力中のピンを保存してから更新してください", "warn"); return;
+      }
+      if (!navigator.onLine) { showToast("オフラインのため更新できません", "warn"); return; }
+      // 送信待ちのピンは localStorage に残るので再読み込みしても消えない（次のログイン時に送信される）。
+      // 止めるのは「送信の最中」だけ＝途中で切ると二重送信になる（offlineSyncing のコメント参照）。
+      if (offlineSyncing) { showToast("送信が終わってから更新してください", "warn"); return; }
+      // ブラウザのHTTPキャッシュ(max-age=600)を先に更新する。これをしないと古い版がもう一度読み込まれる。
+      try { await fetch(location.href, { cache: "reload" }); } catch (e) {}
+      location.reload();
+    };
+    setTimeout(checkForUpdate, 60000);
+    setInterval(checkForUpdate, UPDATE_CHECK_MIN_MS);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) checkForUpdate(); });
+
     // ===== ENTER KEY LOGIN =====
     window.addEventListener("keydown", e => {
       // 起動直後(#boot表示中)はインラインstyleが未設定＝"" になる。!=="none" のままだと
@@ -3016,6 +3070,13 @@
     .cancel-btn { padding: 14px 18px; border-radius: 10px; background: #374151; color: #9ca3af; font-size: 15px; border: none; cursor: pointer; }
     #deleteBtn { padding: 14px 16px; border-radius: 10px; background: transparent; border: 1px solid #ef4444; color: #ef4444; font-size: 14px; cursor: pointer; }
 
+    /* 更新通知。ピン入力(#pinModal z-index:300)より下＝入力中は隠れる。右側の丸ボタン列と重ならないよう上部中央（記録中バナーの下）。 */
+    .update-bar {
+      display: none; position: fixed; top: 134px; left: 50%; transform: translateX(-50%);
+      background: #1d4ed8; color: #fff; font-size: 13px; font-weight: 700; border: none;
+      padding: 10px 18px; border-radius: 20px; z-index: 200; max-width: 92%;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4); cursor: pointer; white-space: nowrap;
+    }
     .toast {
       position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
       padding: 10px 20px; border-radius: 20px; font-size: 13px; font-weight: 500;
@@ -3105,6 +3166,7 @@
   </div>
 </div>
 
+<button class="update-bar" id="updateBar" onclick="applyUpdate()">🔄 更新があります。タップで再読み込み</button>
 <div class="toast" id="toast"></div>
 
 <script>
