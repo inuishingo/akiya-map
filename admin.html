@@ -1466,8 +1466,8 @@
     // ===== 動きの再生（調査員×日）=====
     // 調査集計で色が付いた調査員の、その日の動きを地図で追うための表示。
     // 表示専用：ピンには何も書かず、外部にも送らない。再生中は通常ピンを地図から外し、終了時に描き直す。
-    //   丸と線＝ピンと打刻順（色は時刻：最初=青→最後=赤／5分以上の空白は点線）
-    //   人型＝本人の位置(deviceLoc)。ピンと細線で結ぶ。「本人の動き」ONで本人位置だけをつないだ黒線
+    //   丸と線＝ピンと打刻順（色は時計の時刻：9時台=青→18時台=赤／5分以上の空白は太めの破線）
+    //   人型＝本人の位置(deviceLoc)。ピンと細かい点線で結ぶ。「本人の動き」ONで本人位置だけをつないだ黒線
     //   色の決まり：時刻の色（青→緑→黄→赤）と被らないよう、本人＝黒、離れ打ち＝赤紫に固定する。
     //     離れ打ちを赤にすると夕方の線（赤）と見分けがつかない。凡例(#replayLegend)と必ず揃えること。
     const REPLAY_DEV_COLOR = "#111827", REPLAY_FAR_COLOR = "#C026D3";
@@ -1481,8 +1481,18 @@
     let sumRows = [];       // 直近に描いた集計表の行
     let replay = null;      // 再生中だけ非null。{ pins[], idx, shown, playing, speed, clock, timer, showDev, w:{devLine[],cursor} }
     const REPLAY_TICK_MS = 100;
-    function replayColor(f) {            // 0=最初(青) → 1=最後(赤)。ZDC には hex で渡す
-      const h = 240 - 240 * Math.min(1, Math.max(0, f)), sat = 0.85, l = 0.45;
+    // 色は時計の時刻で固定する（9時台=青 → 18時台=赤の10色。9時より前は青、19時以降は赤）。
+    //   日ごとの相対（最初=青→最後=赤）にすると、同じ色が日によって違う時刻を指し、日をまたいで見比べられない。
+    //   色相は等間隔。明るさは1時間おきに濃・淡と交互にする＝緑の付近（13〜15時台）は色相だけだと
+    //   見分けがつかない（隣どうしの色差 ΔE00 が最小 3.7 → 交互にすると最小 15.4。2026-10-11 に計測）。
+    //   15時台は黄緑寄りになる（黄は16時台）。凡例(#replayHours)はこの関数から作るので色はずれない。
+    const REPLAY_HOUR_FROM = 9, REPLAY_HOUR_COUNT = 10;
+    function replayHourIndex(t) {
+      const h = new Date(t + 9 * 3600 * 1000).getUTCHours();   // JST の時
+      return Math.max(0, Math.min(REPLAY_HOUR_COUNT - 1, h - REPLAY_HOUR_FROM));
+    }
+    function replayColor(i) {            // i=0(9時台)…9(18時台)。ZDC には hex で渡す
+      const h = 240 - 240 * i / (REPLAY_HOUR_COUNT - 1), sat = 0.85, l = i % 2 ? 0.58 : 0.38;
       const k = n => (n + h / 30) % 12, a = sat * Math.min(l, 1 - l);
       const c = n => Math.round(255 * (l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1)))).toString(16).padStart(2, "0");
       return "#" + c(0) + c(8) + c(4);
@@ -1491,6 +1501,29 @@
       const dy = (b.lat - a.lat) * 111000, dx = (b.lng - a.lng) * 111000 * Math.cos(a.lat * Math.PI / 180);
       return Math.hypot(dx, dy);
     }
+    // 本人の移動＝位置が取れたピンの本人位置を打刻順につないだ距離。ただし測位の揺れは足さない：
+    //   直前に数えた位置から「15m または測位の精度」より大きく動いた時だけ足す。
+    //   揺れをそのまま足すと、動いていなくても数百件で数kmになり、机上入力（本人は動かない）を見逃す。
+    // ピンの道のり＝ピンを打刻順につないだ直線距離（5分以上の空白の区間は除く）。
+    const REPLAY_MOVE_MIN_M = 15;      // これ以下の変位は揺れとみなす
+    const REPLAY_STILL_RATIO = 0.2;    // 本人の移動がピンの道のりのこの割合未満なら「ほとんど移動していません」
+    const REPLAY_COVER_MIN = 0.8;      // 位置が取れたピンがこの割合以上の日だけ上の注記を出す（少ないと本人の移動が短く出て比べられない）
+    function replayDistances(pins) {
+      let pinPath = 0, devMove = 0, anchor = null;
+      pins.forEach((x, k) => { if (k && x.gapSec < SUM_GAP_MAX_SEC) pinPath += x.stepM; });
+      for (const x of pins) {
+        if (!x.dev || x.dev.kind === "none") continue;
+        const acc = Number(x.p.deviceLoc.acc) || 0;
+        if (anchor) {
+          const d = replayDistM(anchor, x.dev);
+          if (d <= Math.max(REPLAY_MOVE_MIN_M, anchor.acc, acc)) continue;   // 揺れの範囲＝動いていない
+          devMove += d;
+        }
+        anchor = { lat: x.dev.lat, lng: x.dev.lng, acc };
+      }
+      return { pinPath, devMove };
+    }
+    function replayFmtM(m) { return m >= 1000 ? (m / 1000).toFixed(1) + "km" : Math.round(m) + "m"; }
     window.startReplay = (i) => {
       const r = sumRows[i];
       if (!r || !map || !mapReady) return;
@@ -1500,9 +1533,9 @@
         .map(p => ({ p, lat: Number(p.lat), lng: Number(p.lng), t: Date.parse(p.createdAt) }))
         .filter(x => !Number.isNaN(x.t)).sort((a, b) => a.t - b.t);
       if (!pins.length) { showToast("再生できるピンがありません", "error"); return; }
-      const t0 = pins[0].t, span = Math.max(1, pins[pins.length - 1].t - t0);
+      const t0 = pins[0].t;
       pins.forEach((x, k) => {
-        x.color = replayColor((x.t - t0) / span);
+        x.color = replayColor(replayHourIndex(x.t));
         x.gapSec = k ? (x.t - pins[k - 1].t) / 1000 : null;
         x.stepM  = k ? replayDistM(pins[k - 1], x) : null;
         const d = x.p.deviceLoc;
@@ -1539,6 +1572,22 @@
         : located === 0 ? `位置が取れたピンがありません（位置なし ${recorded}件）`
         : located < total ? `位置の記録あり：${located}件／全${total}件`
         : "";
+      // 本人の移動とピンの道のり。位置の記録がない日（線が引けない日）は出さない。値は数値だけなので innerHTML で組んでよい。
+      const distEl = document.getElementById("replayDist");
+      if (located < 2) distEl.textContent = "";
+      else {
+        const dd = replayDistances(pins), full = located / total >= REPLAY_COVER_MIN;
+        const still = full && dd.pinPath > 0 && dd.devMove < dd.pinPath * REPLAY_STILL_RATIO;
+        distEl.innerHTML = `本人の移動 ${replayFmtM(dd.devMove)} ／ ピンの道のり ${replayFmtM(dd.pinPath)}`
+          + (full ? "" : `（位置あり ${located}件ぶん）`)
+          + (still ? ` <b class="replay-still">本人はほとんど移動していません</b>` : "");
+      }
+      // 凡例の10色は replayColor() から作る（見本と実際の色がずれない）。数字は「○時台」。
+      const hoursEl = document.getElementById("replayHours");
+      if (!hoursEl.firstChild) {
+        hoursEl.innerHTML = Array.from({ length: REPLAY_HOUR_COUNT }, (_, h) =>
+          `<b style="background:${replayColor(h)}">${REPLAY_HOUR_FROM + h}</b>`).join("");
+      }
       const sl = document.getElementById("replaySlider");
       sl.max = String(pins.length - 1);
       replaySeek(pins.length - 1);                 // 開いた直後は全体を見せる。▶で先頭から再生
@@ -1549,6 +1598,11 @@
     //   以前は整数に切り捨てていたため、最大で2倍近く引いた表示になっていた（ピンの範囲が画面の2割程度）。
     // 操作バーが地図に重なっている分（画面が狭くバーが折り返した時）は見えないので、高さから差し引き、
     // その分だけ中心を下げる＝いちばん上のピンがバーの裏に隠れない。
+    // 地図の＋／−ボタン等（ZDC のコントロール）は z-index が非常に大きく、操作バーの上に出て凡例を隠す。
+    // バーが地図に重なっている高さぶん下へずらし、再生を終えたら戻す。
+    function replayShiftControls(px) {
+      document.querySelectorAll("#map .zwgl-ctrl-top-left, #map .zwgl-ctrl-top-right").forEach(e => { e.style.marginTop = px > 0 ? Math.ceil(px) + "px" : ""; });
+    }
     function replayFit() {
       const P = replay.pins, lats = P.map(x => x.lat), lngs = P.map(x => x.lng);
       const s = Math.min(...lats), n = Math.max(...lats), w = Math.min(...lngs), e = Math.max(...lngs), cLat = (s + n) / 2;
@@ -1558,6 +1612,7 @@
         cover = document.getElementById("replayBar").getBoundingClientRect().bottom - document.getElementById("map").getBoundingClientRect().top;
       } catch (e2) { cover = 0; }
       cover = Math.max(0, Math.min(size.height * 0.5, cover || 0));
+      replayShiftControls(cover);
       const viewH = size.height - cover;
       const needM = Math.max((n - s) * 111000 / (viewH * 0.75), (e - w) * 111000 * cos / (size.width * 0.75), 0.3);
       const z = Math.max(10, Math.min(18, Math.floor(Math.log2(156543.03 * cos / needM) * 10) / 10));   // 0.1刻みで切り捨て＝はみ出さない側に倒す
@@ -1566,18 +1621,22 @@
       map.setCenter(new ZDC.LatLng(cLat + (cover / 2) * mpp / 111000, (w + e) / 2));
       map.setZoom(z);
     }
-    function replayLine(a, b, opt, dashed, list) {
-      const add = pts => { const ln = new ZDC.Polyline(pts, opt); map.addWidget(ln); list.push(ln); };
-      if (!dashed) { add([new ZDC.LatLng(a.lat, a.lng), new ZDC.LatLng(b.lat, b.lng)]); return; }
-      // 点線：短く区切って1つおきに描く（地図APIの線種指定に依存しない）
-      const N = Math.max(5, Math.min(41, Math.round(replayDistM(a, b) / 15) | 1));
-      const at = f => new ZDC.LatLng(a.lat + (b.lat - a.lat) * f, a.lng + (b.lng - a.lng) * f);
-      for (let k = 0; k < N; k += 2) add([at(k / N), at((k + 1) / N)]);
+    // 線種は ZDC.Polyline の pattern（16桁の0/1。1=描く。画面のpx基準なので倍率を変えても細かさは同じ）。
+    //   ライブラリのソースで確認：名前("solid"/"dash"/"dot"/"dashdot")か16桁の0/1以外を渡すと例外になる。
+    //   空白＝太めで切れ目の長い破線／結び線＝細くて細かい点線。凡例(#replayLegend)の見本と必ず揃えること。
+    const REPLAY_PAT_GAP = "1111110000000000", REPLAY_PAT_TIE = "1010101010101010";
+    function replayLine(a, b, opt, list) {
+      const ln = new ZDC.Polyline([new ZDC.LatLng(a.lat, a.lng), new ZDC.LatLng(b.lat, b.lng)], opt);
+      map.addWidget(ln); list.push(ln);
     }
     // k件目ぶんの印と線を足す／消す。スライダーを動かした分だけ処理する（全部を引き直さない）。
     function replayDrawOne(k) {
       const x = replay.pins[k], W = [];
-      if (k > 0) replayLine(replay.pins[k - 1], x, { color: x.color, width: 3, opacity: 0.9 }, x.gapSec >= SUM_GAP_MAX_SEC, W);
+      if (k > 0) {
+        replayLine(replay.pins[k - 1], x, x.gapSec >= SUM_GAP_MAX_SEC
+          ? { color: x.color, width: 4, opacity: 0.9, pattern: REPLAY_PAT_GAP }
+          : { color: x.color, width: 3, opacity: 0.9 }, W);
+      }
       // ピンは小さな丸（時刻の色）。通常のピン型だと数百件で線が隠れるため。丸そのものをクリック対象にする。
       const mk = new ZDC.UserWidget(new ZDC.LatLng(x.lat, x.lng), {
         htmlSource: '<div class="replay-pin" onclick="event.stopPropagation();replayPick(' + k + ')" style="transform:translate(-50%,-50%);'
@@ -1587,7 +1646,8 @@
       map.addWidget(mk); W.push(mk);
       if (x.dev) {
         const far = x.dev.kind === "far", stale = x.dev.kind === "none";
-        replayLine(x.dev, x, { color: far ? REPLAY_FAR_COLOR : "#64748B", width: far ? 3 : 1, opacity: stale ? 0.4 : 0.9 }, false, W);
+        replayLine(x.dev, x, { color: far ? REPLAY_FAR_COLOR : REPLAY_DEV_COLOR, width: far ? 3 : 2,
+                               opacity: stale ? 0.4 : 0.9, pattern: REPLAY_PAT_TIE }, W);
         const dot = new ZDC.UserWidget(new ZDC.LatLng(x.dev.lat, x.dev.lng), {
           htmlSource: '<div class="replay-dev" data-kind="' + (far ? "far" : stale ? "stale" : "ok") + '" style="transform:translate(-50%,-50%);'
             + 'width:20px;height:20px;opacity:' + (stale ? 0.4 : 1) + ';pointer-events:none;">'
@@ -1680,6 +1740,7 @@
       const view = replay.view;
       replay = null;
       document.getElementById("replayBar").style.display = "none";
+      replayShiftControls(0);
       if (view && !keepView) {                     // 地図を再生前の位置・倍率へ戻す
         map.setCenter(new ZDC.LatLng(view.lat, view.lng));
         if (map.getZoom() !== view.zoom) map.setZoom(view.zoom);
@@ -4298,8 +4359,13 @@
     .replay-legend span { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }
     .replay-legend i { display:inline-block; }
     .replay-legend .lg-dot  { width:11px; height:11px; border-radius:50%; border:2px solid #fff; background:#11d411; }
-    .replay-legend .lg-grad { width:54px; height:4px; border-radius:2px; background:linear-gradient(90deg,#1111d4,#11d4d4,#11d411,#d4d411,#d41111); }
-    .replay-legend .lg-dash { width:26px; height:0; border-top:3px dashed #cbd5e1; }
+    .replay-legend .lg-hours { display:inline-flex; border-radius:3px; overflow:hidden; }
+    .replay-legend .lg-hours b { width:18px; height:15px; font-size:10px; line-height:15px; text-align:center; color:#fff; text-shadow:0 0 2px #000, 0 0 2px #000; }
+    /* 線の見本。REPLAY_PAT_GAP（線6:空き10・太さ4）／REPLAY_PAT_TIE（1:1・太さ2〜3）と同じ比率にする */
+    .replay-legend .lg-gap { width:38px; height:4px; background:repeating-linear-gradient(90deg,#cbd5e1 0 6px,transparent 6px 16px); }
+    .replay-legend .lg-tie { width:22px; height:2px; background:repeating-linear-gradient(90deg,var(--c) 0 2px,transparent 2px 4px); }
+    .replay-dist { white-space:nowrap; color:#e2e8f0; }
+    .replay-still { color:#fbbf24; }
     .replay-legend .lg-line { width:26px; height:3px; }
     /* 黒（本人）は暗いバーの上では見えないので、見本だけ明るい下地に載せる */
     .replay-legend .lg-chip { display:inline-flex; align-items:center; gap:3px; padding:2px 4px; background:#e2e8f0; border-radius:4px; }
@@ -4690,13 +4756,14 @@
         <label id="replayDevLabel" title="本人の位置だけを打刻順につないだ線"><input type="checkbox" id="replayDevChk" onchange="replayToggleDev(this.checked)"> 本人の動き</label>
         <span class="replay-devnote" id="replayDevNote"></span>
       </span>
+      <span class="replay-dist" id="replayDist"></span>
       <span class="replay-info" id="replayInfo"></span>
       <div class="replay-legend" id="replayLegend">
         <span><i class="lg-dot"></i>ピン</span>
-        <span><i class="lg-grad"></i>色＝時刻（朝 青 → 夕 赤）</span>
-        <span><i class="lg-dash"></i>5分以上の空白</span>
-        <span><i class="lg-chip"><svg width="16" height="16" viewBox="0 0 20 20"><g fill="#111827" stroke="#fff" stroke-width="1.6" stroke-linejoin="round" paint-order="stroke"><circle cx="10" cy="5" r="3.6"/><path d="M3.5 19v-4.2c0-3 2.6-5.3 6.5-5.3s6.5 2.3 6.5 5.3V19z"/></g></svg></i>本人の位置（細い線でピンと結ぶ）</span>
-        <span><i class="lg-chip"><i class="lg-line" style="background:#C026D3"></i><svg width="16" height="16" viewBox="0 0 20 20"><g fill="#C026D3" stroke="#fff" stroke-width="1.6" stroke-linejoin="round" paint-order="stroke"><circle cx="10" cy="5" r="3.6"/><path d="M3.5 19v-4.2c0-3 2.6-5.3 6.5-5.3s6.5 2.3 6.5 5.3V19z"/></g></svg></i>離れ打ち（距離−精度が100m超）</span>
+        <span><i class="lg-hours" id="replayHours"></i>色＝時刻（数字は○時台）</span>
+        <span><i class="lg-gap"></i>5分以上の空白</span>
+        <span><i class="lg-chip"><i class="lg-tie" style="--c:#111827"></i><svg width="16" height="16" viewBox="0 0 20 20"><g fill="#111827" stroke="#fff" stroke-width="1.6" stroke-linejoin="round" paint-order="stroke"><circle cx="10" cy="5" r="3.6"/><path d="M3.5 19v-4.2c0-3 2.6-5.3 6.5-5.3s6.5 2.3 6.5 5.3V19z"/></g></svg></i>本人の位置（点線でピンと結ぶ）</span>
+        <span><i class="lg-chip"><i class="lg-tie" style="--c:#C026D3;height:3px"></i><svg width="16" height="16" viewBox="0 0 20 20"><g fill="#C026D3" stroke="#fff" stroke-width="1.6" stroke-linejoin="round" paint-order="stroke"><circle cx="10" cy="5" r="3.6"/><path d="M3.5 19v-4.2c0-3 2.6-5.3 6.5-5.3s6.5 2.3 6.5 5.3V19z"/></g></svg></i>離れ打ち（距離−精度が100m超）</span>
         <span><i class="lg-chip" style="padding:6px 4px"><i class="lg-line" style="background:#111827"></i></i>本人の動き（ONの時）</span>
       </div>
     </div>
