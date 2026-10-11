@@ -14,8 +14,17 @@ service cloud.firestore {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
                     && request.resource.data.uid == request.auth.uid;
+      // 「いつ・どこで・誰が打ったか」は作成時に1回だけ書ける。本人は後から変更・追加・削除できない。
+      //   deviceLoc ＝打刻時の端末位置（現地で打ったかの記録）／createdAt ＝打刻時刻／uid ＝持ち主／lat・lng ＝ピンの位置
+      //   index.html の編集保存はこれらを送らない（status・memo・chiban 等のみ）ので、現場の操作には影響しない。
+      //   管理者は従来どおり全項目を更新できる（位置の修正は admin.html から）。
+      //   ※本人判定を先に置く＝通常の編集保存で admins の読み取り(exists)を発生させない。
+      //   ※作成時の値そのものは端末の自己申告。本人による削除→作り直しも止めない（「1件戻す」に削除が要るため）。
       allow update: if isSignedIn()
-                    && (resource.data.uid == request.auth.uid || isAdmin());
+                    && ((resource.data.uid == request.auth.uid
+                         && !request.resource.data.diff(resource.data).affectedKeys()
+                              .hasAny(['deviceLoc', 'createdAt', 'uid', 'lat', 'lng']))
+                        || isAdmin());
       allow delete: if isSignedIn()
                     && (resource.data.uid == request.auth.uid || isAdmin());
     }
