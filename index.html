@@ -71,6 +71,64 @@
     // 30秒は約40m＝3〜4軒分ずれ、showMyLocation の「隣家を対象と誤認する」懸念に自分から抵触する。
     const GPS_OPTS_IDLE   = { enableHighAccuracy: false, timeout: 8000, maximumAge: 15000 };
 
+    // ===== 打刻位置の記録（ピン作成時の端末位置。記録のみで挙動には一切使わない）=====
+    // 目的：「現地で打ったか」を後からデータで判定できるようにする（admin.html で距離を見る）。
+    // 青ドット用に取れた測位をそのまま控える。保存時はこの変数を読むだけ＝保存の待ち時間を増やさない。
+    // 「古い」の境目は青ドットの薄化と同じ MY_LOCATION_STALE_MS(60秒) を使う。
+    //   ※青ドット側の値を変えるときは、打刻記録用に60秒の定数を分けること（判定基準が黙って動くため）。
+    let lastDeviceFix = null;    // 直近の測位 { lat, lng, acc(m), at(ms) }
+    let lastGeoErrCode = null;   // 直近の測位エラーコード（1=許可なし）。測位が入ったら null に戻す
+    let tapFixAt = 0;            // ピン入力を開いた時の高精度測位を最後に投げた時刻（多重発行の防止）
+    // 直前の測位がこれ以内で、かつ新しい測位の方が粗いときは直前を残す。
+    //   追従OFF中は低精度watchが流れ続けるため、放っておくとタップ時の高精度測位が
+    //   数秒後に粗い値で上書きされてしまう。10秒＝徒歩で約13m。
+    const DEVICE_FIX_KEEP_BETTER_MS = 10000;
+
+    function recordDeviceFix(pos) {
+      const now = Date.now(), t = pos.timestamp;
+      // maximumAge によりキャッシュが返ることがあるので、取得時刻は端末が測位した時刻を使う。
+      const at = (typeof t === "number" && t > 0) ? Math.min(t, now) : now;
+      const acc = Math.round(pos.coords.accuracy);
+      lastGeoErrCode = null;   // 測位自体は通っている
+      const f = lastDeviceFix;
+      if (f && at < f.at) return;                                           // 古い測位で巻き戻さない
+      if (f && at - f.at < DEVICE_FIX_KEEP_BETTER_MS && acc > f.acc) return; // 直前の方が高精度なら残す
+      lastDeviceFix = { lat: pos.coords.latitude, lng: pos.coords.longitude, acc, at };
+    }
+    function recordGeoError(err) { lastGeoErrCode = (err && err.code) || null; }
+
+    // ピン入力を開いた時点で、高精度の測位を裏で1回だけ走らせる（追従OFF中は低精度watchのため）。
+    // 結果が来たら lastDeviceFix を更新するだけ。保存は待たせない・失敗しても何もしない。
+    // PCでは走らせない（PCは測位に行かない従来方針のまま＝ reason:"pc" で残る）。
+    function refreshDeviceFixOnTap() {
+      if (!isMobileUA() || !navigator.geolocation) return;
+      const now = Date.now();
+      if (now - tapFixAt < GPS_OPTS_FOLLOW.timeout) return;   // 前回分がまだ走っている間は重ねない
+      tapFixAt = now;
+      navigator.geolocation.getCurrentPosition(
+        pos => { if (pos.coords.accuracy <= GEO_MAX_ACCURACY) recordDeviceFix(pos); },
+        () => { /* 失敗は無視（理由は watch 側のエラーで控えている） */ },
+        { enableHighAccuracy: true, timeout: GPS_OPTS_FOLLOW.timeout, maximumAge: 0 }
+      );
+    }
+
+    // ピンに保存する端末位置。取れていれば {lat,lng,acc,at,dist}、だめなら {reason,…}。
+    //   reason: denied=許可なし / stale=位置が古い(60秒以上前) / pc=PCで未測位 / unavailable=取得不可
+    // ⚠️ undefined を入れない（Firestore が拒否して保存自体が壊れる）。例外でも必ず値を返す＝保存を止めない。
+    function deviceLocForPin(pinLat, pinLng) {
+      try {
+        const f = lastDeviceFix, now = Date.now();
+        const snap = f ? { lat: f.lat, lng: f.lng, acc: f.acc, at: new Date(f.at).toISOString(),
+                           dist: Math.round(distanceM(f.lat, f.lng, pinLat, pinLng)) } : null;
+        if (snap && now - f.at < MY_LOCATION_STALE_MS) return snap;
+        if (lastGeoErrCode === 1) return { reason: "denied" };
+        // 古い位置も判断材料として残す（立ち止まって更新が途切れただけの正常ケースを見分けるため）。
+        if (snap) return { reason: "stale", ageSec: Math.round((now - f.at) / 1000), ...snap };
+        if (navigator.geolocation && !isMobileUA()) return { reason: "pc" };
+        return { reason: "unavailable" };
+      } catch (e) { return { reason: "unavailable" }; }
+    }
+
     let myLocationMarker = null; // 現在地（青ドット）。物件ピンとは別管理（listenPinsで消さない）
     let lastFixLL = null;        // 直近に青ドットを描いた位置。位置が古くなっても薄く残すため保持する
     let myLocationStale = false; // 位置情報が古い＝60秒間更新なし（薄色＋パルス停止で明示）
@@ -781,10 +839,12 @@
         const finish = v => { if (!done) { done = true; resolve(v); } };
         setTimeout(function() { finish(null); }, GEO_TIMEOUT_MS + 500);
         navigator.geolocation.getCurrentPosition(
-          pos => finish(pos.coords.accuracy > GEO_MAX_ACCURACY
-            ? null                                                       // 粗すぎる測位は使わず拠点駅へ
-            : { lat: pos.coords.latitude, lng: pos.coords.longitude }),
-          () => finish(null),                                            // 失敗・拒否・タイムアウト
+          pos => {
+            if (pos.coords.accuracy > GEO_MAX_ACCURACY) { finish(null); return; }   // 粗すぎる測位は使わず拠点駅へ
+            recordDeviceFix(pos);
+            finish({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+          },
+          err => { recordGeoError(err); finish(null); },                 // 失敗・拒否・タイムアウト
           { enableHighAccuracy: true, timeout: GEO_TIMEOUT_MS, maximumAge: 60000 }
         );
       });
@@ -855,6 +915,7 @@
                 if (gridMode) { toggleGridCell(e.latlng.lat, e.latlng.lng); return; }
                 if (youtoOn) { if (e && e.latlng) queryYouto(e.latlng); return; } // 用途地域ON＝属性取得（ピン追加しない）
                 pendingLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
+                refreshDeviceFixOnTap();   // 打刻位置の精度対策（裏で1回・保存は待たせない）
                 openPinModal();
               });
 
@@ -1895,6 +1956,8 @@
           surveyRound: (roundState[`${myBranch}__${pendingAreaCode}`]?.currentRound) ?? 1,   // そのエリアの現在周回（未取得/未判定=1・現場を止めない）
           branch: myBranch,   // ログイン調査員の所属店（loadMyBranchで確定。名古屋員は"名古屋"のまま）
           createdAt: new Date().toISOString(),
+          // 打刻時の端末位置（取れなければ理由）。同期処理のみ＝保存を待たせない・止めない。
+          deviceLoc: deviceLocForPin(pendingLatLng.lat, pendingLatLng.lng),
         };
         // 成功時も書く（案B-2）。成功ピンは reason を持たない＝admin の琥珀行は出ない。
         pinData.chibanDiag = chibanDiagToSave;
@@ -2140,6 +2203,7 @@
       watchId = navigator.geolocation.watchPosition(
         pos => {
           if (pos.coords.accuracy > 1000) return;  // 既存ガード踏襲（粗い測位は無視）
+          recordDeviceFix(pos);                    // 打刻位置の記録用に控える（表示・追従には使わない）
           const lat = pos.coords.latitude, lng = pos.coords.longitude;
           noteFix();                               // 実際に位置が入った時点で復帰（watch開始時点ではない）
           showMyLocation(lat, lng);                // 青ドットは常に現在地へ（followの有無に関係なく）
@@ -2159,7 +2223,7 @@
           }
           if (headingUpMode) requestHeadingApply();
         },
-        () => { /* 取得失敗は無視（前回位置を維持） */ },
+        err => recordGeoError(err),   // 表示は従来どおり前回位置を維持。理由(許可なし等)だけ控える
         hi ? GPS_OPTS_FOLLOW : GPS_OPTS_IDLE
       );
     }
@@ -2706,6 +2770,7 @@
       startLocationWatch();     // 追跡が未開始/停止なら再開（watchIdで二重起動防止）
       if (!navigator.geolocation || !map) return;
       navigator.geolocation.getCurrentPosition(pos => {
+        recordDeviceFix(pos);
         const lat = pos.coords.latitude, lng = pos.coords.longitude;
         map.setCenter(new ZDC.LatLng(lat, lng));
         map.setZoom(getDefaultZoom());   // 起動時の初期表示と同一の縮尺（従来は17固定で起動時16とズレていた）
@@ -2713,7 +2778,7 @@
         lastCenterAt = Date.now(); lastCenterLL = { lat, lng };
         noteFix();                       // これも実測位。watchの初回を待たずに青ドットを戻す
         showMyLocation(lat, lng);
-      });
+      }, recordGeoError);
     };
 
     // ===== ENTER KEY LOGIN =====
