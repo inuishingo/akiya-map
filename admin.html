@@ -1471,6 +1471,7 @@
     //   色の決まり：時刻の色（青→緑→黄→赤）と被らないよう、本人＝黒、離れ打ち＝赤紫に固定する。
     //     離れ打ちを赤にすると夕方の線（赤）と見分けがつかない。凡例(#replayLegend)と必ず揃えること。
     const REPLAY_DEV_COLOR = "#111827", REPLAY_FAR_COLOR = "#C026D3";
+    const REPLAY_DEVLOC_SINCE = "10/11";   // deviceLoc の保存を始めた日（2026-10-11）。それより前のピンには記録が無い
     // 人型アイコン（SVG）。絵文字は端末で見た目が変わるので使わない。白フチで地図の上でも読める。
     function replayPersonSVG(color, px) {
       return '<svg width="' + px + '" height="' + px + '" viewBox="0 0 20 20" style="display:block">'
@@ -1524,7 +1525,20 @@
       document.getElementById("replayTitle").textContent = `${staffName(r.email)}　${r.ymd}　${pins.length}件`;
       document.getElementById("replayPlayBtn").textContent = "▶ 再生";
       document.getElementById("replaySpeedSel").value = "60";
-      document.getElementById("replayDevChk").checked = false;
+      // 「本人の動き」は本人の位置が取れたピン（距離が出ているピン）を結ぶ線。2件未満の日は引けないので押せなくする。
+      // 押せない理由を横に出す＝旧版の日（記録なし）と、許可を切って打った日（位置なし）を取り違えさせない。
+      const total = pins.length;
+      const recorded = pins.filter(x => x.p.deviceLoc && typeof x.p.deviceLoc === "object").length;   // deviceLoc があるピン
+      const located = pins.filter(x => x.dev && x.dev.kind !== "none").length;                          // 位置が取れたピン
+      const devChk = document.getElementById("replayDevChk");
+      devChk.checked = false;
+      devChk.disabled = located < 2;
+      document.getElementById("replayDevLabel").classList.toggle("disabled", devChk.disabled);
+      document.getElementById("replayDevNote").textContent =
+        recorded === 0 ? `この日は位置の記録がありません（${REPLAY_DEVLOC_SINCE}以降のピンが対象）`
+        : located === 0 ? `位置が取れたピンがありません（位置なし ${recorded}件）`
+        : located < total ? `位置の記録あり：${located}件／全${total}件`
+        : "";
       const sl = document.getElementById("replaySlider");
       sl.max = String(pins.length - 1);
       replaySeek(pins.length - 1);                 // 開いた直後は全体を見せる。▶で先頭から再生
@@ -4276,6 +4290,9 @@
     .replay-bar button, .replay-bar select { font-size:12px; padding:4px 10px; border-radius:6px; border:1px solid #475569; background:#1e293b; color:#e2e8f0; cursor:pointer; }
     .replay-bar input[type=range] { flex:1; min-width:160px; }
     .replay-bar label { display:flex; align-items:center; gap:4px; cursor:pointer; }
+    .replay-bar label.disabled { opacity:.45; cursor:not-allowed; }
+    .replay-devgroup { display:inline-flex; align-items:center; gap:8px; white-space:nowrap; }
+    .replay-devnote { color:#fbbf24; white-space:nowrap; }
     /* 凡例。色と形は replayDrawOne / REPLAY_*_COLOR と必ず揃える。 */
     .replay-legend { flex-basis:100%; display:flex; flex-wrap:wrap; align-items:center; gap:4px 14px; color:#94a3b8; font-size:11px; }
     .replay-legend span { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }
@@ -4668,7 +4685,11 @@
         <option value="30">×30</option><option value="60" selected>×60</option><option value="120">×120</option><option value="300">×300</option>
       </select>
       <span id="replayPos"></span>
-      <label title="本人の位置だけを打刻順につないだ線"><input type="checkbox" id="replayDevChk" onchange="replayToggleDev(this.checked)"> 本人の動き</label>
+      <!-- チェックと注記は1組で折り返す（注記だけが次の行に落ちて、チェックから離れないように） -->
+      <span class="replay-devgroup">
+        <label id="replayDevLabel" title="本人の位置だけを打刻順につないだ線"><input type="checkbox" id="replayDevChk" onchange="replayToggleDev(this.checked)"> 本人の動き</label>
+        <span class="replay-devnote" id="replayDevNote"></span>
+      </span>
       <span class="replay-info" id="replayInfo"></span>
       <div class="replay-legend" id="replayLegend">
         <span><i class="lg-dot"></i>ピン</span>
