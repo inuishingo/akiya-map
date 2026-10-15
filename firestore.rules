@@ -118,5 +118,49 @@ service cloud.firestore {
       allow read: if exists(/databases/$(database)/documents/admins/$(request.auth.uid));
       allow write: if false;
     }
+
+    // ───────────────────────────────────────────────────────────────
+    // 除外エリア（excludeZones）。寺社所有地など「調査不要な区画」の多角形。
+    //   admin.html で描く／編集／削除し、Excel出力から範囲内のピンを外す。index.html は表示と確認ダイアログだけ。
+    //   ピンのデータには一切書かない（範囲内かどうかは毎回その場で判定する）。
+    //   read  = 同じ拠点のログイン者（全店扱いは全拠点）
+    //   write = 管理者で、かつ自店のエリアだけ（拠点・作成者・作成日時は後から変えられない）
+    //   拠点の判定は Functions の callerBranchOf と同じ：displayNames/{email}.branch → 無ければメールで判定。
+    function emailLc() {
+      return request.auth.token.email.lower();
+    }
+    function isAllStoreUser() {
+      return emailLc().matches('.*@housemarket[.]com') && !emailLc().matches('.*kyoto.*');
+    }
+    function userBranch() {
+      let dn = /databases/$(database)/documents/displayNames/$(request.auth.token.email);
+      let b = exists(dn) ? get(dn).data.get('branch', '').trim() : '';
+      return b != '' ? b : (emailLc().matches('.*kyoto.*') ? '京都' : '名古屋');
+    }
+    function zoneBranchOk(b) {
+      return isAllStoreUser() || b == userBranch();
+    }
+    function validZone(d) {
+      return d.keys().hasOnly(['branch', 'name', 'reason', 'coords', 'createdBy', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['branch', 'name', 'reason', 'coords', 'createdBy', 'createdAt', 'updatedAt'])
+        && d.branch is string && d.branch.size() > 0
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 60
+        && d.reason in ['寺社所有地', '公有地', 'その他']
+        && d.coords is list && d.coords.size() >= 3 && d.coords.size() <= 200
+        && d.createdAt is string && d.updatedAt is string;
+    }
+    match /excludeZones/{zoneId} {
+      allow read:   if isSignedIn() && zoneBranchOk(resource.data.branch);
+      allow create: if isAdmin() && validZone(request.resource.data)
+                    && zoneBranchOk(request.resource.data.branch)
+                    && request.resource.data.createdBy == request.auth.token.email;
+      allow update: if isAdmin() && validZone(request.resource.data)
+                    && zoneBranchOk(resource.data.branch)
+                    && request.resource.data.branch == resource.data.branch
+                    && request.resource.data.createdBy == resource.data.createdBy
+                    && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if isAdmin() && zoneBranchOk(resource.data.branch);
+    }
+    // ───────────────────────────────────────────────────────────────
   }
 }

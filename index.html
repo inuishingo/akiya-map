@@ -41,6 +41,11 @@
     let myBranch = "名古屋";   // ログイン調査員の所属店(displayNames[email].branch)。読取前は名古屋を既定に。
     let pinWidgetMap = new Map();
     let pinsUnsub = null;   // pins onSnapshot の解除関数（多重購読防止）
+    // 除外エリア（excludeZones）。管理画面で描いた「調査不要な区画」。ここでは表示と確認ダイアログだけ（読み取りのみ）。
+    let excludeZones = [];
+    let zonesUnsub = null;
+    let zoneWidgets = [];
+    let zoneHatchZoom = null;   // 斜線を引いたときのズーム（変わった時だけ引き直す）
     // ===== 追従・測位のチューニング定数（発熱対策。現場で調整するのはここだけ）=====
     // iPhone X で「熱くなる→動作が落ちる→タブが落ちてログイン画面に戻る」の起点が、
     // ①止まらない高精度GPS ②測位のたびの setCenter（ZENRINタイル再描画＋idleで全ピン走査）だった。
@@ -575,13 +580,16 @@
         initMap();
         // 再ログイン時は initMap が早期returnするため、map既存ならここで購読を張り直す
         // （初回ログインは map 生成後の ready コールバック内で listenPins する）
-        if (map) listenPins();
+        if (map) { listenPins(); listenExcludeZones(); }
         listenRounds();   // 周回マスタを購読（現在周回で色/薄色を判定）
         syncOfflineQueue();
       } else {
         // ログアウト：購読解除＋マーカー消去（再ログイン時の多重購読・残像を防ぐ）
         if (pinsUnsub) { pinsUnsub(); pinsUnsub = null; }
         if (roundsUnsub) { roundsUnsub(); roundsUnsub = null; }
+        if (zonesUnsub) { zonesUnsub(); zonesUnsub = null; }
+        excludeZones = [];
+        renderZones();   // 前の人の拠点のエリアを残さない
         if (map) {
           for (const id of Array.from(pinWidgetMap.keys())) {
             removePinMarker(id);
@@ -931,6 +939,9 @@
               map.addEventListener("click", function(e) {
                 if (gridMode) { toggleGridCell(e.latlng.lat, e.latlng.lng); return; }
                 if (youtoOn) { if (e && e.latlng) queryYouto(e.latlng); return; } // 用途地域ON＝属性取得（ピン追加しない）
+                // 除外エリア内は確認だけ出す（止めはしない。立てるかどうかは調査員が決める）
+                const zone = zoneAt(e.latlng.lat, e.latlng.lng);
+                if (zone && !confirm(`除外エリア内です（${zone.name || "名前なし"}）。立てますか？`)) return;
                 pendingLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
                 refreshDeviceFixOnTap();   // 打刻位置の精度対策（裏で1回・保存は待たせない）
                 openPinModal();
@@ -942,6 +953,7 @@
               map.addEventListener("idle", function(){ redrawActiveLayers(); }); // 用途地域ON中のみ追従再描画
               // 市区界ON中のみ。索引の bbox で可視市区を決め、可視リングを差分更新する。
               map.addEventListener("idle", function(){ if (areaOn) redrawAreaBorders(); });
+              map.addEventListener("idle", function(){ zoneOnIdle(); });   // 除外エリアの斜線はズームが変わった時だけ引き直す
 
               // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
               attachManualPanDetection();
@@ -950,6 +962,7 @@
               attachCompassToggle();          // 右上コンパス＝進行方向↑のON/OFF（初期表示の反映もこの中）
 
               listenPins();
+              listenExcludeZones();   // 除外エリア（自店。全店アカウントは全拠点）
               loadSurveyGrids();   // 調査済みマスを先読み（gridMode ON時に即描画できるように）
             },
             function() {
@@ -1451,6 +1464,95 @@
       if (areaZoomOk) showToast("市区界：表示（市区町村の境界）");
       areaLoadIndex();                         // 索引が未取得なら取る（取得済みなら何もしない）
     };
+
+    // ===== 除外エリア（excludeZones・表示と確認ダイアログだけ）=====
+    // 管理画面で描いた「調査不要な区画」。グレーの半透明＋斜線で描き、範囲内にピンを立てる時だけ確認を出す。
+    // 判定・斜線の関数は admin.html と同じものを置いている（片方を直したらもう片方も揃えること）。
+    const ZONE_FILL = "#6B7280", ZONE_LINE = "#374151";
+    const ZONE_HATCH_PX = 14;      // 斜線の間隔（画面上のpx）
+    const ZONE_HATCH_MAX = 300;    // 1エリアの斜線の上限。超える広域表示では塗りだけにする（重くしない）
+    function zoneContains(lat, lng, ring) {
+      let inside = false;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const a = ring[i], b = ring[j];
+        if ((a.lat > lat) !== (b.lat > lat)
+            && lng < (b.lng - a.lng) * (lat - a.lat) / (b.lat - a.lat) + a.lng) inside = !inside;
+      }
+      return inside;
+    }
+    function zoneCoords(z) {
+      const c = Array.isArray(z && z.coords)
+        ? z.coords.filter(p => p && typeof p.lat === "number" && typeof p.lng === "number") : [];
+      return c.length >= 3 ? c : null;
+    }
+    function zoneBBox(c) {
+      const lats = c.map(p => p.lat), lngs = c.map(p => p.lng);
+      return { s: Math.min(...lats), n: Math.max(...lats), w: Math.min(...lngs), e: Math.max(...lngs) };
+    }
+    function zoneAt(lat, lng) {
+      for (const z of excludeZones) {
+        const c = zoneCoords(z); if (!c) continue;
+        const bb = z._bb || (z._bb = zoneBBox(c));
+        if (lat < bb.s || lat > bb.n || lng < bb.w || lng > bb.e) continue;
+        if (zoneContains(lat, lng, c)) return z;
+      }
+      return null;
+    }
+    function zoneHatchSegments(coords, spacingM) {
+      const M = 111320, k = Math.cos(coords[0].lat * Math.PI / 180);
+      const P = coords.map(p => ({ x: p.lng * k * M, y: p.lat * M }));
+      const val = P.map(p => p.y - p.x);                 // 線：y − x ＝ c
+      const step = spacingM * Math.SQRT2;
+      const cMin = Math.min(...val), cMax = Math.max(...val);
+      const first = Math.ceil(cMin / step) * step;
+      if (!(step > 0) || (cMax - first) / step > ZONE_HATCH_MAX) return [];
+      const segs = [];
+      for (let c = first; c < cMax; c += step) {
+        const xs = [];
+        for (let a = 0, b = P.length - 1; a < P.length; b = a++) {
+          const fa = val[a] - c, fb = val[b] - c;
+          if ((fa > 0) !== (fb > 0)) xs.push(P[a].x + (P[b].x - P[a].x) * (fa / (fa - fb)));
+        }
+        xs.sort((u, v) => u - v);
+        for (let j = 0; j + 1 < xs.length; j += 2) {
+          segs.push([{ lat: (xs[j] + c) / M, lng: xs[j] / (k * M) }, { lat: (xs[j + 1] + c) / M, lng: xs[j + 1] / (k * M) }]);
+        }
+      }
+      return segs;
+    }
+    // propagation:true は必須。ZDC の図形は既定でクリックを地図へ通さない（PCのマウスではエリア内にピンを立てられなくなる）。
+    function renderZones() {
+      if (!map) return;
+      zoneWidgets.forEach(w => { try { map.removeWidget(w); } catch (e) {} });
+      zoneWidgets = [];
+      zoneHatchZoom = map.getZoom();
+      const mpp = (lat) => 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoneHatchZoom);
+      excludeZones.forEach(z => {
+        const c = zoneCoords(z); if (!c) return;
+        const poly = new ZDC.Polygon(c.map(p => new ZDC.LatLng(p.lat, p.lng)),
+          { fill: ZONE_FILL, fillOpacity: 0.28, stroke: ZONE_LINE, strokeWidth: 2, propagation: true });
+        map.addWidget(poly); zoneWidgets.push(poly);
+        zoneHatchSegments(c, ZONE_HATCH_PX * mpp(c[0].lat)).forEach(s => {
+          const ln = new ZDC.Polyline(s.map(p => new ZDC.LatLng(p.lat, p.lng)), { color: ZONE_LINE, width: 1, opacity: 0.55, propagation: true });
+          map.addWidget(ln); zoneWidgets.push(ln);
+        });
+      });
+    }
+    function zoneOnIdle() {
+      if (map && excludeZones.length && map.getZoom() !== zoneHatchZoom) renderZones();
+    }
+    // 自店に絞る（全店アカウントのみ全拠点＝ピンと同じ）。rules 側も同じ拠点しか読ませない。
+    // rules 未deploy・読取NG のときは表示しないだけ（ピンの購読や打刻は巻き込まない）。
+    function listenExcludeZones() {
+      if (!map) return;
+      if (zonesUnsub) zonesUnsub();
+      const base = collection(db, "excludeZones");
+      const src = isAllStore(currentUser && currentUser.email) ? base : query(base, where("branch", "==", myBranch));
+      zonesUnsub = onSnapshot(src,
+        snap => { excludeZones = snap.docs.map(d => ({ id: d.id, ...d.data() })); renderZones(); },
+        err => { console.warn("excludeZones 購読不可（rules未反映の可能性）", err); excludeZones = []; renderZones(); }
+      );
+    }
 
     // ===== LISTEN PINS（第二便：自店のピンだけ購読。全店アカウント(@housemarket.com)のみ全件）=====
     function listenPins() {

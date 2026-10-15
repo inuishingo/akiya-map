@@ -133,6 +133,18 @@
     let regStatus = "hansha";   // 登録ステータス（hansha/ng）
     let lastGeoLatLng = null;   // 直近ジオコード座標（住所からの登録用）
     let regTempMarker = null;   // 一時マーカー（登録前の仮位置）
+    // 除外エリア（excludeZones・管理画面で描く/編集/削除）。ピンのデータには一切書かない。
+    let excludeZones = [];      // 自店の除外エリア [{id, branch, name, reason, coords:[{lat,lng}], ...}]
+    let zonesUnsub = null;
+    let zoneWidgets = [];       // 表示用（塗り＋斜線）。編集中のエリアは描かない
+    let zoneEditWidgets = [];   // 描画/編集中の仮の多角形・頂点の印
+    let zonePanelOpen = false;  // 除外エリアのパネルを開いているか
+    let zoneMode = null;        // null | "draw"（新規に描く）| "edit"（既存の頂点を直す）
+    let zoneDraft = [];         // 描画/編集中の頂点 [{lat,lng}]
+    let zoneEditId = null;      // 編集中のエリアの doc ID（新規は null）
+    let zoneSelVertex = -1;     // 選んでいる頂点（-1＝なし）。選んだ状態で地図をクリックするとそこへ動く
+    let zoneHatchZoom = null;   // 斜線を引いたときのズーム（変わった時だけ引き直す）
+    let zoneExcludeOn = true;   // Excel出力で除外エリア内のピンを外す（既定ON・記憶しない）
 
     // ===== 公図取得済みマーク（kouzu_marks）— 管理画面専用 =====
     // 地番レイヤで地番が取得できず「公図」を法務局/登記情報提供サービスで取得したエリアの記録。
@@ -470,6 +482,8 @@
         if (acBtn && isAdminUser) acBtn.style.display = "";
         const smBtn = document.getElementById("sumBtn");
         if (smBtn && isAdminUser) smBtn.style.display = "";
+        const zoneBtn = document.getElementById("zoneBtn");
+        if (zoneBtn && isAdminUser) zoneBtn.style.display = "";
         initStatusFilter();       // ステータスDDの選択肢を構築（1回）
         updateStatsHighlight();   // カウンター初期ハイライト（総件数=全表示）
         // 自店は initMap より前に確定させる。初期中心の拠点駅分岐は mapOptions 段階で myBranch を読むため、
@@ -483,12 +497,19 @@
         listenSurveyGrids();   // 調査グリッドの進捗をリアルタイム購読（表示はトグルON時のみ）
         listenRounds();        // 周回マスタを購読（現在周回で色/薄色・周回フィルタ候補を判定）
         listenKouzuMarks();    // 公図取得済みマーク（管理者専用）を購読
+        listenExcludeZones();  // 除外エリア（自店のみ）を購読
       } else {
         document.getElementById("loginScreen").style.display = "flex";
         document.getElementById("adminScreen").style.display = "none";
         // 共有端末で担当が入れ替わったとき、前の人の操作が取消対象に残らないよう捨てる。
         gridUndoStack = [];
         setGridEditMode(false);
+        // 除外エリア：購読を外し、描画途中の形も捨てる（次に入る人に前の人の拠点のエリアを見せない）
+        if (zonesUnsub) { zonesUnsub(); zonesUnsub = null; }
+        zoneCancel();
+        excludeZones = [];
+        renderZones();
+        if (zonePanelOpen) toggleZonePanel();
         // アカウント一覧は他人の個人情報なので、ログアウト時に画面からも捨てる
         acctRows = [];
         hideAcctPwPanel();   // 発行したパスワードも画面から捨てる
@@ -794,7 +815,7 @@
     function setGridEditMode(on) {
       if (on && !gridMode) { showToast("先に「▦ グリッド」をONにしてください", "warn"); return; }
       gridEditMode = !!on;
-      if (gridEditMode) { setRegMode(false); setKouzuMode(false); }   // 反社/NG登録・公図取得と排他
+      if (gridEditMode) { setRegMode(false); setKouzuMode(false); zoneCancel(); }   // 反社/NG登録・公図取得・除外エリア編集と排他
       applyGridEditUI();
     }
     window.toggleGridEditMode = () => setGridEditMode(!gridEditMode);
@@ -874,11 +895,14 @@
             map.addEventListener("idle", function(){ redrawActiveLayers(); });
             // 市区界ON中のみ。索引の bbox で可視市区を決め、可視リングを差分更新する（index.html と同じ）。
             map.addEventListener("idle", function(){ if (areaOn) redrawAreaBorders(); });
+            map.addEventListener("idle", function(){ zoneOnIdle(); });   // 除外エリアの斜線はズームが変わった時だけ引き直す
             map.addEventListener("click", function(e){
               if (!e || !e.latlng) return;
+              if (zoneMode) { zoneMapClick(e.latlng); return; }   // 除外エリアの描画/編集中（他のクリック登録とは排他）
               if (gridEditMode) { toggleGridCell(e.latlng.lat, e.latlng.lng); return; }   // 編集が最優先（用途地域より先勝ち）
               if (regMode) { registerFromClick(e.latlng); return; }   // 反社/NG登録モード優先
               if (kouzuMode) { openKouzuModal(e.latlng); return; }    // 公図取得モード（regModeと排他）
+              if (zonePanelOpen && zonePickAt(e.latlng)) return;      // 除外エリア一覧を開いている間は、エリアのクリックで編集に入る
               if (youtoOn) queryYouto(e.latlng);
             });
             renderAllMarkers();
@@ -1337,6 +1361,373 @@
       redrawAreaBorders();                     // ズーム不足ならこの中で案内が1回出る（＝下の行は出さない）
       if (areaZoomOk) showToast("市区界：表示（市区町村の境界）");
       areaLoadIndex();                         // 索引が未取得なら取る（取得済みなら何もしない）
+    };
+
+    // ===== 除外エリア（excludeZones）=====
+    // 寺社所有地など「調査不要な区画」を多角形で持つ。範囲内のピンは Excel 出力から外す（既定ON・チェックで含められる）。
+    // ピンには何も書かない＝範囲内かどうかは毎回その場で判定する（エリアを直せば即反映・消せば元どおり）。
+    // 読み書きの境界は rules（excludeZones）：読み＝同じ拠点／書き＝管理者で自店のエリアだけ。
+    // 判定・斜線の関数は index.html と同じものを置いている（片方を直したらもう片方も揃えること）。
+    const ZONE_REASONS = ["寺社所有地", "公有地", "その他"];   // rules の validZone と一致させること
+    const ZONE_MAX_VERTICES = 200;                            // 同上
+    const ZONE_FILL = "#6B7280", ZONE_LINE = "#374151";       // グレーの半透明＋斜線（index.html と同じ）
+    const ZONE_EDIT_COLOR = "#2563EB";                        // 描画/編集中の仮の形は青
+    const ZONE_HATCH_PX = 14;      // 斜線の間隔（画面上のpx。ズームが変わったら引き直す）
+    const ZONE_HATCH_MAX = 300;    // 1エリアの斜線の上限。超える広域表示では塗りだけにする（重くしない）
+
+    // 点が多角形の内側か（レイキャスティング）。数百m規模なので緯度経度のまま判定して差し支えない。
+    function zoneContains(lat, lng, ring) {
+      let inside = false;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const a = ring[i], b = ring[j];
+        if ((a.lat > lat) !== (b.lat > lat)
+            && lng < (b.lng - a.lng) * (lat - a.lat) / (b.lat - a.lat) + a.lng) inside = !inside;
+      }
+      return inside;
+    }
+    // 壊れた doc（3点未満・数値でない頂点）は判定にも表示にも使わない
+    function zoneCoords(z) {
+      const c = Array.isArray(z && z.coords)
+        ? z.coords.filter(p => p && typeof p.lat === "number" && typeof p.lng === "number") : [];
+      return c.length >= 3 ? c : null;
+    }
+    function zoneBBox(c) {
+      const lats = c.map(p => p.lat), lngs = c.map(p => p.lng);
+      return { s: Math.min(...lats), n: Math.max(...lats), w: Math.min(...lngs), e: Math.max(...lngs) };
+    }
+    // その地点を含む除外エリア（無ければ null）。bbox で先にふるい落とす（ピン数千件×エリア数で回すため）。
+    function zoneAt(lat, lng) {
+      for (const z of excludeZones) {
+        const c = zoneCoords(z); if (!c) continue;
+        const bb = z._bb || (z._bb = zoneBBox(c));
+        if (lat < bb.s || lat > bb.n || lng < bb.w || lng > bb.e) continue;
+        if (zoneContains(lat, lng, c)) return z;
+      }
+      return null;
+    }
+    function pinZone(p) {
+      return (typeof p.lat === "number" && typeof p.lng === "number") ? zoneAt(p.lat, p.lng) : null;
+    }
+    // 斜線（右上がり45°）を多角形の内側だけに引く。戻り値は線分 [[{lat,lng},{lat,lng}], ...]。
+    //   経度に cos(緯度) を掛けて平面（m）に直してから計算する（そのままだと角度と間隔が歪む）。
+    //   線の位置は全エリア共通の格子に揃える（隣り合うエリアで斜線がずれないように）。
+    function zoneHatchSegments(coords, spacingM) {
+      const M = 111320, k = Math.cos(coords[0].lat * Math.PI / 180);
+      const P = coords.map(p => ({ x: p.lng * k * M, y: p.lat * M }));
+      const val = P.map(p => p.y - p.x);                 // 線：y − x ＝ c
+      const step = spacingM * Math.SQRT2;
+      const cMin = Math.min(...val), cMax = Math.max(...val);
+      const first = Math.ceil(cMin / step) * step;
+      if (!(step > 0) || (cMax - first) / step > ZONE_HATCH_MAX) return [];
+      const segs = [];
+      for (let c = first; c < cMax; c += step) {
+        const xs = [];
+        for (let a = 0, b = P.length - 1; a < P.length; b = a++) {
+          const fa = val[a] - c, fb = val[b] - c;
+          if ((fa > 0) !== (fb > 0)) xs.push(P[a].x + (P[b].x - P[a].x) * (fa / (fa - fb)));
+        }
+        xs.sort((u, v) => u - v);
+        for (let j = 0; j + 1 < xs.length; j += 2) {
+          segs.push([{ lat: (xs[j] + c) / M, lng: xs[j] / (k * M) }, { lat: (xs[j + 1] + c) / M, lng: xs[j + 1] / (k * M) }]);
+        }
+      }
+      return segs;
+    }
+    function zoneClearWidgets(list) {
+      list.forEach(w => { try { map.removeWidget(w); } catch (e) {} });
+      list.length = 0;
+    }
+    // propagation:true は必須。ZDC の図形は既定でクリックを地図へ通さない（マウスでは図形の上の地図クリックが来ない）。
+    //   通さないと、エリアの中に頂点を置く・中へ動かす・エリアを押して編集に入る、が全部できなくなる。
+    function zoneDrawShape(coords, opt, out) {
+      const poly = new ZDC.Polygon(coords.map(p => new ZDC.LatLng(p.lat, p.lng)),
+        { fill: opt.color, fillOpacity: opt.fillOpacity, stroke: opt.line, strokeWidth: 2, propagation: true });
+      map.addWidget(poly); out.push(poly);
+      if (!opt.hatch) return;
+      const mpp = 156543.03392 * Math.cos(coords[0].lat * Math.PI / 180) / Math.pow(2, map.getZoom());
+      zoneHatchSegments(coords, ZONE_HATCH_PX * mpp).forEach(s => {
+        const ln = new ZDC.Polyline(s.map(p => new ZDC.LatLng(p.lat, p.lng)), { color: opt.line, width: 1, opacity: 0.55, propagation: true });
+        map.addWidget(ln); out.push(ln);
+      });
+    }
+    function renderZones() {
+      if (!map || !mapReady) return;
+      zoneClearWidgets(zoneWidgets);
+      zoneHatchZoom = map.getZoom();
+      excludeZones.forEach(z => {
+        if (zoneMode && z.id === zoneEditId) return;   // 編集中のエリアは仮の形（青）だけを見せる
+        const c = zoneCoords(z); if (!c) return;
+        zoneDrawShape(c, { color: ZONE_FILL, line: ZONE_LINE, fillOpacity: 0.28, hatch: true }, zoneWidgets);
+      });
+    }
+    function zoneOnIdle() {
+      if (map && excludeZones.length && map.getZoom() !== zoneHatchZoom) renderZones();
+    }
+
+    // rules 未deploy時は read が既定denyで例外になる。errorコールバックで握りつぶし、既存機能を巻き込まない。
+    function listenExcludeZones() {
+      if (zonesUnsub) zonesUnsub();
+      zonesUnsub = onSnapshot(query(collection(db, "excludeZones"), where("branch", "==", myBranch)),
+        snap => {
+          excludeZones = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+            .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "ja"));
+          if (zoneMode === "edit" && !excludeZones.some(z => z.id === zoneEditId)) {
+            zoneCancel();
+            showToast("編集中のエリアが削除されました", "warn");
+          }
+          renderZones();
+          renderZoneList();
+          updateZoneExCount();
+        },
+        err => {
+          console.warn("excludeZones 購読不可（rules未反映の可能性）", err);
+          excludeZones = [];
+          renderZones(); renderZoneList(); updateZoneExCount();
+        }
+      );
+    }
+
+    // Excel出力の横の「除外エリア内 ○件」。対象は出力と同じ selectionTargets（チェックがあれば選択分）。
+    function updateZoneExCount() {
+      const el = document.getElementById("zoneExCount");
+      if (!el) return;
+      const n = excludeZones.length ? selectionTargets().filter(p => pinZone(p)).length : 0;
+      el.textContent = `除外エリア内 ${n}件`;
+      el.classList.toggle("zero", n === 0);
+      el.classList.toggle("off", !zoneExcludeOn);
+      el.title = zoneExcludeOn ? `Excel出力でこの${n}件を外します` : `「除外エリアを除く」がOFFなので、この${n}件も出力します`;
+    }
+    window.setZoneExclude = (on) => { zoneExcludeOn = !!on; updateZoneExCount(); };
+
+    // ----- パネル（一覧／描画・編集）-----
+    window.toggleZonePanel = () => {
+      zonePanelOpen = !zonePanelOpen;
+      if (!zonePanelOpen) zoneCancel();
+      const panel = document.getElementById("zonePanel");
+      if (panel) panel.style.display = zonePanelOpen ? "block" : "none";
+      const btn = document.getElementById("zoneBtn");
+      if (btn) btn.classList.toggle("active", zonePanelOpen);
+      renderZoneList();
+      updateZonePanel();
+    };
+    function renderZoneList() {
+      const box = document.getElementById("zoneList");
+      if (!box) return;
+      const lbl = document.getElementById("zoneBranchLabel");
+      if (lbl) lbl.textContent = `${myBranch}店`;
+      if (!excludeZones.length) { box.innerHTML = `<div class="zone-empty">まだ登録がありません</div>`; return; }
+      // z.id は Firestore 自動ID（英数）なのでシングルクオート内に直接埋めて安全。名前・理由は escAttr を通す。
+      box.innerHTML = excludeZones.map(z => {
+        const c = zoneCoords(z);
+        return `<div class="zone-item">
+          <div class="zone-item-name">${escAttr(z.name || "（名前なし）")}</div>
+          <div class="zone-item-sub">${escAttr(z.reason || "")}・頂点 ${c ? c.length : 0}${c ? "" : "（形が壊れています）"}</div>
+          <div class="zone-item-btns">
+            <button onclick="zoneJump('${z.id}')">地図で見る</button>
+            <button onclick="startZoneEdit('${z.id}')">編集</button>
+          </div>
+        </div>`;
+      }).join("");
+    }
+    // 描画/編集中の表示（入力欄は作り直さない＝打ちかけの名前を消さない。案内とボタンの状態だけ更新）
+    function updateZonePanel() {
+      const list = document.getElementById("zoneListView"), edit = document.getElementById("zoneEditView");
+      if (!list || !edit) return;
+      list.style.display = zoneMode ? "none" : "block";
+      edit.style.display = zoneMode ? "block" : "none";
+      if (!zoneMode) return;
+      const z = zoneEditId ? excludeZones.find(x => x.id === zoneEditId) : null;
+      document.getElementById("zoneEditTitle").textContent = zoneMode === "draw" ? "✏ 新しい除外エリア" : `✏ 「${z ? z.name : ""}」を編集`;
+      const n = zoneDraft.length;
+      document.getElementById("zoneEditHint").textContent =
+        zoneSelVertex >= 0 ? `頂点${zoneSelVertex + 1}を選択中：移動先の地図をクリック（もう一度押すと選択解除）`
+        : zoneMode === "draw" ? `地図をクリックして頂点を足す（${n}点${n < 3 ? "・3点以上で保存できます" : ""}）。○で頂点を選んで動かす／＋で辺に頂点を足す`
+        : `○で頂点を選んで、移動先の地図をクリック。＋で辺に頂点を足す（${n}点）`;
+      document.getElementById("zoneUndoBtn").style.display = zoneMode === "draw" ? "" : "none";
+      document.getElementById("zoneUndoBtn").disabled = n === 0;
+      document.getElementById("zoneDelVtxBtn").disabled = zoneSelVertex < 0 || n <= 3;
+      document.getElementById("zoneSaveBtn").disabled = n < 3;
+      document.getElementById("zoneDeleteBtn").style.display = zoneMode === "edit" ? "" : "none";
+    }
+    function applyZoneCursor() {
+      const mapEl = document.getElementById("map");
+      if (mapEl) mapEl.style.cursor = (zoneMode || gridEditMode || kouzuMode || regMode) ? "crosshair" : "";
+    }
+    // 描画/編集を始める前に、地図クリックを使う他のモードを全部OFFにする（クリックの奪い合いを防ぐ）
+    function zoneBeginMode() {
+      setRegMode(false);
+      setKouzuMode(false);
+      if (gridEditMode) setGridEditMode(false);
+    }
+    window.startZoneDraw = () => {
+      if (!isAdminUser) { showToast("権限がありません", "error"); return; }
+      zoneBeginMode();
+      zoneMode = "draw"; zoneEditId = null; zoneDraft = []; zoneSelVertex = -1;
+      document.getElementById("zoneName").value = "";
+      document.getElementById("zoneReason").value = ZONE_REASONS[0];
+      applyZoneCursor();
+      renderZones();
+      renderZoneDraft();
+      setTimeout(() => document.getElementById("zoneName")?.focus(), 0);
+    };
+    window.startZoneEdit = (id) => {
+      if (!isAdminUser) { showToast("権限がありません", "error"); return; }
+      const z = excludeZones.find(x => x.id === id);
+      const c = z && zoneCoords(z);
+      if (!c) { showToast("このエリアは形が壊れているため編集できません（削除はできます）", "warn"); return; }
+      zoneBeginMode();
+      zoneMode = "edit"; zoneEditId = id; zoneDraft = c.map(p => ({ lat: p.lat, lng: p.lng })); zoneSelVertex = -1;
+      document.getElementById("zoneName").value = z.name || "";
+      document.getElementById("zoneReason").value = ZONE_REASONS.includes(z.reason) ? z.reason : "その他";
+      applyZoneCursor();
+      renderZones();
+      renderZoneDraft();
+    };
+    window.zoneJump = (id) => {
+      const z = excludeZones.find(x => x.id === id);
+      const c = z && zoneCoords(z);
+      if (!c || !map) return;
+      const bb = zoneBBox(c);
+      map.setCenter(new ZDC.LatLng((bb.s + bb.n) / 2, (bb.w + bb.e) / 2));
+    };
+    // パネルを開いている間、既存エリアの内側をクリックしたら編集に入る（描画/編集中は使わない）
+    function zonePickAt(latlng) {
+      if (zoneMode) return false;
+      const z = zoneAt(latlng.lat, latlng.lng);
+      if (!z) return false;
+      startZoneEdit(z.id);
+      return true;
+    }
+    function zoneCancel() {
+      if (!zoneMode) return;
+      zoneMode = null; zoneEditId = null; zoneDraft = []; zoneSelVertex = -1;
+      if (map) zoneClearWidgets(zoneEditWidgets);
+      applyZoneCursor();
+      renderZones();
+      updateZonePanel();
+    }
+    window.zoneCancel = zoneCancel;
+
+    // ----- 頂点の操作 -----
+    function zoneMapClick(latlng) {
+      const p = { lat: latlng.lat, lng: latlng.lng };
+      if (zoneSelVertex >= 0) {                       // 選んだ頂点をクリック位置へ動かす
+        zoneDraft[zoneSelVertex] = p;
+        zoneSelVertex = -1;
+        renderZoneDraft();
+        return;
+      }
+      if (zoneMode === "draw") {
+        if (zoneDraft.length >= ZONE_MAX_VERTICES) { showToast(`頂点は${ZONE_MAX_VERTICES}点までです`, "warn"); return; }
+        zoneDraft.push(p);
+        renderZoneDraft();
+        return;
+      }
+      showToast("動かす頂点（○）を先にクリックしてください", "warn");
+    }
+    window.zoneVertexClick = (i) => {
+      zoneSelVertex = (zoneSelVertex === i) ? -1 : i;
+      renderZoneDraft();
+    };
+    window.zoneAddVertex = (i) => {   // 辺 i→i+1 の中点に頂点を足して、そのまま選択状態にする
+      if (zoneDraft.length >= ZONE_MAX_VERTICES) { showToast(`頂点は${ZONE_MAX_VERTICES}点までです`, "warn"); return; }
+      const a = zoneDraft[i], b = zoneDraft[(i + 1) % zoneDraft.length];
+      zoneDraft.splice(i + 1, 0, { lat: (a.lat + b.lat) / 2, lng: (a.lng + b.lng) / 2 });
+      zoneSelVertex = i + 1;
+      renderZoneDraft();
+    };
+    window.zoneDeleteVertex = () => {
+      if (zoneSelVertex < 0) { showToast("消す頂点（○）を先にクリックしてください", "warn"); return; }
+      if (zoneDraft.length <= 3) { showToast("頂点は3点より少なくできません", "warn"); return; }
+      zoneDraft.splice(zoneSelVertex, 1);
+      zoneSelVertex = -1;
+      renderZoneDraft();
+    };
+    window.zoneUndoPoint = () => {
+      if (zoneMode !== "draw" || !zoneDraft.length) return;
+      zoneDraft.pop();
+      zoneSelVertex = -1;
+      renderZoneDraft();
+    };
+    // 頂点の印。クリックを地図へ抜けさせない（公図チップと同じ propagation:false＋stopPropagation）。
+    function zoneHandle(p, html, onclickJs, title) {
+      const w = new ZDC.UserWidget(new ZDC.LatLng(p.lat, p.lng), {
+        htmlSource: '<div title="' + title + '" onclick="event.stopPropagation();' + onclickJs + '"'
+          + ' style="transform:translate(-50%,-50%);pointer-events:auto;cursor:pointer;">' + html + '</div>',
+        propagation: false,
+      });
+      map.addWidget(w); zoneEditWidgets.push(w);
+    }
+    function renderZoneDraft() {
+      if (!map) return;
+      zoneClearWidgets(zoneEditWidgets);
+      updateZonePanel();
+      if (!zoneMode) return;
+      const d = zoneDraft;
+      if (d.length >= 3) {
+        zoneDrawShape(d, { color: ZONE_EDIT_COLOR, line: ZONE_EDIT_COLOR, fillOpacity: 0.18, hatch: false }, zoneEditWidgets);
+      } else if (d.length === 2) {
+        const ln = new ZDC.Polyline(d.map(p => new ZDC.LatLng(p.lat, p.lng)), { color: ZONE_EDIT_COLOR, width: 2, opacity: 0.9, propagation: true });
+        map.addWidget(ln); zoneEditWidgets.push(ln);
+      }
+      if (d.length >= 3) {
+        d.forEach((a, i) => {
+          const b = d[(i + 1) % d.length];
+          zoneHandle({ lat: (a.lat + b.lat) / 2, lng: (a.lng + b.lng) / 2 },
+            '<div class="zone-mid">＋</div>', `zoneAddVertex(${i})`, "この辺に頂点を足す");
+        });
+      }
+      d.forEach((p, i) => {
+        zoneHandle(p, `<div class="zone-vtx${i === zoneSelVertex ? " sel" : ""}">${i + 1}</div>`,
+          `zoneVertexClick(${i})`, "クリックで選択 → 地図をクリックで移動");
+      });
+    }
+
+    // ----- 保存・削除 -----
+    window.saveZone = async () => {
+      if (!isAdminUser) { showToast("権限がありません", "error"); return; }
+      if (!zoneMode) return;
+      const name = (document.getElementById("zoneName").value || "").trim();
+      const reason = document.getElementById("zoneReason").value;
+      if (!name) { showToast("名前を入れてください（例：相国寺 寺社所有地）", "warn"); document.getElementById("zoneName").focus(); return; }
+      if (name.length > 60) { showToast("名前は60文字までです", "warn"); return; }
+      if (!ZONE_REASONS.includes(reason)) { showToast("理由を選んでください", "warn"); return; }
+      if (zoneDraft.length < 3) { showToast("頂点を3点以上置いてください", "warn"); return; }
+      if (zoneDraft.length > ZONE_MAX_VERTICES) { showToast(`頂点は${ZONE_MAX_VERTICES}点までです`, "warn"); return; }
+      const coords = zoneDraft.map(p => ({ lat: Math.round(p.lat * 1e7) / 1e7, lng: Math.round(p.lng * 1e7) / 1e7 }));
+      const now = new Date().toISOString();
+      const btn = document.getElementById("zoneSaveBtn");
+      if (btn) btn.disabled = true;
+      try {
+        if (zoneEditId) {
+          await updateDoc(doc(db, "excludeZones", zoneEditId), { name, reason, coords, updatedAt: now });
+        } else {
+          await addDoc(collection(db, "excludeZones"), {
+            branch: myBranch, name, reason, coords,
+            createdBy: auth.currentUser?.email || "", createdAt: now, updatedAt: now,
+          });
+        }
+        showToast(`除外エリア「${name}」を保存しました（ピンのデータは変えていません）`);
+        zoneCancel();   // onSnapshot が拾って描き直す
+      } catch (e) {
+        console.error("saveZone", e);
+        showToast("保存に失敗しました（権限/通信）", "error");
+        updateZonePanel();
+      }
+    };
+    window.deleteZone = async () => {
+      if (!isAdminUser) { showToast("権限がありません", "error"); return; }
+      const z = excludeZones.find(x => x.id === zoneEditId);
+      if (!z) return;
+      if (!confirm(`除外エリア「${z.name}」を削除しますか？\n（範囲内のピンは Excel 出力の対象に戻ります。ピンのデータは変わりません）`)) return;
+      try {
+        await deleteDoc(doc(db, "excludeZones", z.id));
+        zoneCancel();
+        showToast(`除外エリア「${z.name}」を削除しました`);
+      } catch (e) {
+        console.error("deleteZone", e);
+        showToast("削除に失敗しました（権限/通信）", "error");
+      }
     };
 
     // ===== REALTIME LISTEN =====
@@ -2912,6 +3303,7 @@
       }
       const selCnt = document.getElementById("selectCount");
       if (selCnt) selCnt.textContent = checkedIds.size ? `${checkedIds.size}件選択中` : "";
+      updateZoneExCount();   // Excel出力の「除外エリア内 ○件」も同じタイミングで数え直す（対象＝selectionTargets）
 
       if (pins.length === 0) {
         container.innerHTML = `<div class="empty">該当するピンがありません</div>`;
@@ -3431,6 +3823,7 @@
       regMode = !!on;
       if (regMode && kouzuMode) setKouzuMode(false);   // 公図取得モードと排他（同時ONにしない）
       if (regMode && gridEditMode) setGridEditMode(false);   // グリッド編集とも排他（地図クリックの奪い合い）
+      if (regMode) zoneCancel();                             // 除外エリアの描画/編集とも排他
       applyRegModeUI();
     }
     // ボタンから呼ぶトグル。旧: onclick="toggleRegMode(!regMode)" は regMode が module スコープ変数のため
@@ -3464,6 +3857,7 @@
       kouzuMode = !!on;
       if (kouzuMode && regMode) setRegMode(false);   // 反社/NG登録モードと排他
       if (kouzuMode && gridEditMode) setGridEditMode(false);   // グリッド編集とも排他
+      if (kouzuMode) zoneCancel();                             // 除外エリアの描画/編集とも排他
       applyKouzuModeUI();
     }
     window.toggleKouzuMode = () => setKouzuMode(!kouzuMode);
@@ -3550,8 +3944,16 @@
     window.exportExcel = async () => {
       // 対象判定はチェック基点（出力・取消・削除で共通の考え方）。
       //  チェックあり → チェックした案件のみ出力／チェックなし → 表示中(filtered)全体を出力（普段の運用）。
-      const pins = selectionTargets();
-      if (pins.length === 0) { showToast("出力対象のピンがありません", "error"); return; }
+      // 「除外エリアを除く」ON（既定）なら、除外エリア内のピンを外す（チェックで選んだピンも外す）。
+      //  外したピンには exportedAt も付けない＝ピンのデータは一切変えない。
+      const targets = selectionTargets();
+      const zoned = zoneExcludeOn ? targets.filter(p => pinZone(p)) : [];
+      const pins = zoneExcludeOn ? targets.filter(p => !pinZone(p)) : targets;
+      const zonedNote = zoned.length ? `・除外エリア内 ${zoned.length}件を除外` : "";
+      if (pins.length === 0) {
+        showToast(zoned.length ? `出力対象のピンがありません（除外エリア内 ${zoned.length}件を除外）` : "出力対象のピンがありません", "error");
+        return;
+      }
       if (typeof XLSX === "undefined") { showToast("Excelライブラリの読込に失敗しました", "error"); return; }
       // 列順: No/所在地/住居表記/地番/レ/ステータス/調査員メモ/事務員メモ/発見日/担当者/緯度/経度/拠点
       // （メモは2系統：調査員memo=現地メモ／事務員adminMemo。レ＝REINS確認用の空白列は維持）
@@ -3601,7 +4003,7 @@
       await Promise.all(
         pins.map(p => updateDoc(doc(db, "pins", p.id), { exportedAt, exportedBy }).catch(()=>{}))
       );
-      showToast(`Excelを出力しました（${pins.length}件・出力済みに記録）`);
+      showToast(`Excelを出力しました（${pins.length}件・出力済みに記録${zonedNote}）`);
     };
 
     // ===== EXCEL出力済みの取消（未出力に戻す）=====
@@ -4476,6 +4878,44 @@
       padding:10px 12px; font-size:12px; line-height:1.7; box-shadow:0 4px 14px rgba(0,0,0,.4); }
     .kouzu-info .ki-close { float:right; cursor:pointer; color:#94a3b8; font-weight:700; margin-left:8px; }
     .kouzu-info b { color:#22d3ee; }
+    /* 除外エリア（管理者専用）。ボタンON＝グレー（地図のエリアと同じ色） */
+    .layer-btn.zone-btn.active { background:#4B5563; border-color:#4B5563; color:#fff; }
+    .zone-ex { display:inline-flex; align-items:center; gap:4px; font-size:12px; font-weight:700; color:#cbd5e1;
+      cursor:pointer; white-space:nowrap; }
+    .zone-ex input { margin:0; cursor:pointer; }
+    .zone-ex-count { font-size:12px; font-weight:700; color:#fbbf24; white-space:nowrap; }
+    .zone-ex-count.zero { color:#64748b; }
+    .zone-ex-count.off { text-decoration:line-through; color:#64748b; }
+    .zone-panel { position:absolute; top:10px; right:10px; width:290px; max-height:calc(100% - 20px); overflow:auto; z-index:26;
+      background:rgba(15,23,42,.96); color:#e2e8f0; border:1px solid #4B5563; border-radius:8px;
+      padding:10px 12px; font-size:12px; line-height:1.6; box-shadow:0 4px 14px rgba(0,0,0,.4); }
+    .zone-head { display:flex; align-items:center; gap:8px; margin-bottom:6px; font-size:13px; }
+    .zone-branch { color:#94a3b8; font-size:11px; }
+    .zone-x { margin-left:auto; background:none; border:none; color:#94a3b8; font-weight:700; cursor:pointer; font-size:14px; }
+    .zone-hint { color:#94a3b8; font-size:11px; margin:6px 0; }
+    .zone-title { font-weight:700; color:#fff; }
+    .zone-panel button { padding:5px 10px; border-radius:6px; border:1px solid #475569; background:#1e293b; color:#e2e8f0;
+      font-size:12px; font-weight:700; cursor:pointer; }
+    .zone-panel button:disabled { opacity:.45; cursor:default; }
+    .zone-panel .zone-primary { background:#2563eb; border-color:#2563eb; color:#fff; }
+    .zone-panel .zone-danger { background:#7f1d1d; border-color:#991b1b; color:#fecaca; margin-top:8px; }
+    .zone-wide { width:100%; }
+    .zone-row { display:flex; gap:6px; margin-top:6px; }
+    .zone-row button { flex:1; }
+    .zone-field { display:flex; flex-direction:column; gap:2px; margin-top:6px; color:#cbd5e1; font-weight:700; }
+    .zone-field input, .zone-field select { padding:5px 8px; border-radius:6px; border:1px solid #475569; background:#0f172a;
+      color:#e2e8f0; font-size:13px; font-weight:400; }
+    .zone-item { border-top:1px solid #334155; padding:6px 0; }
+    .zone-item-name { font-weight:700; color:#fff; }
+    .zone-item-sub { color:#94a3b8; font-size:11px; }
+    .zone-item-btns { display:flex; gap:6px; margin-top:4px; }
+    .zone-empty { color:#64748b; padding:6px 0; }
+    /* 頂点の印（UserWidget の中身）。選択中は赤。辺の中点の＋は小さめ */
+    .zone-vtx { width:20px; height:20px; border-radius:50%; background:#fff; border:2px solid #2563EB; color:#1e3a8a;
+      font-size:10px; font-weight:800; line-height:16px; text-align:center; box-shadow:0 1px 3px rgba(0,0,0,.4); }
+    .zone-vtx.sel { background:#DC2626; border-color:#fff; color:#fff; }
+    .zone-mid { width:16px; height:16px; border-radius:50%; background:rgba(37,99,235,.85); border:1px solid #fff; color:#fff;
+      font-size:12px; font-weight:800; line-height:14px; text-align:center; }
     .kouzu-info .ki-del { margin-top:8px; padding:5px 10px; border-radius:6px; background:#7f1d1d;
       color:#fca5a5; border:1px solid #991b1b; font-size:12px; cursor:pointer; font-family:inherit; }
     .kouzu-modal { position:fixed; inset:0; z-index:9998; background:rgba(15,23,42,.55);
@@ -4664,6 +5104,13 @@
     <button class="layer-btn acct-btn" id="acctBtn" style="display:none" onclick="openAccountModal()" title="調査員アカウントの一覧・無効化／再有効化（管理者専用）">👤 アカウント管理</button>
     <!-- 調査集計（管理者専用）。調査員×日の件数・ペース・打刻位置。周回管理と同じく既定 display:none。 -->
     <button class="layer-btn acct-btn" id="sumBtn" style="display:none" onclick="openSurveySummary()" title="調査員×日の件数・ペース・離れ打ちの集計">📊 調査集計</button>
+    <!-- 除外エリア（管理者専用）。地図で多角形を描き、範囲内のピンを Excel 出力から外す。既定 display:none。 -->
+    <button class="layer-btn zone-btn" id="zoneBtn" style="display:none" onclick="toggleZonePanel()" title="寺社所有地など調査不要な区画を描く／直す／消す（管理者専用）">🚫 除外エリア</button>
+    <!-- 既定ON・記憶しない（開き直すたびONから）。件数は出力と同じ対象（チェックがあれば選択分）で数える。 -->
+    <label class="zone-ex" title="除外エリア内のピンを Excel 出力から外す（ピンのデータは変えない）">
+      <input type="checkbox" id="zoneExChk" checked onchange="setZoneExclude(this.checked)">除外エリアを除く
+    </label>
+    <span class="zone-ex-count zero" id="zoneExCount">除外エリア内 0件</span>
     <button class="csv-btn" onclick="exportExcel()">📥 Excel出力</button>
     <button class="csv-btn undo-btn" onclick="unexportAll()" title="チェックがあれば選択分／無ければ表示中の出力済みを未出力に戻す">↩ 出力取消</button>
     <button class="logout-btn" onclick="doLogout()">ログアウト</button>
@@ -4772,6 +5219,41 @@
     <div id="gridLegend" class="grid-legend" style="display:none"></div>
     <div id="youtoInfo" class="youto-info" style="display:none"></div>
     <div id="kouzuInfo" class="kouzu-info" style="display:none"></div>
+    <!-- 除外エリアのパネル（管理者専用）。一覧 ⇔ 描画/編集を切り替える。入力欄は作り直さない（打ちかけを消さない）。 -->
+    <div id="zonePanel" class="zone-panel" style="display:none">
+      <div class="zone-head">
+        <b>🚫 除外エリア</b><span class="zone-branch" id="zoneBranchLabel"></span>
+        <button class="zone-x" onclick="toggleZonePanel()" title="閉じる">✕</button>
+      </div>
+      <div id="zoneListView">
+        <button class="zone-primary zone-wide" onclick="startZoneDraw()">＋ 新しいエリアを描く</button>
+        <div class="zone-hint">地図上のエリアをクリックしても編集できます。範囲内のピンは Excel 出力から外れます（ピンのデータは変わりません）。</div>
+        <div id="zoneList"></div>
+      </div>
+      <div id="zoneEditView" style="display:none">
+        <div class="zone-title" id="zoneEditTitle"></div>
+        <div class="zone-hint" id="zoneEditHint"></div>
+        <label class="zone-field">名前
+          <input id="zoneName" type="text" maxlength="60" placeholder="例：相国寺 寺社所有地" autocomplete="off">
+        </label>
+        <label class="zone-field">理由
+          <select id="zoneReason">
+            <option value="寺社所有地">寺社所有地</option>
+            <option value="公有地">公有地</option>
+            <option value="その他">その他</option>
+          </select>
+        </label>
+        <div class="zone-row">
+          <button id="zoneUndoBtn" onclick="zoneUndoPoint()">↩ 1つ戻す</button>
+          <button id="zoneDelVtxBtn" onclick="zoneDeleteVertex()" title="選んだ頂点を消す（3点は残す）">頂点を削除</button>
+        </div>
+        <div class="zone-row">
+          <button onclick="zoneCancel()">やめる</button>
+          <button id="zoneSaveBtn" class="zone-primary" onclick="saveZone()">保存</button>
+        </div>
+        <button id="zoneDeleteBtn" class="zone-danger zone-wide" onclick="deleteZone()">🗑 このエリアを削除</button>
+      </div>
+    </div>
   </div>
 </div>
 
