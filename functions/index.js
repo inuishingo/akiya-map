@@ -42,12 +42,13 @@ admin.initializeApp();
 //   GET ?type=reverse&lat=..&lon=..     逆ジオコーディング（住所・親番）
 //   GET ?type=bm&lat=..&lon=..          地番検索（親番・枝番・distance）
 //   GET ?type=chiban&address=..         ジオコード（住所→座標）
+//   GET ?type=bmword&word=..            地番の文字入力検索（地番→座標）。admin.html の地番モード用
 //
 //   ※ 2026-07-14 の復旧時点で、挙動は復元前と完全に同一。
 //      変更点は APIキーを直書き → Secret に移しただけ。
 // ═══════════════════════════════════════════════════════════════
 exports.zenrin = onRequest({ cors: true, secrets: [ZENRIN_KEY] }, async (req, res) => {
-  const { type, lat, lon, address } = req.query;
+  const { type, lat, lon, address, word } = req.query;
   const BASE = "https://test-web.zmaps-api.com";
 
   let url = "";
@@ -60,6 +61,14 @@ exports.zenrin = onRequest({ cors: true, secrets: [ZENRIN_KEY] }, async (req, re
     // 5件キャップだと近傍の地番（枝番含む）が先頭に入らず取りこぼす。
     // 半径50m内の全候補（実測 hit≈25）を返し、距離選定はクライアント側で行う。
     url = `${BASE}/search/bm_address?proximity=${lon},${lat},50&datum=JGD&limit=0,80&address_level=TBN,EBN`;
+  } else if (type === "bmword") {
+    // 地番→座標。word はクライアント側で整形済み（全角→半角・「番」→「-」・市の補完）。一致の確認もクライアント側。
+    const w = String(word || "").trim();
+    if (!w || w.length > 100) {
+      res.status(400).json({ error: "word は1〜100文字で指定してください" });
+      return;
+    }
+    url = `${BASE}/search/bm_address?word=${encodeURIComponent(w)}&datum=JGD&limit=0,20&address_level=TBN,EBN`;
   } else {
     res.status(400).json({ error: "typeパラメータが必要です" });
     return;

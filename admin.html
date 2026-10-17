@@ -3740,11 +3740,117 @@
       if (regTempMarker) { try { map.removeWidget(regTempMarker); } catch(e){} regTempMarker = null; }
     }
 
+    // ===== 地番検索（ZENRIN 地番検索API の文字入力検索・zenrin プロキシ type=bmword）=====
+    // 住所モード（geocodeAddress）とは別経路。localhost＋?emu=1 のときだけ Functions エミュレータへ向ける。
+    const ZENRIN_PROXY = IS_EMULATOR
+      ? `http://${location.hostname}:${EMU_FUNCTIONS_PORT}/housemarket-map/asia-northeast1/zenrin`
+      : "https://zenrin-ptddjpvgeq-an.a.run.app";
+    const BRANCH_CITY = { "名古屋": "愛知県名古屋市", "京都": "京都府京都市", "大阪": "大阪府大阪市", "神戸": "兵庫県神戸市" };
+    let geoMode = "addr";          // "addr"=住所（従来）/ "chiban"=地番
+    let chibanCands = [];          // 候補一覧（選ばせる用）
+    function kanjiToNum(k) {       // 一〜九十九（丁目用）
+      const d = { 一:1, 二:2, 三:3, 四:4, 五:5, 六:6, 七:7, 八:8, 九:9 };
+      if (!k.includes("十")) return String(d[k] ?? k);
+      const [a, b] = k.split("十");
+      return String((a ? d[a] : 1) * 10 + (b ? d[b] : 0));
+    }
+    // 入力の揺れを吸収：15 / 15番 / 15-1 / １５番１ / 15番地1 / 15の1 → 15・15-1。区名から始まれば拠点の市を補う。
+    function normalizeChibanInput(raw) {
+      let s = String(raw || "").normalize("NFKC").replace(/\s+/g, "");
+      s = s.replace(/([一二三四五六七八九十]+)丁目/g, (_, k) => kanjiToNum(k) + "丁目");
+      s = s.replace(/(\d)[‐―ー−](?=\d)/g, "$1-");                 // 数字に挟まれたハイフン類だけ（町名の「ー」は触らない）
+      s = s.replace(/(\d)(?:番地?|の)(?=\d)/g, "$1-");
+      s = s.replace(/(\d)(?:番地?|号)$/, "$1");
+      if (/^[^都道府県市]+区/.test(s) && BRANCH_CITY[myBranch]) s = BRANCH_CITY[myBranch] + s;
+      return s;
+    }
+    // 比較用：半角化・空白除去・都道府県を外す（入力に県があっても無くても同じ形にする）
+    function chibanKey(a) {
+      return String(a || "").normalize("NFKC").replace(/\s+/g, "").replace(/^(東京都|北海道|(?:京都|大阪)府|.{2,3}県)/, "");
+    }
+    // k（返ってきた住所）が q（入力）で終わり、その直前が区切り（市区郡町村の末尾）なら一致。「西豊岡通」を「豊岡通」で掴まない。
+    function chibanEndsWith(k, q) {
+      if (k === q) return true;
+      if (!k.endsWith(q)) return false;
+      return /[都道府県市区郡町村]$/.test(k.slice(0, -q.length));
+    }
+    // 京都の通り名（「○○通△△上る」「竹田街道丸太町上る」等）。地番は「区＋町名＋地番」なので、一致しない時の案内に使う。
+    //   「通」を含まない通り名（○○街道）もあるため、上る／下る／東入／西入 だけで判定する。
+    const STREET_RE = /(?:上る|上ル|下る|下ル|東入|西入)/;
+    const STREET_NOTE = "通り名を除いて 区＋町名＋地番 で入力してください";
+    window.setGeoMode = (m) => {
+      geoMode = (m === "chiban") ? "chiban" : "addr";
+      document.getElementById("geoModeAddr")?.classList.toggle("active", geoMode === "addr");
+      document.getElementById("geoModeChiban")?.classList.toggle("active", geoMode === "chiban");
+      const el = document.getElementById("geoInput");
+      if (el) el.placeholder = geoMode === "chiban"
+        ? "地番を入力（例：瑞穂区豊岡通1丁目15番）" : "住所を入力して地図へ移動（管理者用）";
+      hideChibanCands();
+    };
+    function hideChibanCands() { chibanCands = []; const b = document.getElementById("chibanCands"); if (b) { b.style.display = "none"; b.innerHTML = ""; } }
+    function showChibanCands(list, note) {
+      chibanCands = list;
+      const b = document.getElementById("chibanCands"); if (!b) return;
+      // ZENRIN には同じ表記の地番が別の位置に2件以上ある（例：伏見区深草藪之内町35-1 が約46m離れて2件）。
+      // 見分けられるよう「その1・その2」を付け、地番レイヤーで確かめるよう添える。
+      const label = it => String(it.address || "").normalize("NFKC");
+      const dup = list.some((it, i) => list.findIndex(o => label(o) === label(it)) !== i);
+      const nth = list.map((it, i) => list.slice(0, i + 1).filter(o => label(o) === label(it)).length);
+      b.innerHTML = `<div class="chiban-cands-note">${escAttr(note)}${dup ? "（同じ地番が別の位置に登録されています。移動後に地番レイヤーで確かめてください）" : ""}</div>`
+        + list.map((it, i) => {
+          const same = list.filter(o => label(o) === label(it)).length > 1;
+          return `<button class="chiban-cand" onclick="pickChibanCand(${i})">${escAttr(label(it))}${same ? `（その${nth[i]}）` : ""}</button>`;
+        }).join("");
+      b.style.display = "flex";
+    }
+    window.pickChibanCand = (i) => { const it = chibanCands[i]; hideChibanCands(); if (it) jumpToChiban(it); };
+    function jumpToChiban(it) {
+      if (!map || !Array.isArray(it.position)) return;
+      const [lng, lat] = it.position;
+      const label = String(it.address || "").normalize("NFKC");
+      map.setCenter(new ZDC.LatLng(lat, lng));
+      if (map.getZoom() !== ZOOM_READABLE) map.setZoom(ZOOM_READABLE);
+      if (!chibanOn) window.toggleChiban();          // 右上「地番」ボタンと同じ経路でON（ボタンの表示も揃う）
+      clearRegTempMarker();
+      regTempMarker = new ZDC.Marker(new ZDC.LatLng(lat, lng), { color: "#F59E0B", text: "★" });
+      map.addWidget(regTempMarker);
+      // 「この住所位置に登録」はクリック登録と同じ判定（その座標で reverse → 住所・エリア）を使う。registerFromAddress 参照。
+      lastGeoLatLng = { lat, lng, address: label, fromChiban: true };
+      showToast("移動：地番 " + label);
+    }
+    async function chibanJump(raw) {
+      const word = normalizeChibanInput(raw);
+      const q = chibanKey(word);
+      if (!/\D{2,}\d+(?:-\d+)*$/.test(q)) { showToast("町名から地番まで入力してください（例：豊岡通1丁目15）", "warn"); return; }
+      const street = STREET_RE.test(q);
+      hideChibanCands();
+      clearRegTempMarker(); lastGeoLatLng = null;   // 前の検索の★と登録対象を残さない（移動できた時だけ置き直す）
+      showToast("地番を検索中…");
+      let items;
+      try {
+        const res = await fetch(`${ZENRIN_PROXY}?type=bmword&word=${encodeURIComponent(word)}`);
+        const j = await res.json();
+        if (!res.ok) { showToast(`地番検索に失敗しました（${res.status}）`, "error"); console.error("bmword", res.status, j); return; }
+        items = (j.result && j.result.item) || [];
+      } catch (e) { showToast("地番検索に失敗しました（通信）", "error"); console.error("bmword", e); return; }
+      if (!items.length) {
+        showToast(street ? STREET_NOTE : "地番データが無い地域の可能性があります", "warn");
+        return;
+      }
+      const exact = items.filter(it => chibanEndsWith(chibanKey(it.address), q));
+      if (exact.length === 1) { jumpToChiban(exact[0]); return; }
+      if (exact.length > 1) { showChibanCands(exact, "候補が複数あります。選んでください"); return; }
+      const branches = items.filter(it => chibanEndsWith(chibanKey(it.address).replace(/-\d+$/, ""), q));
+      if (branches.length) { showChibanCands(branches, "枝番があります。選んでください"); return; }
+      showChibanCands(items, (street ? STREET_NOTE + "。" : "") + "入力と一致する地番がありません。近い候補（違う場所の可能性あり）");
+    }
+
     // 入力住所へ地図移動＋一時マーカー（req1・汎用の地図移動機能）。
     window.geocodeJump = async () => {
       const el = document.getElementById("geoInput");
       const word = (el?.value || "").trim();
       if (!word) return;
+      if (geoMode === "chiban") return chibanJump(word);   // 地番モード。以下の住所モードは従来どおり
       showToast("住所を検索中…");
       let g = null;
       try { g = await geocodeAddress(word); } catch(e) { g = null; }
@@ -3815,6 +3921,8 @@
     // 方法A：住所ジオコード座標に登録
     window.registerFromAddress = async () => {
       if (!lastGeoLatLng) { showToast("先に住所で地図へ移動してください", "warn"); return; }
+      // 地番モードで移動した位置は、クリック登録と同じ判定（reverse で住所・エリア）で登録する
+      if (lastGeoLatLng.fromChiban) { await registerFromClick({ lat: lastGeoLatLng.lat, lng: lastGeoLatLng.lng }); return; }
       await createPermanentPin(lastGeoLatLng.lat, lastGeoLatLng.lng, lastGeoLatLng.address, lastGeoLatLng);
     };
 
@@ -4871,6 +4979,13 @@
     .reg-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .geo-input { flex: 1; min-width: 180px; padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; font-family: inherit; outline: none; }
     .geo-input:focus { border-color: #3b82f6; }
+    .geo-mode { display: inline-flex; border: 1px solid #cbd5e1; border-radius: 6px; overflow: hidden; flex-shrink: 0; }
+    .geo-mode button { padding: 6px 10px; border: 0; background: #fff; color: #334155; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit; }
+    .geo-mode button.active { background: #374151; color: #fff; }
+    .chiban-cands { margin-top: 6px; flex-direction: column; gap: 4px; max-height: 180px; overflow-y: auto; }
+    .chiban-cands-note { font-size: 12px; color: #92400e; }
+    .chiban-cand { text-align: left; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; font-size: 12px; cursor: pointer; font-family: inherit; }
+    .chiban-cand:hover { background: #f1f5f9; }
     .reg-label { font-size: 12px; font-weight: 600; color: #374151; white-space: nowrap; }
     .reg-radio { font-size: 13px; color: #1e293b; display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
     .reg-btn { padding: 6px 11px; border-radius: 6px; background: #374151; color: #fff; border: 1px solid #1f2937; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; font-family: inherit; }
@@ -5183,10 +5298,15 @@
     <!-- 反社/NG登録＋住所ジャンプ（管理画面専用。調査員側index.htmlには出さない） -->
     <div class="admin-reg-bar">
       <div class="reg-row">
+        <span class="geo-mode" title="住所（住居表示）で探すか、地番で探すか">
+          <button id="geoModeAddr" class="active" onclick="setGeoMode('addr')">住所</button>
+          <button id="geoModeChiban" onclick="setGeoMode('chiban')">地番</button>
+        </span>
         <input id="geoInput" class="geo-input" type="search" placeholder="住所を入力して地図へ移動（管理者用）"
           onkeydown="if(event.key==='Enter'){event.preventDefault();geocodeJump();}" autocomplete="off">
         <button class="reg-btn" onclick="geocodeJump()">🔎 移動</button>
       </div>
+      <div id="chibanCands" class="chiban-cands" style="display:none"></div>
       <div class="reg-row">
         <span class="reg-label">反社/NG登録</span>
         <label class="reg-radio"><input type="radio" name="regStatus" value="hansha" checked onchange="setRegStatus('hansha')"> 反社</label>
