@@ -47,7 +47,45 @@ admin.initializeApp();
 //   ※ 2026-07-14 の復旧時点で、挙動は復元前と完全に同一。
 //      変更点は APIキーを直書き → Secret に移しただけ。
 // ═══════════════════════════════════════════════════════════════
-exports.zenrin = onRequest({ cors: true, secrets: [ZENRIN_KEY] }, async (req, res) => {
+exports.zenrin = onRequest({ cors: false, secrets: [ZENRIN_KEY] }, async (req, res) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.set("Access-Control-Allow-Origin", origin);
+  }
+  res.set("Vary", "Origin");
+  res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  res.set("Access-Control-Max-Age", "3600");
+
+  if (req.method === "OPTIONS") {
+    if (!origin || !ALLOWED_ORIGINS.includes(origin)) {
+      res.status(403).json({ error: "origin_not_allowed" });
+      return;
+    }
+    res.status(204).send("");
+    return;
+  }
+  if (req.method !== "GET") {
+    res.status(405).json({ error: "method_not_allowed" });
+    return;
+  }
+
+  const m = (req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+  if (!m) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  try {
+    await admin.auth().verifyIdToken(m[1]);
+  } catch (e) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  if (!origin || !ALLOWED_ORIGINS.includes(origin)) {
+    res.status(403).json({ error: "origin_not_allowed" });
+    return;
+  }
+
   const { type, lat, lon, address, word } = req.query;
   const BASE = "https://test-web.zmaps-api.com";
 
