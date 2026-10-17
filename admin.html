@@ -3745,6 +3745,11 @@
     const ZENRIN_PROXY = IS_EMULATOR
       ? `http://${location.hostname}:${EMU_FUNCTIONS_PORT}/housemarket-map/asia-northeast1/zenrin`
       : "https://zenrin-ptddjpvgeq-an.a.run.app";
+    async function zenrinAuthHeaders() {
+      const user = auth.currentUser;
+      if (!user) throw new Error("ZENRINプロキシの利用にはログインが必要です");
+      return { Authorization: `Bearer ${await user.getIdToken()}` };
+    }
     const BRANCH_CITY = { "名古屋": "愛知県名古屋市", "京都": "京都府京都市", "大阪": "大阪府大阪市", "神戸": "兵庫県神戸市" };
     let geoMode = "addr";          // "addr"=住所（従来）/ "chiban"=地番
     let chibanCands = [];          // 候補一覧（選ばせる用）
@@ -3828,7 +3833,9 @@
       showToast("地番を検索中…");
       let items;
       try {
-        const res = await fetch(`${ZENRIN_PROXY}?type=bmword&word=${encodeURIComponent(word)}`);
+        const res = await fetch(`${ZENRIN_PROXY}?type=bmword&word=${encodeURIComponent(word)}`, {
+          headers: await zenrinAuthHeaders(),
+        });
         const j = await res.json();
         if (!res.ok) { showToast(`地番検索に失敗しました（${res.status}）`, "error"); console.error("bmword", res.status, j); return; }
         items = (j.result && j.result.item) || [];
@@ -3958,11 +3965,13 @@
       let address = "";
       let area = { areaCode: null, areaName: null };
       try {
-        const r = await fetch(`https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`);
+        const r = await fetch(`https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${latlng.lat}&lon=${latlng.lng}`, {
+          headers: await zenrinAuthHeaders(),
+        });
         const item = (await r.json()).result?.item?.[0] || null;
         address = item?.address || "";
         area = areaFromItem(item);   // 同じ item から取る＝reverse の追加呼び出しは不要
-      } catch(e) { address = ""; }   // reverse失敗は無視（座標が最優先・住所はおまけ）
+      } catch(e) { console.error("ZENRIN reverse failed", e); address = ""; }   // reverse失敗は無視（座標が最優先・住所はおまけ）
       const ok = await createPermanentPin(latlng.lat, latlng.lng, address, area);
       if (ok) setRegMode(false);   // 登録成功後は自動OFF（誤ピン防止）。失敗/キャンセルはON維持で再クリック可
     }

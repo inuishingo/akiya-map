@@ -1779,9 +1779,18 @@
     }
 
     // ===== GEOCODE（ZENRIN）=====
+    async function zenrinAuthHeaders() {
+      const user = auth.currentUser;
+      if (!user) throw new Error("ZENRINプロキシの利用にはログインが必要です");
+      return { Authorization: `Bearer ${await user.getIdToken()}` };
+    }
+
     // reverse プロキシから点/セルの item を取得（ピン・グリッド共通）。失敗時は例外。
     async function fetchReverseItem(lat, lng) {
-      const res = await fetch(`https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${lat}&lon=${lng}`);
+      const res = await fetch(
+        `https://zenrin-ptddjpvgeq-an.a.run.app?type=reverse&lat=${lat}&lon=${lng}`,
+        { headers: await zenrinAuthHeaders() }
+      );
       const json = await res.json();
       return (json.result && json.result.item && json.result.item[0]) || null;
     }
@@ -1849,9 +1858,10 @@
       // reverse が速く bm だけ遅い→クエリの重さ / 両方遅い→回線 /
       // bm が数十msで失敗→回線ではなく上流の拒否、を切り分けるため。
       const timedFetch = async (url, key) => {
+        const headers = await zenrinAuthHeaders();
         const t0 = performance.now();
         try {
-          const res = await fetch(url);
+          const res = await fetch(url, { headers });
           chibanTiming[key] = Math.round(performance.now() - t0);
           return res;
         } catch (e) {
