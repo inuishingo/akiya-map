@@ -3837,12 +3837,17 @@
         showToast(street ? STREET_NOTE : "地番データが無い地域の可能性があります", "warn");
         return;
       }
-      const exact = items.filter(it => chibanEndsWith(chibanKey(it.address), q));
-      if (exact.length === 1) { jumpToChiban(exact[0]); return; }
-      if (exact.length > 1) { showChibanCands(exact, "候補が複数あります。選んでください"); return; }
-      const branches = items.filter(it => chibanEndsWith(chibanKey(it.address).replace(/-\d+$/, ""), q));
-      if (branches.length) { showChibanCands(branches, "枝番があります。選んでください"); return; }
-      showChibanCands(items, (street ? STREET_NOTE + "。" : "") + "入力と一致する地番がありません。近い候補（違う場所の可能性あり）");
+      try {
+        const exact = items.filter(it => chibanEndsWith(chibanKey(it.address), q));
+        if (exact.length === 1) { jumpToChiban(exact[0]); return; }
+        if (exact.length > 1) { showChibanCands(exact, "候補が複数あります。選んでください"); return; }
+        const branches = items.filter(it => chibanEndsWith(chibanKey(it.address).replace(/-\d+$/, ""), q));
+        if (branches.length) { showChibanCands(branches, "枝番があります。選んでください"); return; }
+        showChibanCands(items, (street ? STREET_NOTE + "。" : "") + "入力と一致する地番がありません。近い候補（違う場所の可能性あり）");
+      } catch (e) {
+        showToast("地図への移動に失敗しました", "error");
+        console.error("地図への移動に失敗しました", e, e && e.stack, items);
+      }
     }
 
     // 入力住所へ地図移動＋一時マーカー（req1・汎用の地図移動機能）。
