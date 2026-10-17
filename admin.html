@@ -1731,6 +1731,7 @@
     };
 
     // ===== REALTIME LISTEN =====
+    let pinsRendered = false;   // 初回の描画が済んだか（自店ピン0件でも初回は必ず描く）
     function listenPins() {
       const q = query(collection(db, "pins"), orderBy("createdAt", "desc"));
       onSnapshot(q, snap => {
@@ -1738,6 +1739,14 @@
         // 全拠点ぶんは調査集計（拠点を選べる）専用。一覧・地図・Excel は従来どおり自店の allPins だけを使う。
         allPinsAllBranches = snap.docs.map(d => ({ id: d.id, ...d.data() }));
         allPins = allPinsAllBranches.filter(p => pinBranch(p) === myBranch);
+        // 他拠点だけの変化では一覧・地図を描き直さない（admin は全拠点を購読しているため、他店の打刻のたびに固まっていた）。
+        // removed の doc も削除前のデータを持つので、自店ピンの削除は mine=true になる。
+        const mine = snap.docChanges().some(c => pinBranch(c.doc.data() || {}) === myBranch);
+        if (pinsRendered && !mine) {
+          if (document.getElementById("sumModal").style.display === "flex") renderSurveySummary();   // 集計は全拠点なので追随する
+          return;
+        }
+        pinsRendered = true;
         updateStats();
         updateStaffFilter();
         updateDateFilter();
@@ -3288,6 +3297,9 @@
       const sig = filterSignature();
       if (sig !== lastFilterSig) { lastFilterSig = sig; listLimit = LIST_PAGE_SIZE; }
       const shown = pins.slice(0, listLimit);   // DOMに描くのはここまで。以下の全選択判定は pins(全件) のまま
+      // 地図から選んだピンが描画範囲の外なら、そのカードだけ先頭に足す（slice の外なので重複しない）
+      const selIdx = selectedPinId ? pins.findIndex(p => p.id === selectedPinId) : -1;
+      if (selIdx >= listLimit) shown.unshift(pins[selIdx]);
       const container = document.getElementById("pinList");
       const hasChecked = checkedIds.size > 0;
 
@@ -3385,7 +3397,7 @@
           ${devLocHTML(p)}
           ${exported ? `<div class="export-line">✓ Excel出力済 ${exportedMD}${exportedByName ? ` ・ ${exportedByName}` : ""}</div>` : ""}
         </div>`;
-      }).join("") + listFooterHTML(shown.length, pins.length);
+      }).join("") + listFooterHTML(Math.min(listLimit, pins.length), pins.length);   // 先頭に足した選択カードは数えない
     }
 
     // ===== CHECKBOX =====
@@ -3580,13 +3592,10 @@
       selectedPinId = id;
 
       // 一覧は先頭 listLimit 件しか描いていない。地図から選んだピンがその外にあるとカードが存在せず、
-      // ハイライトもスクロールもできないため、含まれるまで広げて描き直す。
-      // 広げた分だけDOMは増えるが、便②-2 以前は毎回 全件 を描いていたので上限は従来と同じ。
+      // ハイライトもスクロールもできないため、そのカード1枚だけ先頭に足して描き直す（renderList 参照）。
+      // 以前は listLimit をそのピンまで広げていたが、古いピンを選ぶと5000枚描いて固まった（2026-10-17 京都）。
       const idx = filteredPins.findIndex(p => p.id === id);
-      if (idx >= listLimit) {
-        listLimit = Math.ceil((idx + 1) / LIST_PAGE_SIZE) * LIST_PAGE_SIZE;
-        renderList();
-      }
+      if (idx >= listLimit) renderList();
 
       document.querySelectorAll(".pin-card").forEach(c => c.classList.remove("selected"));
       const card = document.getElementById(`card-${id}`);
