@@ -15,7 +15,8 @@
 
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-    import { getAuth, connectAuthEmulator, signInWithEmailAndPassword, signOut, onAuthStateChanged }
+    import { getAuth, connectAuthEmulator, signInWithEmailAndPassword, signOut, onAuthStateChanged,
+             EmailAuthProvider, reauthenticateWithCredential, updatePassword }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
     import { getFirestore, connectFirestoreEmulator, collection, getDocs, getDoc, addDoc, updateDoc, deleteDoc, doc, deleteField, onSnapshot, query, where, orderBy, runTransaction, serverTimestamp, setDoc, writeBatch, arrayUnion }
       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
@@ -514,6 +515,7 @@
         acctRows = [];
         hideAcctPwPanel();   // 発行したパスワードも画面から捨てる
         closeAcctPwForm();   // 手入力途中のパスワードも捨てる
+        closeAcctSelfPwForm();
         acctEditingUid = null;
         const am = document.getElementById("acctModal");
         if (am) am.style.display = "none";
@@ -4254,12 +4256,18 @@
         const tip = escAttr(op.tip);
         const running = action => acctBusyUid === r.uid && acctBusyAction === action;
         const label = running("toggle") ? "実行中…" : (r.disabled ? "再有効化" : "無効化");
+        // 自分の行だけ「PW再発行」の代わりに「PW変更」（本人が再認証して変更。Functions は使わない）
+        const isMe = !!auth.currentUser && r.uid === auth.currentUser.uid;
         // PW再発行の押せる条件は無効化ボタンと同一（Functions のガードも同じ3つ）
+        const pwBtn = isMe
+          ? `<button class="acct-op reset" title="自分のパスワードを変更" ${busy ? "disabled" : ""}`
+            + ` onclick="openAcctSelfPwForm()">${running("selfpw") ? "実行中…" : "PW変更"}</button>`
+          : `<span title="${tip}"><button class="acct-op reset" data-uid="${escAttr(r.uid)}" title="${tip}"`
+            + ` ${dis} onclick="resetAccountPassword(this.dataset.uid)">${running("reset") ? "実行中…" : "PW再発行"}</button></span>`;
         const btn = `<span title="${tip}"><button class="acct-op ${r.disabled ? "enable" : "disable"}"`
           + ` data-uid="${escAttr(r.uid)}" title="${tip}"`
           + ` ${dis} onclick="toggleAccountDisabled(this.dataset.uid)">${label}</button></span>`
-          + `<span title="${tip}"><button class="acct-op reset" data-uid="${escAttr(r.uid)}" title="${tip}"`
-          + ` ${dis} onclick="resetAccountPassword(this.dataset.uid)">${running("reset") ? "実行中…" : "PW再発行"}</button></span>`
+          + pwBtn
           + (op.why ? `<span class="acct-why">${escAttr(op.why)}</span>` : "");
         return `<tr class="${r.disabled ? "acct-disabled" : ""}">`
           + `<td class="acct-name-cell">${acctNameCell(r, busy)}</td>`
@@ -4378,6 +4386,7 @@
       acctEditingUid = null;
       closeAcctCreateForm();
       closeAcctPwForm();
+      closeAcctSelfPwForm();
       document.getElementById("acctModal").style.display = "flex";
       loadAccounts();
     };
@@ -4387,6 +4396,7 @@
       acctEditingUid = null;
       closeAcctCreateForm();
       closeAcctPwForm();
+      closeAcctSelfPwForm();
       document.getElementById("acctModal").style.display = "none";
     };
     window.reloadAccounts = () => { if (!acctBusyUid && !acctLoading) loadAccounts(); };
@@ -4427,6 +4437,7 @@
       const domains = acctCreatableDomains();
       if (!domains.length) { showToast("作成できるドメインがありません", "warn"); return; }
       closeAcctPwForm();
+      closeAcctSelfPwForm();
       document.getElementById("acctNewName").value = "";
       document.getElementById("acctNewLocal").value = "";
       document.getElementById("acctNewDomain").innerHTML =
@@ -4538,6 +4549,7 @@
       const op = acctOperable(r);
       if (!op.ok) { showToast(op.tip, "warn"); return; }
       closeAcctCreateForm();
+      closeAcctSelfPwForm();
       acctPwFormUid = uid;
       document.getElementById("acctPwFormTarget").textContent = `${r.displayName || "（氏名未登録）"}（${r.email}）`;
       document.querySelector('input[name="acctPwMode"][value="auto"]').checked = true;
@@ -4582,6 +4594,83 @@
         btn.textContent = "再発行する";
       }
       await loadAccounts();
+    };
+
+    // ── 自分のパスワード変更（再認証 → updatePassword。クライアントSDKのみ・Functions は使わない）──
+    // 管理者は「PW再発行」の対象外（Functions が弾く）なので、自分のPWは本人がここで変える。
+    // 入力値はどこにも保存・出力しない（ログは e.code だけ）。閉じたら欄を空にする。
+    const SELF_PW_MIN = 12;
+    const SELF_PW_FIELDS = ["acctSelfPwCur", "acctSelfPwNew", "acctSelfPwNew2"];
+    function acctSelfPwErrorMessage(e) {
+      switch (e && e.code) {
+        case "auth/invalid-credential":
+        case "auth/wrong-password":
+        case "auth/invalid-login-credentials":
+          return "現在のパスワードが違います";
+        case "auth/weak-password":
+        case "auth/password-does-not-meet-requirements":
+          return "新しいパスワードが弱すぎます（パスワードの要件を満たしていません）";
+        case "auth/too-many-requests":
+          return "試行回数が多すぎます。しばらく待ってから再度お試しください";
+        case "auth/network-request-failed":
+          return "通信に失敗しました。接続を確認して再度お試しください";
+        case "auth/requires-recent-login":
+        case "auth/user-mismatch":
+        case "auth/user-token-expired":
+          return "ログインし直してから実行してください";
+        default:
+          return `パスワードを変更できませんでした（${(e && e.code) || "unknown"}）`;
+      }
+    }
+    function closeAcctSelfPwForm() {
+      const f = document.getElementById("acctSelfPwForm");
+      if (!f) return;
+      f.style.display = "none";
+      SELF_PW_FIELDS.forEach(id => { document.getElementById(id).value = ""; });   // 入力したPWを画面に残さない
+      document.getElementById("acctSelfPwNg").textContent = "";
+    }
+    window.closeAcctSelfPwForm = () => { if (acctBusyAction !== "selfpw") closeAcctSelfPwForm(); };
+    window.openAcctSelfPwForm = () => {
+      if (!isAdminUser || acctBusyUid || acctLoading || !auth.currentUser) return;
+      closeAcctCreateForm();
+      closeAcctPwForm();
+      closeAcctSelfPwForm();
+      document.getElementById("acctSelfPwForm").style.display = "";
+      document.getElementById("acctSelfPwCur").focus();
+    };
+    window.submitAcctSelfPw = async () => {
+      const me = auth.currentUser;
+      if (!isAdminUser || !me || acctBusyUid || acctLoading) return;
+      const [cur, pw, pw2] = SELF_PW_FIELDS.map(id => document.getElementById(id).value);
+      const ng = document.getElementById("acctSelfPwNg");
+      let problem = "";
+      if (!cur) problem = "現在のパスワードを入力してください";
+      else if (pw.length < SELF_PW_MIN) problem = `新しいパスワードは${SELF_PW_MIN}文字以上にしてください`;
+      else if (pw !== pw2) problem = "新しいパスワード（確認）が一致しません";
+      else if (pw === cur) problem = "現在と同じパスワードは使えません";
+      if (problem) { ng.textContent = problem; return; }
+
+      ng.textContent = "";
+      acctBusyUid = me.uid;
+      acctBusyAction = "selfpw";
+      const btn = document.getElementById("acctSelfPwExecBtn");
+      btn.textContent = "変更中…";
+      renderAccountTable();
+      try {
+        await reauthenticateWithCredential(me, EmailAuthProvider.credential(me.email, cur));
+        await updatePassword(me, pw);
+        acctBusyAction = null;
+        closeAcctSelfPwForm();
+        showToast("パスワードを変更しました");
+      } catch (e) {
+        console.error("selfPasswordChange", e && e.code);   // e 本体は出さない（入力値を含めないため code だけ）
+        ng.textContent = acctSelfPwErrorMessage(e);       // 欄は残す＝直して再実行できる
+      } finally {
+        acctBusyUid = null;
+        acctBusyAction = null;
+        btn.textContent = "変更する";
+        renderAccountTable();
+      }
     };
 
     // ── U-2：発行結果パネル（作成・再発行 共通）──────────────
@@ -5560,7 +5649,28 @@
         <button class="round-exec" id="acctPwFormExecBtn" onclick="submitAcctPwForm()">再発行する</button>
       </div>
     </div>
-    <div class="acct-note">無効化するとログインできなくなります。過去のピン・グリッド・担当者名は残ります。アカウントの削除はこの画面では扱いません。<br>管理者アカウントの無効化・パスワード再発行はこの画面では行いません（スクリプト対応）。</div>
+    <!-- 自分のパスワード変更。現在のPWで再認証してから updatePassword（クライアントSDKのみ）。
+         欄は伏せる（本人の秘密で、他人に伝える文字列ではないため）。 -->
+    <div class="acct-create" id="acctSelfPwForm" style="display:none">
+      <div class="acct-create-title">自分のパスワードを変更</div>
+      <label class="kouzu-field">現在のパスワード
+        <input id="acctSelfPwCur" class="acct-pw-input" type="password" maxlength="128" autocomplete="current-password">
+      </label>
+      <label class="kouzu-field">新しいパスワード（12文字以上）
+        <input id="acctSelfPwNew" class="acct-pw-input" type="password" maxlength="128" autocomplete="new-password">
+      </label>
+      <label class="kouzu-field">新しいパスワード（確認）
+        <input id="acctSelfPwNew2" class="acct-pw-input" type="password" maxlength="128" autocomplete="new-password"
+          onkeydown="if (event.key === 'Enter') submitAcctSelfPw()">
+      </label>
+      <div class="acct-note">変更後、このアカウントで他の端末にログインしている場合は再ログインが必要になります。</div>
+      <div class="acct-pw-rule-ng" id="acctSelfPwNg"></div>
+      <div class="kouzu-modal-actions">
+        <button class="kouzu-cancel" onclick="closeAcctSelfPwForm()">キャンセル</button>
+        <button class="round-exec" id="acctSelfPwExecBtn" onclick="submitAcctSelfPw()">変更する</button>
+      </div>
+    </div>
+    <div class="acct-note">無効化するとログインできなくなります。過去のピン・グリッド・担当者名は残ります。アカウントの削除はこの画面では扱いません。<br>管理者アカウントの無効化・パスワード再発行はこの画面では行いません（スクリプト対応）。自分のパスワードは「PW変更」から変更できます。</div>
     <div class="acct-table-wrap">
       <table class="acct-table">
         <thead><tr><th>氏名</th><th>メール</th><th>拠点</th><th>状態</th><th>最終ログイン</th><th>操作</th></tr></thead>
