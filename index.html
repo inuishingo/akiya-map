@@ -45,7 +45,7 @@
     let excludeZones = [];
     let zonesUnsub = null;
     let zoneWidgets = [];
-    let zoneHatchZoom = null;   // 斜線を引いたときのズーム（変わった時だけ引き直す）
+    let zoneDrawnKey = null;    // 描いたときの「ズーム＋画面内のエリア」。変わった時だけ描き直す
     // ===== 追従・測位のチューニング定数（発熱対策。現場で調整するのはここだけ）=====
     // iPhone X で「熱くなる→動作が落ちる→タブが落ちてログイン画面に戻る」の起点が、
     // ①止まらない高精度GPS ②測位のたびの setCenter（ZENRINタイル再描画＋idleで全ピン走査）だった。
@@ -956,7 +956,7 @@
               map.addEventListener("idle", function(){ redrawActiveLayers(); }); // 用途地域ON中のみ追従再描画
               // 市区界ON中のみ。索引の bbox で可視市区を決め、可視リングを差分更新する。
               map.addEventListener("idle", function(){ if (areaOn) redrawAreaBorders(); });
-              map.addEventListener("idle", function(){ zoneOnIdle(); });   // 除外エリアの斜線はズームが変わった時だけ引き直す
+              map.addEventListener("idle", function(){ zoneOnIdle(); });   // 除外エリアはズームか画面内のエリアが変わった時だけ引き直す
 
               // 地図を指/マウスでドラッグしたら追従解除（プログラムのsetCenterは入力イベントを出さず誤検知しない）
               attachManualPanDetection();
@@ -1486,6 +1486,7 @@
     const ZONE_FILL = "#6B7280", ZONE_LINE = "#374151";
     const ZONE_HATCH_PX = 14;      // 斜線の間隔（画面上のpx）
     const ZONE_HATCH_MAX = 300;    // 1エリアの斜線の上限。超える広域表示では塗りだけにする（重くしない）
+    const ZONE_HATCH_TOTAL_MAX = 600;   // 画面全体の斜線の上限。超えたら斜線なし（塗りと枠線だけ）
     function zoneContains(lat, lng, ring) {
       let inside = false;
       for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
@@ -1535,26 +1536,43 @@
       }
       return segs;
     }
+    // 画面（＋バッファ）に掛かる除外エリアだけ返す（ピンと同じ viewBounds・bbox で判定）。範囲が取れない時は全部。
+    // 描画専用。タップ時の確認（zoneAt）は今まで通り全エリアを見る。
+    function zonesInView(vb) {
+      return excludeZones.filter(z => {
+        const c = zoneCoords(z); if (!c) return false;
+        if (!vb) return true;
+        const bb = z._bb || (z._bb = zoneBBox(c));
+        return !(bb.n < vb.south || bb.s > vb.north || bb.e < vb.west || bb.w > vb.east);
+      });
+    }
+    function zoneViewKey(list) { return map.getZoom() + "|" + list.map(z => z.id).join(","); }
     // propagation:true は必須。ZDC の図形は既定でクリックを地図へ通さない（PCのマウスではエリア内にピンを立てられなくなる）。
+    // 描くのは画面内のエリアだけ。斜線は画面全体で ZONE_HATCH_TOTAL_MAX 本までで、超えたら引かない
+    // （京都299エリアでズームのたびに全エリアの斜線を引き直し、Z20で約9,200本になって固まっていた）。
     function renderZones() {
       if (!map) return;
       zoneWidgets.forEach(w => { try { map.removeWidget(w); } catch (e) {} });
       zoneWidgets = [];
-      zoneHatchZoom = map.getZoom();
-      const mpp = (lat) => 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoneHatchZoom);
-      excludeZones.forEach(z => {
-        const c = zoneCoords(z); if (!c) return;
+      const list = zonesInView(viewBounds());
+      zoneDrawnKey = zoneViewKey(list);
+      const zoom = map.getZoom();
+      const mpp = (lat) => 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
+      const shapes = list.map(z => { const c = zoneCoords(z); return { c, segs: zoneHatchSegments(c, ZONE_HATCH_PX * mpp(c[0].lat)) }; });
+      const hatch = shapes.reduce((n, s) => n + s.segs.length, 0) <= ZONE_HATCH_TOTAL_MAX;
+      shapes.forEach(({ c, segs }) => {
         const poly = new ZDC.Polygon(c.map(p => new ZDC.LatLng(p.lat, p.lng)),
           { fill: ZONE_FILL, fillOpacity: 0.28, stroke: ZONE_LINE, strokeWidth: 2, propagation: true });
         map.addWidget(poly); zoneWidgets.push(poly);
-        zoneHatchSegments(c, ZONE_HATCH_PX * mpp(c[0].lat)).forEach(s => {
+        if (hatch) segs.forEach(s => {
           const ln = new ZDC.Polyline(s.map(p => new ZDC.LatLng(p.lat, p.lng)), { color: ZONE_LINE, width: 1, opacity: 0.55, propagation: true });
           map.addWidget(ln); zoneWidgets.push(ln);
         });
       });
     }
+    // ズームが変わった時と、パンで画面に掛かるエリアが変わった時だけ描き直す（顔ぶれが同じパンでは何もしない）。
     function zoneOnIdle() {
-      if (map && excludeZones.length && map.getZoom() !== zoneHatchZoom) renderZones();
+      if (map && excludeZones.length && zoneViewKey(zonesInView(viewBounds())) !== zoneDrawnKey) renderZones();
     }
     // 自店に絞る（全店アカウントのみ全拠点＝ピンと同じ）。rules 側も同じ拠点しか読ませない。
     // rules 未deploy・読取NG のときは表示しないだけ（ピンの購読や打刻は巻き込まない）。

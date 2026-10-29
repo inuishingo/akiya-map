@@ -144,7 +144,7 @@
     let zoneDraft = [];         // 描画/編集中の頂点 [{lat,lng}]
     let zoneEditId = null;      // 編集中のエリアの doc ID（新規は null）
     let zoneSelVertex = -1;     // 選んでいる頂点（-1＝なし）。選んだ状態で地図をクリックするとそこへ動く
-    let zoneHatchZoom = null;   // 斜線を引いたときのズーム（変わった時だけ引き直す）
+    let zoneDrawnKey = null;    // 描いたときの「ズーム＋画面内のエリア」。変わった時だけ描き直す
     let zoneExcludeOn = true;   // Excel出力で除外エリア内のピンを外す（既定ON・記憶しない）
 
     // ===== 公図取得済みマーク（kouzu_marks）— 管理画面専用 =====
@@ -897,7 +897,7 @@
             map.addEventListener("idle", function(){ redrawActiveLayers(); });
             // 市区界ON中のみ。索引の bbox で可視市区を決め、可視リングを差分更新する（index.html と同じ）。
             map.addEventListener("idle", function(){ if (areaOn) redrawAreaBorders(); });
-            map.addEventListener("idle", function(){ zoneOnIdle(); });   // 除外エリアの斜線はズームが変わった時だけ引き直す
+            map.addEventListener("idle", function(){ zoneOnIdle(); });   // 除外エリアはズームか画面内のエリアが変わった時だけ引き直す
             map.addEventListener("click", function(e){
               if (!e || !e.latlng) return;
               if (zoneMode) { zoneMapClick(e.latlng); return; }   // 除外エリアの描画/編集中（他のクリック登録とは排他）
@@ -1376,6 +1376,7 @@
     const ZONE_EDIT_COLOR = "#2563EB";                        // 描画/編集中の仮の形は青
     const ZONE_HATCH_PX = 14;      // 斜線の間隔（画面上のpx。ズームが変わったら引き直す）
     const ZONE_HATCH_MAX = 300;    // 1エリアの斜線の上限。超える広域表示では塗りだけにする（重くしない）
+    const ZONE_HATCH_TOTAL_MAX = 600;   // 画面全体の斜線の上限。超えたら斜線なし（塗りと枠線だけ）
 
     // 点が多角形の内側か（レイキャスティング）。数百m規模なので緯度経度のまま判定して差し支えない。
     function zoneContains(lat, lng, ring) {
@@ -1446,24 +1447,39 @@
         { fill: opt.color, fillOpacity: opt.fillOpacity, stroke: opt.line, strokeWidth: 2, propagation: true });
       map.addWidget(poly); out.push(poly);
       if (!opt.hatch) return;
-      const mpp = 156543.03392 * Math.cos(coords[0].lat * Math.PI / 180) / Math.pow(2, map.getZoom());
-      zoneHatchSegments(coords, ZONE_HATCH_PX * mpp).forEach(s => {
+      (opt.segs || zoneHatchSegments(coords, ZONE_HATCH_PX * zoneMpp(coords))).forEach(s => {
         const ln = new ZDC.Polyline(s.map(p => new ZDC.LatLng(p.lat, p.lng)), { color: opt.line, width: 1, opacity: 0.55, propagation: true });
         map.addWidget(ln); out.push(ln);
       });
     }
+    function zoneMpp(coords) { return 156543.03392 * Math.cos(coords[0].lat * Math.PI / 180) / Math.pow(2, map.getZoom()); }
+    // 画面（＋バッファ）に掛かる除外エリアだけ返す（ピンと同じ viewBounds・bbox で判定）。範囲が取れない時は全部。
+    // 描画専用。Excel出力の除外判定（pinZone）は今まで通り全エリアを見る。
+    function zonesInView(vb) {
+      return excludeZones.filter(z => {
+        const c = zoneCoords(z); if (!c) return false;
+        if (!vb) return true;
+        const bb = z._bb || (z._bb = zoneBBox(c));
+        return !(bb.n < vb.south || bb.s > vb.north || bb.e < vb.west || bb.w > vb.east);
+      });
+    }
+    // 表示対象＝画面内のエリアから編集中のものを除いたもの（編集中は仮の形（青）だけを見せる）
+    function zonesToDraw() { return zonesInView(viewBounds()).filter(z => !(zoneMode && z.id === zoneEditId)); }
+    function zoneViewKey(list) { return map.getZoom() + "|" + list.map(z => z.id).join(","); }
+    // 描くのは画面内のエリアだけ。斜線は画面全体で ZONE_HATCH_TOTAL_MAX 本までで、超えたら引かない
+    // （京都299エリアでズームのたびに全エリアの斜線を引き直し、Z20で約9,200本になって固まっていた）。
     function renderZones() {
       if (!map || !mapReady) return;
       zoneClearWidgets(zoneWidgets);
-      zoneHatchZoom = map.getZoom();
-      excludeZones.forEach(z => {
-        if (zoneMode && z.id === zoneEditId) return;   // 編集中のエリアは仮の形（青）だけを見せる
-        const c = zoneCoords(z); if (!c) return;
-        zoneDrawShape(c, { color: ZONE_FILL, line: ZONE_LINE, fillOpacity: 0.28, hatch: true }, zoneWidgets);
-      });
+      const list = zonesToDraw();
+      zoneDrawnKey = zoneViewKey(list);
+      const shapes = list.map(z => { const c = zoneCoords(z); return { c, segs: zoneHatchSegments(c, ZONE_HATCH_PX * zoneMpp(c)) }; });
+      const hatch = shapes.reduce((n, s) => n + s.segs.length, 0) <= ZONE_HATCH_TOTAL_MAX;
+      shapes.forEach(({ c, segs }) => zoneDrawShape(c, { color: ZONE_FILL, line: ZONE_LINE, fillOpacity: 0.28, hatch, segs }, zoneWidgets));
     }
+    // ズームが変わった時と、パンで画面に掛かるエリアが変わった時だけ描き直す（顔ぶれが同じパンでは何もしない）。
     function zoneOnIdle() {
-      if (map && excludeZones.length && map.getZoom() !== zoneHatchZoom) renderZones();
+      if (map && mapReady && excludeZones.length && zoneViewKey(zonesToDraw()) !== zoneDrawnKey) renderZones();
     }
 
     // rules 未deploy時は read が既定denyで例外になる。errorコールバックで握りつぶし、既存機能を巻き込まない。
