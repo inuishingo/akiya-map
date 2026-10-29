@@ -1750,20 +1750,21 @@
 
     // ===== REALTIME LISTEN =====
     let pinsRendered = false;   // 初回の描画が済んだか（自店ピン0件でも初回は必ず描く）
+    // 自店のピンだけ購読する（index.html と同じ where のみ）。以前は全拠点（約4万件・約23MB）を毎回受信して
+    // 表示まで20〜30秒かかっていた。全拠点ぶんは調査集計を開いた時だけ期間を絞って取る（loadSumRange）。
+    // orderBy を付けると branch＋createdAt の複合インデックスが要るため、並べ替えは受信後にここで行う。
+    // branch 空/欠落のピンは取れないが、2026-10-29 の棚卸しで0件（pinBranch の名古屋扱いは残す）。
     function listenPins() {
-      const q = query(collection(db, "pins"), orderBy("createdAt", "desc"));
+      const q = query(collection(db, "pins"), where("branch", "==", myBranch));
       onSnapshot(q, snap => {
-        // 自店フィルタ：allPins段階で自店ピンだけに絞る（stats/ドロップダウン/地図/Excel が全て自店スコープになる）。
-        // 全拠点ぶんは調査集計（拠点を選べる）専用。一覧・地図・Excel は従来どおり自店の allPins だけを使う。
-        allPinsAllBranches = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        allPins = allPinsAllBranches.filter(p => pinBranch(p) === myBranch);
-        // 他拠点だけの変化では一覧・地図を描き直さない（admin は全拠点を購読しているため、他店の打刻のたびに固まっていた）。
-        // removed の doc も削除前のデータを持つので、自店ピンの削除は mine=true になる。
-        const mine = snap.docChanges().some(c => pinBranch(c.doc.data() || {}) === myBranch);
-        if (pinsRendered && !mine) {
-          if (document.getElementById("sumModal").style.display === "flex") renderSurveySummary();   // 集計は全拠点なので追随する
-          return;
-        }
+        // stats/ドロップダウン/地図/Excel はすべてこの allPins（自店）から作る。並びは従来の orderBy("createdAt","desc") と同じ。
+        // 比較は Firestore と同じコード順（localeCompare は使わない）。同時刻は doc ID の降順＝orderBy desc の既定と同じ。
+        allPins = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+          .sort((a, b) => {
+            const ca = String(a.createdAt || ""), cb = String(b.createdAt || "");
+            if (ca !== cb) return ca < cb ? 1 : -1;
+            return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+          });
         pinsRendered = true;
         updateStats();
         updateStaffFilter();
@@ -1783,7 +1784,13 @@
     //   中央値     = その日の全間隔の中央値（5分以上の空白も含む）
     //   10秒未満   = 10秒未満の間隔数 ÷ 全間隔数
     //   離れ打ち率 = 離れ打ち ÷ 位置が取れたピン（位置なし・記録なしは分母に入れない）
-    let allPinsAllBranches = [];   // 全拠点のピン（集計専用）
+    // 全拠点のピン（集計・再生専用）。集計を開くたびに捨てて、期間（JSTの日付）ぶんだけ取り直す
+    // （開きっぱなしの管理画面で他店の今日の打刻が反映されない＝集計が古くなるのを防ぐ）。開いている間の期間変更・拠点切替は使い回す。
+    const sumCache = new Map();   // id -> ピン
+    const sumRanges = [];         // 取得済みの期間 [{ a, b }]（ISO文字列。null＝その側は制限なし）
+    const sumLoading = new Map(); // 取得中の期間（キー -> Promise）。同じ期間を二重に取らない
+    let sumError = false;
+    let sumGen = 0;               // 集計を開いた回数。開き直す前に始まった取得の結果は捨てる
     const SUM_GAP_MAX_SEC = 300, SUM_FAST_SEC = 10;
     const SUM_MIN_N = 20;          // これ未満の行は色を付けず、比較相手にも入れない（少数だと件/時が暴れる）
     // 割合の列は固定のしきい値 [黄, 赤]（%）。件/時と間隔は「同じ拠点の他の調査員の中央値」との倍率で見る。
@@ -1793,6 +1800,53 @@
       if (!a.length) return null;
       const s = [...a].sort((x, y) => x - y), m = s.length >> 1;
       return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+    }
+    // JST の YYYY-MM-DD → その日の0時（JST）の ISO 文字列。createdAt は toISOString（UTC・…Z）なので文字列比較できる
+    // （2026-10-29 に全40,373件が ISO 形式と確認済み）。
+    function jstDayStartIso(ymd, addDays = 0) {
+      const t = Date.parse(ymd + "T00:00:00+09:00");
+      return Number.isNaN(t) ? null : new Date(t + addDays * 86400e3).toISOString();
+    }
+    function sumRangeOf(from, to) { return { a: from ? jstDayStartIso(from) : null, b: to ? jstDayStartIso(to, 1) : null }; }
+    function sumCovered(r) {
+      return sumRanges.some(x => (x.a == null || (r.a != null && x.a <= r.a)) && (x.b == null || (r.b != null && x.b >= r.b)));
+    }
+    // 期間ぶんの全拠点ピンを1回だけ取る。届いたら（失敗でも）集計を描き直す。
+    function loadSumRange(r) {
+      const gen = sumGen, key = gen + "|" + (r.a || "") + "|" + (r.b || "");
+      if (sumLoading.has(key)) return sumLoading.get(key);
+      const cs = [];
+      if (r.a) cs.push(where("createdAt", ">=", r.a));
+      if (r.b) cs.push(where("createdAt", "<", r.b));
+      const pr = getDocs(query(collection(db, "pins"), ...cs)).then(snap => {
+        if (gen !== sumGen) return;   // 取得中に開き直した＝古い回の結果は使わない
+        snap.docs.forEach(d => sumCache.set(d.id, { id: d.id, ...d.data() }));
+        sumRanges.push(r); sumError = false;
+      }).catch(e => {
+        console.warn("調査集計の取得に失敗", e);
+        if (gen === sumGen) sumError = true;
+      }).finally(() => {
+        sumLoading.delete(key);
+        if (gen === sumGen && document.getElementById("sumModal").style.display === "flex") renderSurveySummary();
+      });
+      sumLoading.set(key, pr);
+      return pr;
+    }
+    // 集計・再生に使うピン。自店は購読中の allPins（ライブ）、他店は取得済みの sumCache（重複は自店側を採る）。
+    function sumPins() {
+      const others = [];
+      for (const p of sumCache.values()) if (pinBranch(p) !== myBranch) others.push(p);
+      return allPins.concat(others);
+    }
+    // 拠点の選択肢＝集計に使うピンに出てくる拠点＋自店。初回だけ自店を既定にする。以後は選択を保つ。
+    function fillSumBranches(pins) {
+      const sel = document.getElementById("sumBranch");
+      const branches = [...new Set(pins.map(pinBranch).concat(myBranch))].sort();
+      const cur = sel.dataset.init ? sel.value : myBranch;
+      sel.innerHTML = `<option value="">全拠点</option>`
+        + branches.map(b => `<option value="${escAttr(b)}">${escAttr(b)}</option>`).join("");
+      sel.value = (cur === "" || branches.includes(cur)) ? cur : "";
+      sel.dataset.init = "1";
     }
     function buildSurveySummary(pins) {
       const groups = new Map();
@@ -1839,9 +1893,21 @@
       return rows.sort((a, b) => b.ymd.localeCompare(a.ymd) || a.branch.localeCompare(b.branch) || b.n - a.n);
     }
     function renderSurveySummary() {
-      const br = document.getElementById("sumBranch").value;
       const from = document.getElementById("sumFrom").value, to = document.getElementById("sumTo").value;
-      const rows = buildSurveySummary(allPinsAllBranches.filter(p => {
+      // 期間ぶんの他店ピンがまだ無ければ取りに行き、届いたらもう一度ここが呼ばれる（loadSumRange の finally）。
+      const range = sumRangeOf(from, to);
+      if (!sumCovered(range)) {
+        const failed = sumError && !sumLoading.size;
+        document.getElementById("sumMeta").textContent = failed ? "読み込みに失敗しました（権限/通信）" : "読み込み中…";
+        document.getElementById("sumBody").innerHTML = `<tr><td colspan="10" class="sum-dim">${failed ? "読み込みに失敗しました" : "読み込み中…"}</td></tr>`;
+        sumRows = [];   // 古い行をクリックして再生しないように
+        if (!failed) loadSumRange(range);
+        return;
+      }
+      const pins = sumPins();
+      fillSumBranches(pins);
+      const br = document.getElementById("sumBranch").value;
+      const rows = buildSurveySummary(pins.filter(p => {
         const d = jstYmd(p.createdAt);
         return d && (!from || d >= from) && (!to || d <= to) && (br === "" || pinBranch(p) === br);
       }));
@@ -1863,19 +1929,17 @@
         : `<tr><td colspan="10" class="sum-dim">該当するピンがありません</td></tr>`;
     }
     window.renderSurveySummary = renderSurveySummary;
-    window.openSurveySummary = () => {
-      const sel = document.getElementById("sumBranch");
-      const branches = [...new Set(allPinsAllBranches.map(pinBranch))].sort();
-      const cur = sel.dataset.init ? sel.value : myBranch;   // 初回だけ自店を既定にする。以後は選択を保つ
-      sel.innerHTML = `<option value="">全拠点</option>`
-        + branches.map(b => `<option value="${escAttr(b)}">${escAttr(b)}</option>`).join("");
-      sel.value = (cur === "" || branches.includes(cur)) ? cur : "";
-      if (!sel.dataset.init) {
-        sel.dataset.init = "1";
+    // keep=true は「再生から集計に戻る」時。取得済みの他店ぶんを使い回す。
+    window.openSurveySummary = (keep) => {
+      const fromEl = document.getElementById("sumFrom");
+      if (!fromEl.dataset.init) {
+        fromEl.dataset.init = "1";
         // 既定は直近7日（JST）。日付の入口は jstYmd() に統一（UTCずれ防止）。
         document.getElementById("sumTo").value = jstYmd(new Date().toISOString());
-        document.getElementById("sumFrom").value = jstYmd(new Date(Date.now() - 6 * 86400e3).toISOString());
+        fromEl.value = jstYmd(new Date(Date.now() - 6 * 86400e3).toISOString());
       }
+      // 開くたびに他店ぶんを捨てて取り直す（開きっぱなしでも今日の打刻が反映されるように）。
+      if (keep !== true) { sumGen++; sumCache.clear(); sumRanges.length = 0; sumLoading.clear(); sumError = false; }
       document.getElementById("sumModal").style.display = "flex";
       renderSurveySummary();
     };
@@ -1945,7 +2009,7 @@
     window.startReplay = (i) => {
       const r = sumRows[i];
       if (!r || !map || !mapReady) return;
-      const pins = allPinsAllBranches
+      const pins = sumPins()
         .filter(p => pinBranch(p) === r.branch && (p.email || "") === r.email && jstYmd(p.createdAt) === r.ymd
                   && Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng)))
         .map(p => ({ p, lat: Number(p.lat), lng: Number(p.lng), t: Date.parse(p.createdAt) }))
@@ -2164,7 +2228,7 @@
         if (map.getZoom() !== view.zoom) map.setZoom(view.zoom);
       }
       renderAllMarkers();                          // 通常ピンを描き直す
-      if (backToSummary) openSurveySummary();
+      if (backToSummary) openSurveySummary(true);   // 再生は集計の続き＝取り直さない
     };
 
     // ===== 公図取得済みマーク：購読・描画・ポップアップ・削除（管理画面専用）=====
@@ -3554,17 +3618,25 @@
 
     // 可視範囲の変化に追従して差分更新（範囲内で未描画は追加／対象外は marker＋ラベルごと除去）。
     // 既に描画済みのピンは触らない＝パンのたびに全再生成しない。
+    // 描画上限（index.html と同じ）。画面内の該当ピンがこれを超えたら1本も描かず「非表示中」を出す
+    // （京都の密集地でZ16に1,075本描いていた）。一覧/地図から選んだピン（selectedPinId）だけは上限を超えていても描く。
+    const MAX_VISIBLE_PINS = 600;
+    let pinsOverLimit = false;
+    function setPinLimitNotice(on) {
+      pinsOverLimit = on;
+      const el = document.getElementById("pinLimitNotice");
+      if (el) el.style.display = on ? "block" : "none";
+    }
     function relayoutVisiblePins() {
       if (!map) return;
       // 動きの再生中は通常ピンを地図に出さない（再生用の印と重なって読めない）。終了時に renderAllMarkers() で戻す。
-      if (replay) { for (const id of Array.from(pinWidgetMap.keys())) removePinMarker(id); updateMapCount(); return; }
+      if (replay) { for (const id of Array.from(pinWidgetMap.keys())) removePinMarker(id); setPinLimitNotice(false); updateMapCount(); return; }
       const vb = viewBounds();
-      const keep = new Set();
-      filteredPins.forEach(p => {
-        if (!inViewBounds(p, vb)) return;
-        keep.add(p.id);
-        if (!pinWidgetMap.has(p.id)) renderMarker(p);
-      });
+      const inView = filteredPins.filter(p => inViewBounds(p, vb));
+      setPinLimitNotice(inView.length > MAX_VISIBLE_PINS);
+      const targets = pinsOverLimit ? inView.filter(p => p.id === selectedPinId) : inView;
+      const keep = new Set(targets.map(p => p.id));
+      targets.forEach(p => { if (!pinWidgetMap.has(p.id)) renderMarker(p); });
       for (const id of Array.from(pinWidgetMap.keys())) {
         if (!keep.has(id)) removePinMarker(id);
       }
@@ -3589,7 +3661,10 @@
       const el = document.getElementById("mapCount");
       if (!el) return;
       const n = filteredPins.length, m = pinWidgetMap.size;
-      if (n > 0 && m === 0) {
+      if (pinsOverLimit) {
+        el.textContent = `該当 ${n}件／ピンが多いため地図は非表示中`;
+        el.classList.add("warn");
+      } else if (n > 0 && m === 0) {
         el.textContent = `該当 ${n}件／表示範囲に該当ピンがありません`;
         el.classList.add("warn");
       } else {
@@ -4831,6 +4906,10 @@
     .grid-edit-banner { position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:25;
       background:rgba(217,119,6,.96);color:#fff;border-radius:8px;padding:6px 14px;
       font-size:13px;font-weight:700;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,.4); }
+    /* 描画上限超えの通知（タップ透過）。地図の下端中央（上端は .right-panel 基準でツールバーに重なるため。縮尺=左下・著作権=右下の間） */
+    .pin-limit-notice { display:none; position:absolute; bottom:28px; left:50%; transform:translateX(-50%); z-index:24;
+      background:rgba(31,41,55,.88); color:#e5e7eb; font-size:12px; font-weight:700; padding:4px 12px;
+      border-radius:14px; pointer-events:none; white-space:nowrap; }
     /* データ重畳トグル（用途地域/地番）。グリッドボタンと同系。ON時に色付け */
     .layer-btn { padding:7px 14px;border-radius:6px;background:transparent;border:1px solid #334155;
       color:#94a3b8;font-size:13px;font-weight:700;cursor:pointer; }
@@ -5463,6 +5542,7 @@
       </div>
     </div>
     <div id="map"></div>
+    <div id="pinLimitNotice" class="pin-limit-notice">ピンが多いため非表示中（拡大すると表示）</div>
     <div id="gridEditBanner" class="grid-edit-banner" style="display:none">✏ グリッド編集中：マスをタップで記録／解除</div>
     <div id="gridLegend" class="grid-legend" style="display:none"></div>
     <div id="youtoInfo" class="youto-info" style="display:none"></div>
