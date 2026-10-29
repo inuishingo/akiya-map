@@ -545,6 +545,7 @@
             if (item.seqNo == null) item.seqNo = await nextSeqNo();
             const ref = await addDoc(collection(db, "pins"), item);
             undoUpgradeQueued(item, ref.id);   // 同期でIDが確定＝Undo対象を doc に昇格（同期後もUndoできる）
+            justSavedIds.add(ref.id);   // 電波の悪い所で打ったピンも、描画上限を超えたエリアで見えなくならないように
             const i = offlineQueue.indexOf(item);
             if (i >= 0) offlineQueue.splice(i, 1);
             localStorage.setItem("offlineQueue", JSON.stringify(offlineQueue));
@@ -552,6 +553,8 @@
             failed++;
           }
         }
+        // 送信直後の onSnapshot は justSavedIds 登録前に走るため、上限超えエリアではここで描き直して拾う。
+        if (map) relayoutVisiblePins();
         if (failed === 0) showToast("オフライン中のデータを同期しました");
       } finally {
         offlineSyncing = false;
@@ -1043,6 +1046,19 @@
       if (!showPastRounds && isPastRound(data)) return false;
       return inViewBounds(data, vb);
     }
+    // 描画上限。可視範囲の描画対象がこれを超えたら1本も描かない（数千本の addWidget で固まるのを防ぐ）。
+    // 永久ピン(反社/NG)も数に含める。例外は自分がこのセッションで保存したピンだけ（打った直後に見えないと困るため）。
+    const MAX_VISIBLE_PINS = 600;
+    const justSavedIds = new Set();
+    // 描画すべきピンIDの集合を返す。上限超えなら「非表示中」表示を出し、保存直後のピンだけ返す。
+    function visiblePinIds(vb) {
+      const ids = [];
+      lastPinDocs.forEach(p => { if (shouldRenderPin(p.data, vb)) ids.push(p.id); });
+      const over = ids.length > MAX_VISIBLE_PINS;
+      const notice = document.getElementById("pinLimitNotice");
+      if (notice) notice.style.display = over ? "block" : "none";
+      return new Set(over ? ids.filter(id => justSavedIds.has(id)) : ids);
+    }
     // 可視範囲の変化に追従して描画を差分更新（範囲内で未描画は追加／対象外は marker＋ラベルごと除去）。
     // 既に描画済みのピンは触らない＝パンのたびに全再生成しない。
     function relayoutVisiblePins() {
@@ -1054,11 +1070,9 @@
         labelsShown = showLabels;
         for (const id of Array.from(pinWidgetMap.keys())) removePinMarker(id);
       }
-      const keep = new Set();
+      const keep = visiblePinIds(vb);
       lastPinDocs.forEach(p => {
-        if (!shouldRenderPin(p.data, vb)) return;
-        keep.add(p.id);
-        if (!pinWidgetMap.has(p.id)) renderMarker(p.id, p.data);
+        if (keep.has(p.id) && !pinWidgetMap.has(p.id)) renderMarker(p.id, p.data);
       });
       for (const id of Array.from(pinWidgetMap.keys())) {
         if (!keep.has(id)) removePinMarker(id);
@@ -1073,7 +1087,8 @@
         removePinMarker(id);
       }
       const vb = viewBounds();
-      lastPinDocs.forEach(p => { if (shouldRenderPin(p.data, vb)) renderMarker(p.id, p.data); });
+      const keep = visiblePinIds(vb);
+      lastPinDocs.forEach(p => { if (keep.has(p.id)) renderMarker(p.id, p.data); });
     }
 
     // 過去周回ピンの表示トグル（既定OFF）。ONで従来の薄色(opacity .45)表示に戻る。
@@ -1564,18 +1579,12 @@
       pinsUnsub = onSnapshot(src, snap => {
         // 担当者カラー・表示名はログイン時に1回読み済み（ここでは読まない）。
         lastPinDocs = snap.docs.map(d => ({ id:d.id, data:d.data() }));
-        const vb = viewBounds();
+        // 変更分は一旦消すだけ。描き直しは最後の relayoutVisiblePins でまとめて行う
+        // （描画上限の判定を1回で済ませる。modified は消えているので新データで描き直される）。
         snap.docChanges().forEach(change => {
-          const id = change.doc.id;
-          const data = change.doc.data();
-          if (change.type === "added" || change.type === "modified") {
-            removePinMarker(id);
-            // 可視範囲外／過去周回(OFF時)は描かない。範囲内に入ったら idle の relayoutVisiblePins が拾う。
-            if (shouldRenderPin(data, vb)) renderMarker(id, data);
-          } else if (change.type === "removed") {
-            removePinMarker(id);
-          }
+          removePinMarker(change.doc.id);
         });
+        relayoutVisiblePins();
         renderJumpList();     // 「続きへ」ドロップダウンを最新ピンで再構築
 
       }, e => { /* オフライン/権限エラーは無視（再オンライン・再ログインで復帰） */ });
@@ -2110,6 +2119,7 @@
             pinData.seqNo = await nextSeqNo();
             const ref = await addDoc(collection(db, "pins"), pinData);
             undoPush({ kind: "doc", id: ref.id });   // 直近作成としてUndo対象に積む
+            justSavedIds.add(ref.id);   // 描画上限を超えていても自分が打ったピンは表示する
             // 保存直後の即時描画も表示対象判定を通す（保存中に画面外へパンした場合は描かない。onSnapshot/idleが拾う）
             if (shouldRenderPin(pinData, viewBounds())) renderMarker(ref.id, pinData);
             console.log("[debug] rendered after save:", ref.id, pinData);
@@ -3143,6 +3153,12 @@
       padding: 6px 14px; border-radius: 20px; z-index: 200; max-width: 92%;
       text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
     }
+    /* 描画上限超えの通知（小さく・タップ透過）。他の上部バナー(60/96/134px)と重ならない位置 */
+    .pin-limit-notice {
+      display: none; position: fixed; top: 172px; left: 50%; transform: translateX(-50%);
+      background: rgba(31,41,55,.88); color: #e5e7eb; font-size: 11px; font-weight: 700;
+      padding: 4px 12px; border-radius: 14px; z-index: 200; pointer-events: none; white-space: nowrap;
+    }
 
     #pinModal {
       display: none; position: fixed; inset: 0; z-index: 300;
@@ -3240,6 +3256,7 @@
   <div class="grid-banner" id="gridBanner">🗺️ 調査グリッド記録モード：マスをタップで調査済み/解除（ピン追加は一時停止中）</div>
   <div class="youto-banner" id="youtoBanner">🏠 用途地域モード：地図タップで用途地域の属性表示（ピン追加は一時停止中）</div>
   <div class="youto-info" id="youtoInfo" style="display:none"></div>
+  <div class="pin-limit-notice" id="pinLimitNotice">ピンが多いため非表示中（拡大すると表示）</div>
   <button class="past-btn" id="pastBtn" onclick="togglePastRounds()" title="過去周回ピンの表示（既定OFF）">旧</button>
   <!-- 市区町村界の赤線表示。既定OFF・セッション内のみ（記憶しない） -->
   <button class="area-btn" id="areaBtn" onclick="toggleAreaBorders()" title="市区町村の境界を赤線で表示">境</button>
