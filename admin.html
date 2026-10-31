@@ -1779,9 +1779,10 @@
 
     // ===== 調査集計（調査員×日）=====
     // 雑な調査・机上入力を日々の数字で拾うための表。表示専用で、ピンには何も書かない。
-    // 定義は 2026-10-10 の京都の実績（498件・144件/時・中央値13秒）と突き合わせて決めた。変えると過去の数字と合わなくなる。
-    //   件/時      = 件数 ÷ 稼働時間（連続する打刻間隔のうち5分未満のものの合計）
-    //   中央値     = その日の全間隔の中央値（5分以上の空白も含む）
+    // 定義は 2026-10-10 の京都の実績（498件・中央値13秒）と突き合わせて決めた。変えると過去の数字と合わなくなる。
+    // 稼働時間の除外は当初5分だったが、間隔が5分前後の人の稼働が大幅に削られるため 2026-10-31 に30分へ変更（144件/時は5分時点の値）。
+    //   件/時      = 件数 ÷ 稼働時間（連続する打刻間隔のうち30分未満のものの合計）
+    //   中央値     = その日の全間隔の中央値（30分以上の空白も含む）
     //   10秒未満   = 10秒未満の間隔数 ÷ 全間隔数
     //   離れ打ち率 = 離れ打ち ÷ 位置が取れたピン（位置なし・記録なしは分母に入れない）
     // 全拠点のピン（集計・再生専用）。集計を開くたびに捨てて、期間（JSTの日付）ぶんだけ取り直す
@@ -1791,7 +1792,8 @@
     const sumLoading = new Map(); // 取得中の期間（キー -> Promise）。同じ期間を二重に取らない
     let sumError = false;
     let sumGen = 0;               // 集計を開いた回数。開き直す前に始まった取得の結果は捨てる
-    const SUM_GAP_MAX_SEC = 300, SUM_FAST_SEC = 10;
+    const SUM_ACTIVE_GAP_MAX_SEC = 1800;   // 稼働時間から除く空白のしきい値（件/時・稼働の列）
+    const SUM_GAP_MAX_SEC = 300, SUM_FAST_SEC = 10;   // SUM_GAP_MAX_SEC は地図再生の空白判定（破線・道のり・早送り）専用
     const SUM_MIN_N = 20;          // これ未満の行は色を付けず、比較相手にも入れない（少数だと件/時が暴れる）
     // 割合の列は固定のしきい値 [黄, 赤]（%）。件/時と間隔は「同じ拠点の他の調査員の中央値」との倍率で見る。
     // 位置なし率も見る＝位置情報の許可を切って打つ抜け道を塞ぐ。分母は「位置あり＋位置なし」（旧版の記録なしは入れない）。
@@ -1864,9 +1866,9 @@
       for (const g of groups.values()) {
         g.ts.sort((a, b) => a - b);
         const gaps = g.ts.slice(1).map((t, i) => (t - g.ts[i]) / 1000);
-        const activeSec = gaps.filter(x => x < SUM_GAP_MAX_SEC).reduce((s, x) => s + x, 0);
+        const activeSec = gaps.filter(x => x < SUM_ACTIVE_GAP_MAX_SEC).reduce((s, x) => s + x, 0);
         const n = g.ts.length, located = g.ok + g.far, recorded = located + g.none;
-        rows.push({ branch: g.branch, email: g.email, ymd: g.ymd, n, ts: g.ts, far: g.far, none: g.none, noRec: g.noRec,
+        rows.push({ branch: g.branch, email: g.email, ymd: g.ymd, n, ts: g.ts, activeSec, far: g.far, none: g.none, noRec: g.noRec,
           perHour: activeSec > 0 ? n / (activeSec / 3600) : null,
           medGap: sumMedian(gaps),
           fastPct: gaps.length ? gaps.filter(x => x < SUM_FAST_SEC).length / gaps.length * 100 : null,
@@ -1968,7 +1970,7 @@
       if (!sumCovered(range)) {
         const failed = sumError && !sumLoading.size;
         document.getElementById("sumMeta").textContent = failed ? "読み込みに失敗しました（権限/通信）" : "読み込み中…";
-        document.getElementById("sumBody").innerHTML = `<tr><td colspan="10" class="sum-dim">${failed ? "読み込みに失敗しました" : "読み込み中…"}</td></tr>`;
+        document.getElementById("sumBody").innerHTML = `<tr><td colspan="11" class="sum-dim">${failed ? "読み込みに失敗しました" : "読み込み中…"}</td></tr>`;
         document.getElementById("sumTimeBody").innerHTML = `<tr><td colspan="23" class="sum-dim">${failed ? "読み込みに失敗しました" : "読み込み中…"}</td></tr>`;
         document.getElementById("sumTimeFoot").innerHTML = "";
         sumRows = [];   // 古い行をクリックして再生しないように
@@ -1985,6 +1987,7 @@
       }));
       const cls = f => f === 2 ? " sum-bad" : f === 1 ? " sum-warn" : "";
       const num = (v, unit) => v == null ? "–" : Math.round(v) + unit;
+      const hm = sec => { const m = Math.round(sec / 60); return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}`; };
       document.getElementById("sumMeta").textContent = `${rows.length}行（調査員×日）`;
       // 20件未満はペース系の3列を出さない（3件で1859件/時のような跳ねた数字になるため）。件数・離れ打ち・位置なしは出す。
       const few = r => r.n < SUM_MIN_N;
@@ -1992,13 +1995,14 @@
       document.getElementById("sumBody").innerHTML = rows.length ? rows.map((r, i) => `<tr class="sum-row" onclick="startReplay(${i})" title="クリックでこの日の動きを地図で再生">
         <td>${r.ymd}</td><td>${escAttr(r.branch)}</td><td>${escAttr(staffName(r.email))}</td>
         <td class="num">${r.n}</td>
+        <td class="num">${hm(r.activeSec)}</td>
         <td class="num${cls(r.flag.perHour)}">${few(r) ? "–" : num(r.perHour, "")}</td>
         <td class="num${cls(r.flag.medGap)}">${few(r) ? "–" : num(r.medGap, "秒")}</td>
         <td class="num${cls(r.flag.fastPct)}">${few(r) ? "–" : num(r.fastPct, "%")}</td>
         <td class="num${cls(r.flag.farPct)}">${r.far}件${r.farPct == null ? "" : `（${Math.round(r.farPct)}%）`}</td>
         <td class="num${cls(r.flag.nonePct)}">${r.none}件${r.nonePct == null ? "" : `（${Math.round(r.nonePct)}%）`}</td>
         <td class="num sum-dim">${r.noRec}件</td></tr>`).join("")
-        : `<tr><td colspan="10" class="sum-dim">該当するピンがありません</td></tr>`;
+        : `<tr><td colspan="11" class="sum-dim">該当するピンがありません</td></tr>`;
       renderSumTimeTable(rows);
     }
     window.renderSurveySummary = renderSurveySummary;
@@ -5773,10 +5777,10 @@
       <button class="sum-xlsx" id="sumXlsxBtn" style="display:none" onclick="exportSumTime()">Excel出力</button>
     </div>
     <div class="acct-note" id="sumTimeNote" style="display:none">FAST＝その日最初のピン、LAST＝最後のピンの時刻（分まで・秒は切り捨て）。拘束＝LAST−FAST。各時の列はその時台の件数で、0件は空欄です。空白は連続するピンの間隔を数えた回数です。行をクリックすると、その日の動きを地図で再生します。</div>
-    <div class="acct-note" id="sumListNote">件/時＝件数÷稼働時間（5分以上の空白は除く）。件/時と間隔は、同じ拠点の他の調査員の中央値と比べて 2倍(1/2)で黄・3倍(1/3)で赤。10秒未満は 20%で黄・40%で赤。離れ打ち（距離−精度が100m超）と位置なしは 10%で黄・30%で赤。20件未満の行は色を付けず、件/時・間隔・10秒未満は「–」にします。行をクリックすると、その日の動きを地図で再生します。</div>
+    <div class="acct-note" id="sumListNote">件/時＝件数÷稼働時間（30分以上の空白は除く）。件/時と間隔は、同じ拠点の他の調査員の中央値と比べて 2倍(1/2)で黄・3倍(1/3)で赤。10秒未満は 20%で黄・40%で赤。離れ打ち（距離−精度が100m超）と位置なしは 10%で黄・30%で赤。20件未満の行は色を付けず、件/時・間隔・10秒未満は「–」にします。行をクリックすると、その日の動きを地図で再生します。</div>
     <div class="acct-table-wrap">
       <table class="acct-table" id="sumListTable">
-        <thead><tr><th>日付</th><th>拠点</th><th>調査員</th><th>件数</th><th>件/時</th><th>間隔の中央値</th><th>10秒未満</th><th>離れ打ち</th><th>位置なし</th><th>記録なし</th></tr></thead>
+        <thead><tr><th>日付</th><th>拠点</th><th>調査員</th><th>件数</th><th>稼働</th><th>件/時</th><th>間隔の中央値</th><th>10秒未満</th><th>離れ打ち</th><th>位置なし</th><th>記録なし</th></tr></thead>
         <tbody id="sumBody"></tbody>
       </table>
       <table class="acct-table sum-time" id="sumTimeTable" style="display:none">
