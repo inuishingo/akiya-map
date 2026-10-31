@@ -1866,7 +1866,7 @@
         const gaps = g.ts.slice(1).map((t, i) => (t - g.ts[i]) / 1000);
         const activeSec = gaps.filter(x => x < SUM_GAP_MAX_SEC).reduce((s, x) => s + x, 0);
         const n = g.ts.length, located = g.ok + g.far, recorded = located + g.none;
-        rows.push({ branch: g.branch, email: g.email, ymd: g.ymd, n, far: g.far, none: g.none, noRec: g.noRec,
+        rows.push({ branch: g.branch, email: g.email, ymd: g.ymd, n, ts: g.ts, far: g.far, none: g.none, noRec: g.noRec,
           perHour: activeSec > 0 ? n / (activeSec / 3600) : null,
           medGap: sumMedian(gaps),
           fastPct: gaps.length ? gaps.filter(x => x < SUM_FAST_SEC).length / gaps.length * 100 : null,
@@ -1892,6 +1892,75 @@
       }
       return rows.sort((a, b) => b.ymd.localeCompare(a.ymd) || a.branch.localeCompare(b.branch) || b.n - a.n);
     }
+    // 時間帯表示（手書きExcelの FAST／時間帯ごとの件数／LAST／空白回数の置き換え）。
+    // 一覧と同じ行（buildSurveySummary）から作る＝行の分け方・並び・件数は一覧と必ず一致し、行クリックの再生もそのまま使える。
+    // 画面もExcelもこの sumTimeTbl から出す＝両者の数字はずれない。空欄（0件）は null。
+    const SUM_HOUR_FROM = 9, SUM_HOUR_TO = 18;   // 1時間ごとに出す範囲（9時台〜18時台）。前後は「〜8時」「19時〜」にまとめる
+    const SUM_BLANK_LABELS = ["空白15〜30分", "空白30〜45分", "空白45〜60分", "空白60分〜"];
+    let sumTimeTbl = null;      // 直近に作った時間帯表 { head, body, foot }。読み込み中は null
+    function sumHm(t) { return jstYmdHm(new Date(t).toISOString()).slice(11); }   // JST の HH:MM（秒は切り捨て）
+    function buildSumTimeTable(rows) {
+      const hours = Array.from({ length: SUM_HOUR_TO - SUM_HOUR_FROM + 1 }, (_, i) => `${SUM_HOUR_FROM + i}時`);
+      const head = ["日付", "拠点", "調査員", "FAST", "〜8時", ...hours, "19時〜", "計", "LAST", "拘束", ...SUM_BLANK_LABELS];
+      const blankCell = v => v || null;
+      const cntTotal = Array(hours.length + 2).fill(0), blankTotal = SUM_BLANK_LABELS.map(() => 0);
+      const body = rows.map(r => {
+        const cnt = cntTotal.map(() => 0), blanks = blankTotal.map(() => 0);
+        r.ts.forEach((t, i) => {
+          const h = Number(sumHm(t).slice(0, 2));
+          cnt[h < SUM_HOUR_FROM ? 0 : h > SUM_HOUR_TO ? cnt.length - 1 : h - SUM_HOUR_FROM + 1]++;
+          // 15分刻みの区分。15分未満は -1 で数えない。60分以上は最後の区分にまとめる（境界は下側に含む＝重複しない）。
+          const b = i ? Math.min(Math.floor((t - r.ts[i - 1]) / (15 * 60e3)), 4) - 1 : -1;
+          if (b >= 0) blanks[b]++;
+        });
+        cnt.forEach((v, i) => { cntTotal[i] += v; });
+        blanks.forEach((v, i) => { blankTotal[i] += v; });
+        const has = r.ts.length > 0;   // buildSurveySummary の行は必ず1件以上あるが、空でも落とさない
+        const fast = has ? sumHm(r.ts[0]) : "–", last = has ? sumHm(r.ts[r.ts.length - 1]) : "–";
+        // 拘束は表示中の HH:MM どうしの差＝画面の FAST・LAST から検算できる。
+        const toMin = s => Number(s.slice(0, 2)) * 60 + Number(s.slice(3));
+        const hold = has ? toMin(last) - toMin(fast) : null;
+        return [r.ymd, r.branch, staffName(r.email), fast, ...cnt.map(blankCell), r.n, last,
+          has ? `${Math.floor(hold / 60)}:${String(hold % 60).padStart(2, "0")}` : "–", ...blanks.map(blankCell)];
+      });
+      const foot = ["合計", null, null, null, ...cntTotal.map(blankCell), rows.reduce((s, r) => s + r.n, 0), null, null, ...blankTotal.map(blankCell)];
+      return { head, body, foot };
+    }
+    function renderSumTimeTable(rows) {
+      sumTimeTbl = buildSumTimeTable(rows);
+      const { head, body, foot } = sumTimeTbl;
+      const tds = cells => cells.map((c, j) => `<td${j >= 3 ? ' class="num"' : ""}>${c == null ? "" : escAttr(String(c))}</td>`).join("");
+      document.getElementById("sumTimeHead").innerHTML = `<tr>${head.map(h => `<th>${h}</th>`).join("")}</tr>`;
+      document.getElementById("sumTimeBody").innerHTML = body.length
+        ? body.map((cells, i) => `<tr class="sum-row" onclick="startReplay(${i})" title="クリックでこの日の動きを地図で再生">${tds(cells)}</tr>`).join("")
+        : `<tr><td colspan="${head.length}" class="sum-dim">該当するピンがありません</td></tr>`;
+      document.getElementById("sumTimeFoot").innerHTML = body.length ? `<tr>${tds(foot)}</tr>` : "";
+    }
+    window.setSumView = (v) => {
+      const time = v === "time";
+      document.getElementById("sumViewList").classList.toggle("active", !time);
+      document.getElementById("sumViewTime").classList.toggle("active", time);
+      document.getElementById("sumModal").classList.toggle("sum-wide", time);
+      document.getElementById("sumListTable").style.display = time ? "none" : "";
+      document.getElementById("sumListNote").style.display = time ? "none" : "";
+      document.getElementById("sumTimeTable").style.display = time ? "" : "none";
+      document.getElementById("sumTimeNote").style.display = time ? "" : "none";
+      document.getElementById("sumXlsxBtn").style.display = time ? "" : "none";
+    };
+    // 表示専用：既存の exportExcel と違い exportedAt は書かない（Firestore には何も書かない）。
+    window.exportSumTime = () => {
+      if (!sumTimeTbl || !sumTimeTbl.body.length) { showToast("出力する行がありません", "error"); return; }
+      if (typeof XLSX === "undefined") { showToast("Excelライブラリの読込に失敗しました", "error"); return; }
+      const { head, body, foot } = sumTimeTbl;
+      // 日付・FAST・LAST・拘束は文字列のまま出す（画面の表示と同じ文字にする）。件数は数値。
+      const ws = XLSX.utils.aoa_to_sheet([head, ...body, foot]);
+      ws["!cols"] = head.map((_, j) => ({ wch: j === 0 ? 11 : j === 1 ? 8 : j === 2 ? 12 : j >= head.length - 4 ? 12 : 6 }));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "時間帯");
+      const br = document.getElementById("sumBranch").value || "全拠点";
+      const from = document.getElementById("sumFrom").value || "開始なし", to = document.getElementById("sumTo").value || "終了なし";
+      XLSX.writeFile(wb, `調査集計_時間帯_${br}_${from}_${to}.xlsx`);
+    };
     function renderSurveySummary() {
       const from = document.getElementById("sumFrom").value, to = document.getElementById("sumTo").value;
       // 期間ぶんの他店ピンがまだ無ければ取りに行き、届いたらもう一度ここが呼ばれる（loadSumRange の finally）。
@@ -1900,7 +1969,10 @@
         const failed = sumError && !sumLoading.size;
         document.getElementById("sumMeta").textContent = failed ? "読み込みに失敗しました（権限/通信）" : "読み込み中…";
         document.getElementById("sumBody").innerHTML = `<tr><td colspan="10" class="sum-dim">${failed ? "読み込みに失敗しました" : "読み込み中…"}</td></tr>`;
+        document.getElementById("sumTimeBody").innerHTML = `<tr><td colspan="23" class="sum-dim">${failed ? "読み込みに失敗しました" : "読み込み中…"}</td></tr>`;
+        document.getElementById("sumTimeFoot").innerHTML = "";
         sumRows = [];   // 古い行をクリックして再生しないように
+        sumTimeTbl = null;   // 読み込み中の Excel 出力を止める
         if (!failed) loadSumRange(range);
         return;
       }
@@ -1927,6 +1999,7 @@
         <td class="num${cls(r.flag.nonePct)}">${r.none}件${r.nonePct == null ? "" : `（${Math.round(r.nonePct)}%）`}</td>
         <td class="num sum-dim">${r.noRec}件</td></tr>`).join("")
         : `<tr><td colspan="10" class="sum-dim">該当するピンがありません</td></tr>`;
+      renderSumTimeTable(rows);
     }
     window.renderSurveySummary = renderSurveySummary;
     // keep=true は「再生から集計に戻る」時。取得済みの他店ぶんを使い回す。
@@ -5062,6 +5135,14 @@
     .acct-table td.sum-dim  { color:#94a3b8; }
     .acct-table tr.sum-row { cursor:pointer; }
     .acct-table tr.sum-row:hover td { box-shadow: inset 0 0 0 999px rgba(37,99,235,.07); }
+    .sum-tabs { display:inline-flex; border:1px solid #cbd5e1; border-radius:6px; overflow:hidden; }
+    .sum-tabs button { font-size:12px; padding:4px 12px; border:0; background:#fff; color:#475569; cursor:pointer; }
+    .sum-tabs button.active { background:#2563eb; color:#fff; font-weight:700; }
+    .sum-xlsx { font-size:12px; padding:4px 12px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; color:#1e293b; cursor:pointer; margin-left:auto; }
+    /* 時間帯表示は列が多いので、この時だけモーダルを広げて余白を詰める。列が収まらない幅では .acct-table-wrap が横スクロールする */
+    #sumModal.sum-wide .acct-modal-box { width:min(1320px,100%); }
+    .acct-table.sum-time th, .acct-table.sum-time td { padding:5px 6px; }
+    .acct-table.sum-time tfoot td { position:sticky; bottom:0; background:#f8fafc; font-weight:700; border-top:2px solid #cbd5e1; }
     /* 動きの再生の操作バー。右パネル上部に重ねる（地図の大きさを変えない／再生中は反社・NG登録バーを覆って誤操作を防ぐ）。 */
     .replay-bar { display:none; position:absolute; top:0; left:0; right:0; z-index:30; flex-wrap:wrap; align-items:center; gap:8px;
                   padding:8px 10px; background:#0f172a; color:#e2e8f0; font-size:12px; box-shadow:0 2px 8px rgba(0,0,0,.35); }
@@ -5685,15 +5766,23 @@
   <div class="kouzu-modal-box acct-modal-box">
     <div class="kouzu-modal-title">📊 調査集計（調査員×日）</div>
     <div class="sum-ctl">
+      <span class="sum-tabs"><button id="sumViewList" class="active" onclick="setSumView('list')">一覧</button><button id="sumViewTime" onclick="setSumView('time')">時間帯</button></span>
       拠点 <select id="sumBranch" onchange="renderSurveySummary()"></select>
       期間 <input type="date" id="sumFrom" onchange="renderSurveySummary()"> 〜 <input type="date" id="sumTo" onchange="renderSurveySummary()">
       <span class="acct-meta" id="sumMeta"></span>
+      <button class="sum-xlsx" id="sumXlsxBtn" style="display:none" onclick="exportSumTime()">Excel出力</button>
     </div>
-    <div class="acct-note">件/時＝件数÷稼働時間（5分以上の空白は除く）。件/時と間隔は、同じ拠点の他の調査員の中央値と比べて 2倍(1/2)で黄・3倍(1/3)で赤。10秒未満は 20%で黄・40%で赤。離れ打ち（距離−精度が100m超）と位置なしは 10%で黄・30%で赤。20件未満の行は色を付けず、件/時・間隔・10秒未満は「–」にします。行をクリックすると、その日の動きを地図で再生します。</div>
+    <div class="acct-note" id="sumTimeNote" style="display:none">FAST＝その日最初のピン、LAST＝最後のピンの時刻（分まで・秒は切り捨て）。拘束＝LAST−FAST。各時の列はその時台の件数で、0件は空欄です。空白は連続するピンの間隔を数えた回数です。行をクリックすると、その日の動きを地図で再生します。</div>
+    <div class="acct-note" id="sumListNote">件/時＝件数÷稼働時間（5分以上の空白は除く）。件/時と間隔は、同じ拠点の他の調査員の中央値と比べて 2倍(1/2)で黄・3倍(1/3)で赤。10秒未満は 20%で黄・40%で赤。離れ打ち（距離−精度が100m超）と位置なしは 10%で黄・30%で赤。20件未満の行は色を付けず、件/時・間隔・10秒未満は「–」にします。行をクリックすると、その日の動きを地図で再生します。</div>
     <div class="acct-table-wrap">
-      <table class="acct-table">
+      <table class="acct-table" id="sumListTable">
         <thead><tr><th>日付</th><th>拠点</th><th>調査員</th><th>件数</th><th>件/時</th><th>間隔の中央値</th><th>10秒未満</th><th>離れ打ち</th><th>位置なし</th><th>記録なし</th></tr></thead>
         <tbody id="sumBody"></tbody>
+      </table>
+      <table class="acct-table sum-time" id="sumTimeTable" style="display:none">
+        <thead id="sumTimeHead"></thead>
+        <tbody id="sumTimeBody"></tbody>
+        <tfoot id="sumTimeFoot"></tfoot>
       </table>
     </div>
     <div class="kouzu-modal-actions"><button class="kouzu-cancel" onclick="closeSurveySummary()">閉じる</button></div>
