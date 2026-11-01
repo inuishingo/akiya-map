@@ -3227,6 +3227,35 @@
     .cancel-btn { padding: 14px 18px; border-radius: 10px; background: #374151; color: #9ca3af; font-size: 15px; border: none; cursor: pointer; }
     #deleteBtn { padding: 14px 16px; border-radius: 10px; background: transparent; border: 1px solid #ef4444; color: #ef4444; font-size: 14px; cursor: pointer; }
 
+    /* ピン入力シートを画面内に収める（Galaxy Z Fold 等で上が切れてスクロールできない対策）
+       ・シートは画面高さまで＋中身スクロール ・保存/キャンセルは下に固定 */
+    .modal-sheet {
+      max-height: 100vh; max-height: 100dvh; overflow-y: auto;
+      overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+      box-sizing: border-box; padding-bottom: calc(16px + env(safe-area-inset-bottom));
+    }
+    .modal-actions {
+      position: sticky; bottom: calc(-16px - env(safe-area-inset-bottom));
+      background: #1f2937; padding: 10px 0 16px; margin-bottom: -16px; z-index: 1;
+    }
+    /* 画面の高さが低い端末：余白とボタンを詰める */
+    @media (max-height: 820px) {
+      .modal-sheet { padding-top: 12px; }
+      .modal-handle { margin-bottom: 8px; }
+      .modal-title { font-size: 15px; margin-bottom: 8px; }
+      .address-box { padding: 6px 10px; margin-bottom: 8px; font-size: 12px; }
+      .oc-check { padding: 6px 10px; margin: 0 0 6px; }
+      .status-grid { gap: 6px; margin-bottom: 8px; }
+      .status-label { padding: 7px 6px; }
+      textarea#memo { height: 52px; margin-bottom: 8px; }
+      #saveBtn, .cancel-btn { padding: 11px 14px; }
+    }
+    /* 横幅が広い端末（Fold展開時など）：シートを広げてステータスを3列に */
+    @media (min-width: 600px) {
+      .modal-sheet { max-width: 720px; }
+      .status-grid { grid-template-columns: 1fr 1fr 1fr; }
+    }
+
     /* 更新通知。ピン入力(#pinModal z-index:300)より下＝入力中は隠れる。右側の丸ボタン列と重ならないよう上部中央（記録中バナーの下）。 */
     .update-bar {
       display: none; position: fixed; top: 134px; left: 50%; transform: translateX(-50%);
