@@ -3508,7 +3508,7 @@
           ? `https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lng}`
           : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(p.address || "")}`;
         return `
-        <div class="pin-card ${exported ? "exported" : ""} ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""} ${isPastRound(p) ? "past" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}')">
+        <div class="pin-card ${exported ? "exported" : ""} ${isChecked ? "checked" : ""} ${isSelected ? "selected" : ""} ${isPastRound(p) ? "past" : ""}" id="card-${p.id}" onclick="selectPin('${p.id}');closeMobileList()">
           <div class="pin-card-top">
             <input type="checkbox" class="pin-check" ${isChecked ? "checked" : ""}
               onclick="toggleCheck('${p.id}',event)">
@@ -3751,6 +3751,14 @@
     }
     
     // ===== SELECT PIN =====
+    // スマホ表示：一覧は地図の上に重ねて開閉する（地図の大きさを変えない＝地図の再描画トラブルを避ける）
+    window.toggleMobileList = () => {
+      const on = document.body.classList.toggle("m-list");
+      const b = document.getElementById("mListBtn");
+      if (b) { b.textContent = on ? "🗺 地図" : "☰ 一覧"; b.classList.toggle("active", on); }
+    };
+    window.closeMobileList = () => { if (document.body.classList.contains("m-list")) window.toggleMobileList(); };
+
     window.selectPin = (id) => {
       // 動きの再生中に一覧からピンを選んだら、再生を終えて通常の地図に戻す（再生中は通常ピンを描いていないため）。
       // 位置は下でこのピンへ移すので戻さない。倍率だけ再生前の値に戻す＝事務員の作業倍率を保つ。
@@ -5450,6 +5458,36 @@
     /* warn は既に6箇所で使われていたが admin 側だけ定義が無く、背景なし＝地図上で読めなかった。
        index.html と同値に揃える（「エリア未判定」等の警告を事務員が確実に気づけるようにするため）。 */
     .toast.warn  { background: #78350f; color: #fcd34d; }
+    /* ===== スマホ表示（Fold等・幅1024px以下）＝地図メイン =====
+       ・上のボタン類は1行にして横スクロール（よく使う グリッド／市区界／エリア／周回 を先頭へ）
+       ・一覧は「☰ 一覧」で地図の上に重ねて開く ・反社/NG登録の行は隠す（住所ジャンプは残す）
+       PCの幅では一切効かない */
+    .m-only { display: none; }
+    @media (max-width: 1024px) {
+      body { height: 100vh; height: 100dvh; }
+      #adminScreen { grid-template-columns: 1fr; height: 100vh; height: 100dvh; }
+      .header {
+        flex-wrap: nowrap; overflow-x: auto; justify-content: flex-start;
+        padding: 6px 8px; gap: 6px; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+      }
+      .header::-webkit-scrollbar { display: none; }
+      .header > * { flex-shrink: 0; white-space: nowrap; }
+      .header-spacer, #userLabel { display: none; }
+      .m-only { display: inline-block; }
+      .header-title { order: -10; }
+      #mListBtn { order: -9; }
+      #gridBtn { order: -8; }
+      #areaBtn { order: -7; }
+      #areaFilter { order: -6; }
+      #roundFilter { order: -5; }
+      .left-panel, .right-panel { grid-row: 2; grid-column: 1; min-height: 0; }
+      .left-panel { display: none; z-index: 30; border-right: none; }
+      body.m-list .left-panel { display: flex; }
+      .admin-reg-bar { padding: 6px 8px; }
+      .admin-reg-bar > .reg-row:last-child { display: none; }
+      .admin-reg-bar .reg-row { flex-wrap: nowrap; }
+      .admin-reg-bar .geo-input { flex: 1; min-width: 0; }
+    }
   </style>
 </head>
 <body>
@@ -5470,6 +5508,8 @@
          2段に折り返して地図が43px低くなるため。名称はホバー(title属性)で分かるようにする。 -->
     <div class="header-title" title="空家マップ 管理画面">🏚</div>
     <div id="userLabel"></div>
+    <!-- スマホ（狭い画面）だけ出す一覧の開閉。PCでは非表示＝従来どおり -->
+    <button class="grid-btn m-only" id="mListBtn" onclick="toggleMobileList()">☰ 一覧</button>
     <div class="header-spacer"></div>
     <select id="dateFilter" onchange="setDateFilter(this.value)">
       <option value="all">日付：すべて</option>
